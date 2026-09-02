@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Launch the editor: bridge first, proxy build second, window third.
 
-Three environment details are not optional, and each cost a debugging session:
+Two environment details are not optional, and each cost a debugging session:
 
 * /usr/bin/qml6 by absolute path. Plain `qml` on PATH is Qt 5.15 and fails with
   "Did not load any objects, exiting" and nothing else -- no file, no line, no type.
 * QT_ASSUME_STDERR_HAS_CONSOLE=1, or Qt routes console.log into the journal and every
   QML warning this launcher is watching for disappears.
-* QML_XHR_ALLOW_FILE_READ=1, or Theme.qml cannot read the theme's colors.toml and the
-  editor silently falls back to its built-in palette.
 
 usage: omarchy-studio BUNDLE [--selftest MS] [--no-proxy]
 """
@@ -41,7 +39,8 @@ def _print_proxy_progress(status: dict, last: list) -> None:
     """
     if status["state"] != "building":
         if status["state"] != last[0]:
-            print(f"proxy: {status['state']} {status.get('message', '')}".rstrip(), file=sys.stderr)
+            nl = "\n" if last[1] >= 0 else ""   # finish the percentage line first
+            print(f"{nl}proxy: {status['state']} {status.get('message', '')}".rstrip(), file=sys.stderr)
         last[0] = status["state"]
         return
     pct = int(status.get("progress", 0) * 100)
@@ -87,7 +86,6 @@ def main(argv: list[str] | None = None) -> int:
 
     env = dict(os.environ)
     env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
-    env["QML_XHR_ALLOW_FILE_READ"] = "1"
     argvq = [
         QML6, "-I", str(EDITOR), str(EDITOR / "main.qml"), "--",
         "--port", str(server.server_port),

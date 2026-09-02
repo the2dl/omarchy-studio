@@ -2,15 +2,18 @@
 //
 // The structure is load-bearing and mirrors the export's compile order:
 //
-//   stage        canvas-sized, scaled by one Scale transform to fit the panel
-//     content    clip box; ShaderEffectSource reads THIS for redactions, so a blur
-//                sees the post-zoom pixels exactly as ffmpeg's redact crops the
-//                post-zoom stream
-//       zoomed   transformOrigin TopLeft, scale/x/y straight from Zoom.to_qml
-//         screen VideoOutput, explicit width/height
-//     layers     overlaid on the output canvas, i.e. NOT inside the zoom, because the
-//                export overlays them after the crop+scale
-//     webcam     likewise
+//   stage          canvas-sized, scaled by one Scale transform to fit the panel
+//     content      clip box; ShaderEffectSource reads THIS for redactions, so a blur
+//                  sees the composited pixels the way ffmpeg's redact crops the
+//                  composited stream
+//       backdrop   the coloured ground, when one is enabled
+//       insetBox   the rounded inset the video sits in (the whole canvas when there is
+//                  no backdrop), masked
+//         zoomed   transformOrigin TopLeft, scale/x/y straight from Zoom.to_qml
+//           screen VideoOutput, explicit width/height
+//     layers       overlaid on the output canvas, i.e. NOT inside the zoom or the inset,
+//                  because render.py's stage order is cut -> zoom -> backdrop -> layers
+//     webcam       likewise
 //
 // Two rules that have already cost a day between them: transformOrigin must be TopLeft
 // (any other origin makes the translation depend on the item's size, giving a zoom that
@@ -44,14 +47,44 @@ Item {
     readonly property int frame: hasScreen ? Math.round(screenPlayer.position / msPerFrame) : scrubFrame
     readonly property bool playing: screenPlayer.playbackState === MediaPlayer.PlayingState
 
-    readonly property real fit: Math.min(width / canvas.width, height / canvas.height)
+    // Fit inside the canvas panel with the spec's 46px inset (§1d region 3), not the
+    // whole item: the recording floats on the gradient rather than touching the edges.
+    readonly property real fit: Math.max(0.01, Math.min(
+        (canvasPanel.width - 2 * Style.canvasPad) / canvas.width,
+        (canvasPanel.height - 2 * Style.canvasPad) / canvas.height))
 
-    // What the zoom transform actually ended up as, read back off the item. The
-    // difference between this and `zoomNow` is the whole class of bugs where a binding
-    // is silently overridden -- anchors.fill on a transformed item does exactly that,
-    // with no warning -- so the self-test asserts on these rather than on the payload.
-    // Read back off the items for the same reason as the zoom transform: what the
-    // scene graph ended up with, not what the payload asked for.
+    // Zoom events, derived from the resolved track the bridge sends: a run of
+    // consecutive non-identity samples is one event, represented by its peak sample.
+    // Derived here for DISPLAY only -- the transform applied to the stage still comes
+    // one sample at a time from zoomAt(), never from these.
+    readonly property var zoomSegments: computeZoomSegments(st.zoom_track)
+    property int selectedZoomIndex: -1
+
+    function computeZoomSegments(tr) {
+        var out = []
+        if (!tr || !tr.frames || tr.frames.length === 0)
+            return out
+        var start = 0
+        var peak = 0
+        for (var i = 1; i <= tr.frames.length; ++i) {
+            if (i < tr.frames.length && tr.frames[i] === tr.frames[i - 1] + 1) {
+                if (tr.scale[i] > tr.scale[peak])
+                    peak = i
+                continue
+            }
+            if (tr.scale[peak] > 1.0001)
+                out.push({ start: tr.frames[start], end: tr.frames[i - 1] + 1,
+                           scale: tr.scale[peak], x: tr.x[peak], y: tr.y[peak] })
+            start = i
+            peak = i
+        }
+        return out
+    }
+
+    // What the scene graph actually ended up with, read back off the items. The
+    // difference between these and the payload is the whole class of bugs where a
+    // binding is silently overridden -- anchors.fill on a transformed item does exactly
+    // that, with no warning -- so the self-test asserts on these, not on the payload.
     readonly property var appliedWebcamRect: ({
         x: webcam.x, y: webcam.y, width: webcam.width, height: webcam.height,
         visible: webcam.visible, shape: webcam.cam.shape || ""
@@ -145,16 +178,83 @@ Item {
         x: 0; y: 0
         width: root.width
         height: root.height
-        color: Theme.surfaceDeep
+        color: Theme.bg
+    }
+
+    // The canvas ground: canvasA -> canvasB at 150deg (spec §1 "canvas"). Rectangle
+    // gradients are axis-aligned only, so a vertical gradient is rotated -30deg inside
+    // a masked panel -- same wash, and the mask gives the panel its rounded corners.
+    Item {
+        id: canvasPanel
+        x: 6
+        y: 14
+        width: root.width - 12
+        height: root.height - 28
+        layer.enabled: true
+        layer.effect: MultiEffect {
+            maskEnabled: true
+            maskSource: canvasPanelMask
+        }
+        Rectangle {
+            width: Math.max(canvasPanel.width, canvasPanel.height) * 2
+            height: width
+            x: (canvasPanel.width - width) / 2
+            y: (canvasPanel.height - height) / 2
+            rotation: -30
+            gradient: Gradient {
+                GradientStop { position: 0; color: Theme.canvasA }
+                GradientStop { position: 1; color: Theme.canvasB }
+            }
+        }
+    }
+    Item {
+        id: canvasPanelMask
+        x: canvasPanel.x; y: canvasPanel.y
+        width: canvasPanel.width; height: canvasPanel.height
+        visible: false
+        layer.enabled: true
+        Rectangle {
+            x: 0; y: 0
+            width: canvasPanelMask.width; height: canvasPanelMask.height
+            radius: Theme.radiusPanel
+            color: "black"
+        }
+    }
+
+    // The recording's drop shadow -- 0 28px 64px rgba(0,0,0,0.6) per spec §1d. Drawn
+    // from a stand-in rectangle so the video pixels themselves never re-render for it.
+    Rectangle {
+        id: recordingGround
+        x: viewport.x; y: viewport.y
+        width: viewport.width; height: viewport.height
+        radius: Theme.radiusRow
+        color: Theme.bgDeep
+        visible: false
+    }
+    MultiEffect {
+        source: recordingGround
+        x: recordingGround.x; y: recordingGround.y
+        width: recordingGround.width; height: recordingGround.height
+        shadowEnabled: true
+        shadowColor: Qt.rgba(0, 0, 0, 0.6)
+        shadowVerticalOffset: 28
+        shadowBlur: 1.0
+        blurMax: 64
     }
 
     Item {
         id: viewport
-        x: (root.width - width) / 2
-        y: (root.height - height) / 2
+        x: canvasPanel.x + (canvasPanel.width - width) / 2
+        y: canvasPanel.y + (canvasPanel.height - height) / 2
         width: root.canvas.width * root.fit
         height: root.canvas.height * root.fit
         clip: true
+        // The recording carries its own 10px radius on the canvas (spec §1d region 3).
+        layer.enabled: true
+        layer.effect: MultiEffect {
+            maskEnabled: true
+            maskSource: viewportMask
+        }
 
         Item {
             id: stage
@@ -342,6 +442,7 @@ Item {
                 onClicked: {
                     root.selectedId = ""
                     root.webcamSelected = false
+                    root.selectedZoomIndex = -1
                 }
             }
 
@@ -362,6 +463,98 @@ Item {
                     drop.accept()
                 }
             }
+        }
+
+        // -- selected zoom region, in viewport pixels ------------------------
+        //
+        // The region a zoom event magnifies, mapped through the CURRENT frame's
+        // transform: at identity it sits where the source region is (the mock's state),
+        // and once the playhead is inside the event it grows to fill the viewport,
+        // which is exactly what "you are now looking at this region" should read as.
+        readonly property var selSeg:
+            root.selectedZoomIndex >= 0 && root.selectedZoomIndex < root.zoomSegments.length
+            ? root.zoomSegments[root.selectedZoomIndex] : null
+        readonly property real segX: selSeg ? root.fit * (root.zoomNow.scale * (-selSeg.x / selSeg.scale) + root.zoomNow.x) : 0
+        readonly property real segY: selSeg ? root.fit * (root.zoomNow.scale * (-selSeg.y / selSeg.scale) + root.zoomNow.y) : 0
+        readonly property real segW: selSeg ? root.fit * root.zoomNow.scale * root.canvas.width / selSeg.scale : 0
+        readonly property real segH: selSeg ? root.fit * root.zoomNow.scale * root.canvas.height / selSeg.scale : 0
+
+        // One dim overlay with a hole punched in it -- the spec's 0 0 0 9999px scrim
+        // (§3), kept as a single surface so the four sides can never seam or double up.
+        Canvas {
+            id: dimOverlay
+            x: 0; y: 0
+            width: viewport.width
+            height: viewport.height
+            visible: viewport.selSeg !== null
+            property real hx: viewport.segX
+            property real hy: viewport.segY
+            property real hw: viewport.segW
+            property real hh: viewport.segH
+            onHxChanged: requestPaint()
+            onHyChanged: requestPaint()
+            onHwChanged: requestPaint()
+            onHhChanged: requestPaint()
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
+            onPaint: {
+                var ctx = getContext("2d")
+                ctx.clearRect(0, 0, width, height)
+                ctx.fillStyle = Qt.rgba(0, 0, 0, 0.28)   // spec §1d region 3, verbatim
+                ctx.fillRect(0, 0, width, height)
+                ctx.clearRect(hx, hy, hw, hh)
+            }
+        }
+
+        Rectangle {
+            visible: viewport.selSeg !== null
+            x: viewport.segX
+            y: viewport.segY
+            width: viewport.segW
+            height: viewport.segH
+            radius: Theme.radiusChip
+            color: "transparent"
+            border.color: Theme.accent
+            border.width: 1.5
+        }
+
+        // The label chip above the region: uppercase, accent on a floating fill.
+        Rectangle {
+            visible: viewport.selSeg !== null
+            x: viewport.segX
+            y: Math.max(4, viewport.segY - height - 8)
+            width: chipLabel.implicitWidth + 16
+            height: chipLabel.implicitHeight + 8
+            radius: Theme.radiusChip
+            color: Theme.bgFloat
+            Text {
+                id: chipLabel
+                anchors.centerIn: parent
+                text: viewport.selSeg
+                      ? ("zoom " + (root.selectedZoomIndex + 1) + " · "
+                         + viewport.selSeg.scale.toFixed(1) + "×")
+                      : ""
+                color: Theme.accent
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsHint
+                font.letterSpacing: Theme.fsHint * Theme.capsSpacing
+                font.capitalization: Font.AllUppercase
+            }
+        }
+    }
+
+    // The rounded-rect mask the viewport's layer samples; hidden, like screenMask.
+    Item {
+        id: viewportMask
+        x: viewport.x; y: viewport.y
+        width: viewport.width; height: viewport.height
+        visible: false
+        layer.enabled: true
+        Rectangle {
+            x: 0; y: 0
+            width: viewportMask.width; height: viewportMask.height
+            radius: Theme.radiusRow
+            color: "black"
         }
     }
 
@@ -440,45 +633,17 @@ Item {
         }
     }
 
-    // Tool strip. Sits outside the stage so it is not scaled with the canvas.
-    Row {
-        x: Theme.pad
-        y: Theme.pad
-        spacing: 6
-        Repeater {
-            model: [
-                { id: "select", label: "Select" },
-                { id: "blur", label: "Blur box" },
-                { id: "pixelate", label: "Pixelate" },
-                { id: "text", label: "Text" }
-            ]
-            Button {
-                text: modelData.label
-                checkable: true
-                checked: root.tool === modelData.id
-                onClicked: root.tool = modelData.id
-                background: Rectangle {
-                    radius: Theme.radius
-                    color: root.tool === modelData.id ? Theme.accent : Theme.surface
-                    opacity: 0.9
-                }
-                contentItem: Text {
-                    text: parent.text
-                    color: root.tool === modelData.id ? Theme.surfaceDeep : Theme.foreground
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
-            }
-        }
-    }
+    // The tool strip lives in main.qml's left rail (spec §1d region 2); this item only
+    // carries the `tool` property the rail drives.
 
     Text {
-        x: Theme.pad
-        y: root.height - height - Theme.pad
+        x: viewport.x + (viewport.width - width) / 2
+        y: viewport.y + (viewport.height - height) / 2
         text: root.hasScreen ? "" : (Bridge.proxyStatus.state === "building"
                                      ? "building preview proxy…"
                                      : "no preview media")
-        color: Theme.dim
-        font.pixelSize: 14
+        color: Theme.text5
+        font.family: Theme.fontFamily
+        font.pixelSize: Theme.fsRow
     }
 }

@@ -266,7 +266,7 @@ def test_timebase_chain_runs_before_the_cut():
 
 
 def test_webcam_layer_adapts_the_settings():
-    layer = webcam_layer(WebcamSettings(x=0.5, y=0.25, shape="rounded"))
+    layer = webcam_layer(WebcamSettings(x=0.5, y=0.25, shape="rounded"), CANVAS)
     assert layer.type == "webcam" and layer.x == 0.5 and layer.y == 0.25
     assert layer.props["shape"] == "rounded"
 
@@ -365,7 +365,7 @@ def test_a_graph_with_every_layer_type_renders(tmp_path):
               props={"strength": 0.9}),
         Layer(id="pix", type="pixelate", x=0.1, y=0.4, w=0.2, h=0.15,
               props={"block": 12}),
-        webcam_layer(WebcamSettings(x=0.7, y=0.6, w=0.2, h=0.25)),
+        webcam_layer(WebcamSettings(x=0.7, y=0.6, w=0.2, h=0.25), CANVAS),
     ]
     graph, inputs = _build(layers, tmp_path, camera=_cam(tmp_path))
     hashes = framehashes(graph, tmp_path, inputs=inputs, frames=30)
@@ -391,7 +391,7 @@ def test_a_gated_layer_is_absent_outside_its_range(tmp_path):
 def test_webcam_circle_mask_leaves_the_corners_transparent(tmp_path):
     """The mask is built once from a 1-frame lavfi source, so `geq` -- a per-pixel
     interpreter -- runs once for the whole render rather than once per frame."""
-    layers = [webcam_layer(WebcamSettings(x=0.0, y=0.0, w=0.25, h=0.3333))]
+    layers = [webcam_layer(WebcamSettings(x=0.0, y=0.0, w=0.25, h=0.3333), CANVAS)]
     graph, inputs = _build(layers, tmp_path, camera=_cam(tmp_path))
     corner, middle = (
         framehashes(

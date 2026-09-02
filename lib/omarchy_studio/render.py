@@ -296,7 +296,7 @@ def _layer_list(bundle: Bundle, registry: layers_mod.InputRegistry) -> list[Laye
     layer_list = [_resolve_asset(l, bundle) for l in bundle.edit.layers if l.enabled]
     has_webcam = any(l.type == "webcam" for l in layer_list)
     if registry.has("camera") and not has_webcam:
-        layer_list.append(layers_mod.webcam_layer(bundle.edit.webcam))
+        layer_list.append(layers_mod.webcam_layer(bundle.edit.webcam, bundle.canvas))
     elif has_webcam and not registry.has("camera"):
         layer_list = [l for l in layer_list if l.type != "webcam"]
     return sorted(layer_list, key=lambda l: l.z)

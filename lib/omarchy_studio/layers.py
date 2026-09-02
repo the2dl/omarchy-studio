@@ -136,20 +136,28 @@ def timebase_chain(label_in: str, tb: Timebase, label_out: str) -> str:
     return f"{label_in}fps={tb.fps_num}/{tb.fps_den},setsar=1{label_out}"
 
 
-def webcam_layer(settings: WebcamSettings, t: FrameRange | None = None, z: int = 100) -> Layer:
+def webcam_layer(
+    settings: WebcamSettings,
+    canvas: Canvas,
+    t: FrameRange | None = None,
+    z: int = 100,
+) -> Layer:
     """Adapt `Edit.webcam` into the Layer the one primitive understands.
 
     The webcam is a layer like any other -- it is stored as settings only because the
     editor gives it a dedicated panel.
     """
+    place = settings.placement(canvas)
     return Layer(
         id="webcam",
         type="webcam",
         t=t,
-        x=settings.x,
-        y=settings.y,
-        w=settings.w,
-        h=settings.h,
+        # Through settings.placement so the export's box is the preview's box; a
+        # circle is square in pixels and h is derived, not the stored value.
+        x=place.x,
+        y=place.y,
+        w=place.w,
+        h=place.h,
         z=z,
         props={
             "shape": settings.shape,

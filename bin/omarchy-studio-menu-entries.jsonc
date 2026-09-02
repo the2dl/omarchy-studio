@@ -1,0 +1,34 @@
+{
+  // omarchy-menu leaves for omarchy-studio. Merge these into
+  // /usr/share/omarchy/default/omarchy/omarchy-menu.jsonc -- same schema, same
+  // conventions: IDs are object keys, dotted IDs imply hierarchy, and kind is inferred
+  // (an entry with "action" is an action, one without is a submenu).
+  //
+  // Everything hangs off the existing "trigger.capture.screenrecord" submenu, so a
+  // recording and the things you do to it afterwards live in one place.
+  //
+  // Every leaf is guarded by `omarchy-capture-screenrecording-edit --locate`, which
+  // exits 1 when no bundle exists. Without the guard the whole branch shows up on a
+  // machine that has never recorded anything, and every row fails when picked.
+  //
+  // The exports pass --notify because a menu-launched command has no terminal: the
+  // notification is the only completion signal the user gets. They do NOT pass --json;
+  // the menu reads exit codes, not stdout.
+
+  "trigger.capture.screenrecord.edit": {"icon":"","label":"Edit Last Recording","when":"omarchy-capture-screenrecording-edit --locate","action":"omarchy-studio \"$(omarchy-capture-screenrecording-edit --locate)\""},
+  "trigger.capture.screenrecord.export": {"icon":"","label":"Export Last Recording","when":"omarchy-capture-screenrecording-edit --locate","title":"Export"},
+
+  // Each export is a full re-render from the untouched masters, so these compose:
+  // picking "Webcam bottom left" and then "With auto-zoom" gives both, because each
+  // one only writes the setting it names into edit.json.
+  "trigger.capture.screenrecord.export.plain": {"icon":"","label":"As recorded","action":"omarchy-capture-screenrecording-edit --notify"},
+  "trigger.capture.screenrecord.export.zoom": {"icon":"","label":"With auto-zoom","action":"omarchy-capture-screenrecording-edit --zoom=on --notify"},
+  "trigger.capture.screenrecord.export.no-zoom": {"icon":"","label":"Without auto-zoom","action":"omarchy-capture-screenrecording-edit --zoom=off --notify"},
+  "trigger.capture.screenrecord.export.webcam-bl": {"icon":"","label":"Webcam bottom left","action":"omarchy-capture-screenrecording-edit --webcam=bottom-left --webcam-size=m --notify"},
+  "trigger.capture.screenrecord.export.webcam-br": {"icon":"","label":"Webcam bottom right","action":"omarchy-capture-screenrecording-edit --webcam=bottom-right --webcam-size=m --notify"},
+  "trigger.capture.screenrecord.export.no-webcam": {"icon":"","label":"Without webcam","action":"omarchy-capture-screenrecording-edit --no-webcam --notify"},
+  "trigger.capture.screenrecord.export.backdrop": {"icon":"","label":"On a backdrop","action":"omarchy-capture-screenrecording-edit --backdrop=gradient --padding=0.05 --radius=0.02 --notify"},
+  "trigger.capture.screenrecord.export.reset": {"icon":"","label":"Reset edits and export","action":"omarchy-capture-screenrecording-edit --reset --notify"},
+
+  "trigger.capture.screenrecord.reveal": {"icon":"","label":"Open Recording Folder","when":"omarchy-capture-screenrecording-edit --locate","action":"xdg-open \"$(dirname \"$(omarchy-capture-screenrecording-edit --locate)\")\""},
+}

@@ -249,7 +249,11 @@ def test_webcam_box_is_placement_resolve(tmp_path):
     bundle = Bundle(root)
     cam = bundle.edit.webcam
     f = selftest_fields(run_editor(root, "--no-proxy").stderr)
-    want = Placement(cam.x, cam.y, cam.w, cam.h).resolve(Canvas(1280, 720))
+    # Through WebcamSettings.placement, not the raw w/h: a circle is square in PIXELS
+    # and derives its height, so the stored h is not the box. Asserting the raw values
+    # here is what let a 282x158 "circle" pass every test in the suite.
+    canvas = Canvas(1280, 720)
+    want = cam.placement(canvas).resolve(canvas)
     got = f["webcamRect"]
     assert got["visible"] is True
     assert got["x"] == pytest.approx(want.x)

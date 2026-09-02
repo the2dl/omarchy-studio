@@ -1,12 +1,17 @@
-// Webcam, zoom, backdrop and the layer list.
+// The right inspector: zoom, webcam, backdrop and the layer list (spec §1d region 4).
 //
 // Every control posts an intent and then displays whatever comes back: none of them
 // hold their own value. That is what makes a rejected change (a burned-in webcam, a
 // clamped zoom amount) visible instead of leaving the UI showing something the project
 // does not contain.
+//
+// Visual register per the spec: uppercase captions, hairline dividers, no boxes --
+// "nothing uses a border to mean container". Accent sliders mark what the panel is
+// about (the zoom); webcam and backdrop sliders are secondary and run text3.
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
+import "controls" as C
 
 ScrollView {
     id: root
@@ -18,285 +23,288 @@ ScrollView {
     readonly property real msPerFrame: st.timebase ? st.timebase.ms_per_frame : 1000 / 60
 
     property string selectedId: ""
+    property Item preview: null
     signal selectLayer(string id)
+
+    readonly property int selZoom: preview ? preview.selectedZoomIndex : -1
+    readonly property var selSeg: preview && selZoom >= 0 && selZoom < preview.zoomSegments.length
+                                  ? preview.zoomSegments[selZoom] : null
+
+    function shortTime(f) {
+        var fps = Math.max(1, st.timebase ? st.timebase.fps : 60)
+        var secs = Math.floor(f / fps)
+        return Math.floor(secs / 60) + ":" + (secs % 60 < 10 ? "0" : "") + (secs % 60)
+    }
 
     contentWidth: availableWidth
     clip: true
 
     ColumnLayout {
-        width: root.availableWidth
-        spacing: Theme.pad
+        width: root.availableWidth - 2 * Style.pad
+        x: Style.pad
+        spacing: 12
 
-        // -- webcam ----------------------------------------------------------
-        GroupBox {
+        Item { Layout.preferredHeight: 4 }
+
+        // -- contextual header ------------------------------------------------
+        // Names the selected object: a zoom event when one is picked on the timeline,
+        // a layer when one is picked on the canvas, the recording otherwise.
+        RowLayout {
             Layout.fillWidth: true
-            Layout.margins: Theme.pad
-            label: Text { text: "Webcam"; color: Theme.foreground; font.bold: true }
-            background: Rectangle {
-                color: Theme.surface
-                radius: Theme.radius
-                border.color: Theme.muted
+            spacing: 10
+            Text {   // nf-fa-search_plus for zoom, nf-fa-film otherwise
+                text: root.selSeg ? "" : ""
+                color: Theme.accent
+                font.family: Theme.fontFamily
+                font.pixelSize: 16
             }
-
-            ColumnLayout {
-                width: parent.width
-                spacing: 6
-
-                // Not merely inert: a burned-in recording genuinely cannot be edited
-                // this way, and the editor has to say which recording made that true.
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: reasonText.implicitHeight + 12
-                    visible: root.cam.editable === false
-                    color: Qt.rgba(Theme.warning.r, Theme.warning.g, Theme.warning.b, 0.15)
-                    border.color: Theme.warning
-                    radius: Theme.radius
-                    Text {
-                        id: reasonText
-                        x: 6
-                        y: 6
-                        width: parent.width - 12
-                        text: root.cam.disabled_reason || ""
-                        color: Theme.warning
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: 12
-                    }
-                }
-
-                CheckBox {
-                    text: "Show webcam"
-                    enabled: root.cam.editable === true
-                    checked: root.cam.enabled === true
-                    onToggled: Bridge.op("set_webcam", { enabled: checked })
-                    contentItem: Text {
-                        text: parent.text
-                        color: parent.enabled ? Theme.foreground : Theme.dim
-                        leftPadding: parent.indicator.width + 6
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                }
-
-                CheckBox {
-                    text: "Mirror"
-                    enabled: root.cam.editable === true
-                    checked: root.cam.mirror === true
-                    onToggled: Bridge.op("set_webcam", { mirror: checked })
-                    contentItem: Text {
-                        text: parent.text
-                        color: parent.enabled ? Theme.foreground : Theme.dim
-                        leftPadding: parent.indicator.width + 6
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    Text { text: "Shape"; color: Theme.dim; font.pixelSize: 12 }
-                    Repeater {
-                        model: ["circle", "rounded", "rect"]
-                        Button {
-                            text: modelData
-                            enabled: root.cam.editable === true
-                            checkable: true
-                            checked: root.cam.shape === modelData
-                            onClicked: Bridge.op("set_webcam", { shape: modelData })
-                        }
-                    }
-                }
-
-                Text {
-                    text: "Drag the webcam in the preview to move it; the corner grip resizes."
-                    color: Theme.dim
-                    font.pixelSize: 11
-                    wrapMode: Text.WordWrap
-                    Layout.fillWidth: true
-                }
+            Text {
+                Layout.fillWidth: true
+                text: root.selSeg ? ("Zoom " + (root.selZoom + 1))
+                    : root.selectedId !== "" ? root.selectedId
+                    : (st.name || "Recording")
+                color: Theme.text
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsRow
+                elide: Text.ElideRight
+            }
+            Text {
+                text: root.selSeg
+                      ? (root.shortTime(root.selSeg.start) + " – " + root.shortTime(root.selSeg.end))
+                      : ""
+                color: Theme.text5
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsCaption
             }
         }
 
         // -- zoom ------------------------------------------------------------
-        GroupBox {
+        RowLayout {
             Layout.fillWidth: true
-            Layout.margins: Theme.pad
-            label: Text { text: "Auto-zoom"; color: Theme.foreground; font.bold: true }
-            background: Rectangle {
-                color: Theme.surface
-                radius: Theme.radius
-                border.color: Theme.muted
+            C.Caption { text: "zoom"; Layout.fillWidth: true }
+            Text {
+                text: (st.clicks ? st.clicks.length : 0) + " clicks"
+                color: Theme.text5
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsHint
             }
-
-            ColumnLayout {
-                width: parent.width
-                spacing: 6
-
-                CheckBox {
-                    text: "Zoom on clicks (" + (st.clicks ? st.clicks.length : 0) + " recorded)"
-                    checked: root.zoom.enabled === true
-                    onToggled: Bridge.op("set_zoom", { enabled: checked })
-                    contentItem: Text {
-                        text: parent.text
-                        color: Theme.foreground
-                        leftPadding: parent.indicator.width + 6
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                }
-
-                LabelledSlider {
-                    Layout.fillWidth: true
-                    label: "Amount"
-                    from: 1.0
-                    to: 3.0
-                    value: root.zoom.amount === undefined ? 1.8 : root.zoom.amount
-                    display: liveValue.toFixed(2) + "×"
-                    onCommitted: function (v) { Bridge.op("set_zoom", { amount: v }) }
-                }
-
-                LabelledSlider {
-                    Layout.fillWidth: true
-                    label: "Hold"
-                    from: 100
-                    to: 4000
-                    value: (root.zoom.hold_frames || 0) * root.msPerFrame
-                    display: (liveValue / 1000).toFixed(2) + "s"
-                    onCommitted: function (v) { Bridge.op("set_zoom", { hold_ms: v }) }
-                }
-
-                LabelledSlider {
-                    Layout.fillWidth: true
-                    label: "Ease"
-                    from: 30
-                    to: 1200
-                    value: (root.zoom.ease_frames || 0) * root.msPerFrame
-                    display: (liveValue / 1000).toFixed(2) + "s"
-                    onCommitted: function (v) { Bridge.op("set_zoom", { ease_ms: v }) }
-                }
+            C.Toggle {
+                checked: root.zoom.enabled === true
+                onToggled: function (v) { Bridge.op("set_zoom", { enabled: v }) }
             }
         }
+
+        LabelledSlider {
+            Layout.fillWidth: true
+            label: "scale"
+            from: 1.0
+            to: 3.0
+            modelValue: root.zoom.amount === undefined ? 1.8 : root.zoom.amount
+            display: liveValue.toFixed(2) + "×"
+            enabled: root.zoom.enabled === true
+            onCommitted: function (v) { Bridge.op("set_zoom", { amount: v }) }
+        }
+
+        LabelledSlider {
+            Layout.fillWidth: true
+            label: "hold after click"
+            from: 100
+            to: 4000
+            modelValue: (root.zoom.hold_frames || 0) * root.msPerFrame
+            display: (liveValue / 1000).toFixed(2) + " s"
+            enabled: root.zoom.enabled === true
+            onCommitted: function (v) { Bridge.op("set_zoom", { hold_ms: v }) }
+        }
+
+        LabelledSlider {
+            Layout.fillWidth: true
+            label: "ease"
+            from: 30
+            to: 1200
+            modelValue: (root.zoom.ease_frames || 0) * root.msPerFrame
+            display: (liveValue / 1000).toFixed(2) + " s"
+            enabled: root.zoom.enabled === true
+            onCommitted: function (v) { Bridge.op("set_zoom", { ease_ms: v }) }
+        }
+
+        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
+
+        // -- webcam ----------------------------------------------------------
+        // The toggle lives on the caption line (1g's pattern) so the whole section can
+        // be switched off from one place.
+        RowLayout {
+            Layout.fillWidth: true
+            C.Caption { text: "webcam"; Layout.fillWidth: true }
+            C.Toggle {
+                checked: root.cam.enabled === true
+                enabled: root.cam.editable === true
+                onToggled: function (v) { Bridge.op("set_webcam", { enabled: v }) }
+            }
+        }
+
+        // Not merely inert: a burned-in recording genuinely cannot be edited this way,
+        // and the editor has to say which recording made that true.
+        Text {
+            visible: root.cam.editable === false
+            text: root.cam.disabled_reason || ""
+            color: Theme.text4
+            font.family: Theme.fontFamily
+            font.pixelSize: Theme.fsCaption
+            wrapMode: Text.WordWrap
+            Layout.fillWidth: true
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 10
+            enabled: root.cam.editable === true
+            C.Toggle {
+                checked: root.cam.mirror === true
+                enabled: root.cam.editable === true
+                onToggled: function (v) { Bridge.op("set_webcam", { mirror: v }) }
+            }
+            Text {
+                text: "Mirror"
+                color: root.cam.editable === true ? Theme.text3 : Theme.text5
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsRow
+            }
+        }
+
+        C.Caption { text: "shape" }
+
+        C.Segmented {
+            Layout.fillWidth: true
+            model: ["Circle", "Rounded", "Rect"]
+            enabled: root.cam.editable === true
+            // Bound to the model and never assigned locally (Segmented only emits), so
+            // a rejected shape change snaps the chips back to the truth.
+            currentIndex: ["circle", "rounded", "rect"].indexOf(root.cam.shape)
+            onActivated: function (i) {
+                Bridge.op("set_webcam", { shape: ["circle", "rounded", "rect"][i] })
+            }
+        }
+
+        Text {
+            text: "Drag the webcam on the canvas to move it; the corner grip resizes."
+            color: Theme.text6
+            font.family: Theme.fontFamily
+            font.pixelSize: Theme.fsHint
+            wrapMode: Text.WordWrap
+            Layout.fillWidth: true
+        }
+
+        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
 
         // -- backdrop --------------------------------------------------------
-        GroupBox {
+        RowLayout {
             Layout.fillWidth: true
-            Layout.margins: Theme.pad
-            label: Text { text: "Backdrop"; color: Theme.foreground; font.bold: true }
-            background: Rectangle {
-                color: Theme.surface
-                radius: Theme.radius
-                border.color: Theme.muted
-            }
-
-            ColumnLayout {
-                width: parent.width
-                spacing: 6
-
-                CheckBox {
-                    text: "Inset the screen on a backdrop"
-                    checked: root.backdrop.enabled === true
-                    onToggled: Bridge.op("set_backdrop", { enabled: checked })
-                    contentItem: Text {
-                        text: parent.text
-                        color: Theme.foreground
-                        leftPadding: parent.indicator.width + 6
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                }
-
-                LabelledSlider {
-                    Layout.fillWidth: true
-                    label: "Padding"
-                    from: 0.0
-                    to: 0.2
-                    value: root.backdrop.padding === undefined ? 0.04 : root.backdrop.padding
-                    display: (liveValue * 100).toFixed(1) + "%"
-                    onCommitted: function (v) { Bridge.op("set_backdrop", { padding: v }) }
-                }
-
-                LabelledSlider {
-                    Layout.fillWidth: true
-                    label: "Corner"
-                    from: 0.0
-                    to: 0.05
-                    value: root.st.edit ? root.st.edit.backdrop.corner_radius : 0.015
-                    display: (liveValue * 100).toFixed(2) + "%"
-                    onCommitted: function (v) { Bridge.op("set_backdrop", { corner_radius: v }) }
-                }
+            C.Caption { text: "backdrop"; Layout.fillWidth: true }
+            C.Toggle {
+                checked: root.backdrop.enabled === true
+                onToggled: function (v) { Bridge.op("set_backdrop", { enabled: v }) }
             }
         }
+
+        LabelledSlider {
+            Layout.fillWidth: true
+            label: "padding"
+            subject: false
+            from: 0.0
+            to: 0.2
+            modelValue: root.backdrop.padding === undefined ? 0.04 : root.backdrop.padding
+            display: (liveValue * 100).toFixed(1) + " %"
+            enabled: root.backdrop.enabled === true
+            onCommitted: function (v) { Bridge.op("set_backdrop", { padding: v }) }
+        }
+
+        LabelledSlider {
+            Layout.fillWidth: true
+            label: "corner radius"
+            subject: false
+            from: 0.0
+            to: 0.05
+            modelValue: root.st.edit ? root.st.edit.backdrop.corner_radius : 0.015
+            display: (liveValue * 100).toFixed(2) + " %"
+            enabled: root.backdrop.enabled === true
+            onCommitted: function (v) { Bridge.op("set_backdrop", { corner_radius: v }) }
+        }
+
+        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
 
         // -- layers ----------------------------------------------------------
-        GroupBox {
+        C.Caption { text: "layers" }
+
+        Text {
+            visible: !st.layers || st.layers.length === 0
+            text: "Drop an image on the canvas, or drag out a blur box."
+            color: Theme.text6
+            font.family: Theme.fontFamily
+            font.pixelSize: Theme.fsHint
+            wrapMode: Text.WordWrap
             Layout.fillWidth: true
-            Layout.margins: Theme.pad
-            label: Text { text: "Layers"; color: Theme.foreground; font.bold: true }
-            background: Rectangle {
-                color: Theme.surface
-                radius: Theme.radius
-                border.color: Theme.muted
-            }
+        }
 
-            ColumnLayout {
-                width: parent.width
-                spacing: 4
+        Repeater {
+            model: st.layers || []
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 44
+                radius: Theme.radiusRow
+                // Ring + wash mean selected; rest state is a bare row, hover a fill.
+                color: root.selectedId === modelData.id ? Theme.accentWash
+                     : rowMa.containsMouse ? Theme.fillHover : "transparent"
+                border.width: root.selectedId === modelData.id ? 1.5 : 0
+                border.color: Theme.accent
+                Behavior on color { ColorAnimation { duration: Theme.durFast } }
 
-                Text {
-                    visible: !st.layers || st.layers.length === 0
-                    text: "No layers yet. Drop an image on the preview, or drag out a blur box."
-                    color: Theme.dim
-                    font.pixelSize: 12
-                    wrapMode: Text.WordWrap
-                    Layout.fillWidth: true
+                MouseArea {
+                    id: rowMa
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    onClicked: root.selectLayer(modelData.id)
                 }
 
-                Repeater {
-                    model: st.layers || []
-                    Rectangle {
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 58
-                        color: root.selectedId === modelData.id ? Theme.selection : "transparent"
-                        radius: Theme.radius
-                        border.color: modelData.supported === false ? Theme.warning : Theme.muted
-
-                        MouseArea {
-                            x: 0; y: 0
-                            width: parent.width
-                            height: parent.height
-                            onClicked: root.selectLayer(modelData.id)
-                        }
-
-                        Text {
-                            x: 8
-                            y: 6
-                            text: modelData.type + "  " + modelData.id
-                            color: Theme.foreground
-                            font.pixelSize: 13
-                        }
-                        Text {
-                            x: 8
-                            y: 24
-                            text: modelData.t
-                                  ? ("frames " + modelData.t.start + "–" + modelData.t.end)
-                                  : "whole recording"
-                            color: Theme.dim
-                            font.pixelSize: 11
-                        }
-                        Row {
-                            x: parent.width - width - 8
-                            y: 14
-                            spacing: 4
-                            Button {
-                                text: modelData.enabled === false ? "Show" : "Hide"
-                                onClicked: Bridge.op("update_layer", {
-                                    id: modelData.id, enabled: modelData.enabled === false })
-                            }
-                            Button {
-                                text: "Delete"
-                                onClicked: Bridge.op("delete_layer", { id: modelData.id })
-                            }
-                        }
+                Text {
+                    x: 10
+                    y: 7
+                    width: parent.width - rowBtns.width - 24
+                    text: modelData.type + " · " + modelData.id
+                    color: modelData.enabled === false ? Theme.text5 : Theme.text2
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsRow
+                    elide: Text.ElideRight
+                }
+                Text {
+                    x: 10
+                    y: 24
+                    width: parent.width - rowBtns.width - 24
+                    text: modelData.t
+                          ? ("frames " + modelData.t.start + "–" + modelData.t.end)
+                          : "whole recording"
+                    color: Theme.text6
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsHint
+                    elide: Text.ElideRight
+                }
+                Row {
+                    id: rowBtns
+                    x: parent.width - width - 6
+                    y: (parent.height - 28) / 2
+                    spacing: 2
+                    C.GhostButton {   // nf-fa-eye / nf-fa-eye_slash
+                        text: modelData.enabled === false ? "" : ""
+                        onClicked: Bridge.op("update_layer", {
+                            id: modelData.id, enabled: modelData.enabled === false })
+                    }
+                    C.GhostButton {   // nf-fa-trash
+                        text: ""
+                        onClicked: Bridge.op("delete_layer", { id: modelData.id })
                     }
                 }
             }
         }
 
-        Item { Layout.preferredHeight: Theme.pad }
+        Item { Layout.preferredHeight: Style.pad }
     }
 }

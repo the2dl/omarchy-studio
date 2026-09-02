@@ -66,7 +66,7 @@ def test_an_explicit_webcam_layer_is_dropped_when_there_is_no_camera(tmp_path):
     registry for a stream nobody bound, and an unhandled LayerError there is an export
     that dies on a project the user can still perfectly well render."""
     b = _tiny(tmp_path, "rec", camera=False)
-    b.edit.layers.append(layers_mod.webcam_layer(b.edit.webcam))
+    b.edit.layers.append(layers_mod.webcam_layer(b.edit.webcam, b.canvas))
     b.edit.layers.append(
         Layer(id="s1", type="shape", x=0.1, y=0.1, w=0.2, h=0.2, z=1,
               props={"color": "#ffffff"})

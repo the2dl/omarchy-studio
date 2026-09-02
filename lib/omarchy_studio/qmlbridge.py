@@ -215,7 +215,7 @@ def resolve_webcam(bundle: Bundle) -> dict:
     """
     cam = bundle.edit.webcam
     canvas = bundle.canvas
-    place = Placement(cam.x, cam.y, cam.w, cam.h, "top-left")
+    place = cam.placement(canvas)
     d = resolve_placement(place, canvas)
     r = place.resolve(canvas)
     d.update(

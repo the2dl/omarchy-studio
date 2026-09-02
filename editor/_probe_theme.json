@@ -1,0 +1,33 @@
+{
+  "mode": "dark",
+  "font": "JetBrainsMono Nerd Font",
+  "radii": {
+    "window": 14,
+    "panel": 14,
+    "row": 9,
+    "chip": 7
+  },
+  "bg": "#121212",
+  "bgDeep": "#090909",
+  "bgFloat": "#eb121212",
+  "panel": "#1e1e1e",
+  "canvasA": "#221e19",
+  "canvasB": "#101114",
+  "accent": "#e68e0d",
+  "accentDim": "#a66609",
+  "accentOn": "#170e01",
+  "accentWash": "#2ee68e0d",
+  "accentGlow": "#38e68e0d",
+  "live": "#D35F5F",
+  "text": "#cacaca",
+  "text2": "#bebebe",
+  "text3": "#8a8a8d",
+  "text4": "#606062",
+  "text5": "#555555",
+  "text6": "#444444",
+  "hairline": "#12bebebe",
+  "fillSubtle": "#0dbebebe",
+  "fillHover": "#12bebebe",
+  "track": "#1abebebe",
+  "selected": "#2a2a2a"
+}

@@ -45,10 +45,10 @@ Item {
                     anchors.fill: parent
                     enabled: root.enabled
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                        root.currentIndex = parent.index
-                        root.activated(parent.index)
-                    }
+                    // Emit only -- `currentIndex` is bound to the model, and assigning
+                    // it here would destroy that binding, leaving the chip lit on a
+                    // value the project rejected (a burned-in webcam does exactly that).
+                    onClicked: root.activated(parent.index)
                 }
             }
         }

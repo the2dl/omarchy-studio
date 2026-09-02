@@ -91,6 +91,12 @@ QtObject {
         send("GET", "/state", null, function (s, ok) { if (ok) apply(s) })
     }
 
+    // theme.py resolves every mix, alpha and contrast decision; QML applies the answer
+    // and derives nothing, which is the same rule the geometry seam follows.
+    function loadTheme() {
+        send("GET", "/theme", null, function (t, ok) { if (ok) Theme.load(t) })
+    }
+
     function op(name, args, cb) {
         send("POST", "/op", { op: name, args: args || {} }, function (s, ok) {
             if (ok)
@@ -155,6 +161,7 @@ QtObject {
         token = arg("--token", "")
         bundle = arg("--bundle", "")
         selftestMs = parseInt(arg("--selftest", "0"))
+        loadTheme()
         refresh()
     }
 }

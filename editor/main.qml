@@ -8,63 +8,90 @@ import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
 import QtQuick.Dialogs
+import "controls" as C
 
 ApplicationWindow {
     id: app
 
     width: 1560
-    height: 980
+    height: 880    // the mock's editor frame (§1d: 1560×880)
     visible: true
-    color: Theme.background
+    color: Theme.bg
     title: "Omarchy Studio — " + (Bridge.state.name || Bridge.bundle)
 
     readonly property var st: Bridge.state
 
-    header: ToolBar {
-        background: Rectangle { color: Theme.surface }
-        RowLayout {
-            x: Theme.pad
-            y: 0
-            width: parent.width - 2 * Theme.pad
-            height: parent.height
-            spacing: 8
+    // m:ss from source frames -- whole seconds; the frame-exact counter lives in the
+    // timeline transport where scrubbing needs it.
+    function durationLabel() {
+        if (!st.timebase || !st.source_frames)
+            return ""
+        var secs = Math.floor(st.source_frames / st.timebase.fps)
+        var m = Math.floor(secs / 60)
+        var s = secs % 60
+        return m + ":" + (s < 10 ? "0" : "") + s
+    }
 
-            Text {
-                text: app.st.name || "loading…"
-                color: Theme.foreground
-                font.bold: true
+    // The mock says "4K"; recordings that are not 4K say what they are instead.
+    function formatLabel() {
+        if (!st.canvas)
+            return ""
+        return st.canvas.height >= 2100 ? "4K" : (st.canvas.height + "p")
+    }
+
+    // Top bar, 46px (spec §1d region 1): file glyph, name, duration/format in text6,
+    // then the actions. Undo/redo and Preview from the mock are absent on purpose --
+    // the model has no undo stack and no preview render, and dead chrome would read
+    // as broken. Save/Reset take their place until those exist.
+    header: Rectangle {
+        height: Style.topBarHeight
+        color: Theme.bg
+
+        RowLayout {
+            x: Style.pad
+            y: 0
+            width: parent.width - 2 * Style.pad
+            height: parent.height
+            spacing: 14
+
+            Text {   // nf-fa-film
+                text: ""
+                color: Theme.accent
+                font.family: Theme.fontFamily
+                font.pixelSize: 17
             }
             Text {
-                text: app.st.canvas
-                      ? (app.st.canvas.width + "×" + app.st.canvas.height + " · "
-                         + (app.st.timebase ? app.st.timebase.fps.toFixed(2) : "?") + " fps · "
-                         + app.st.source_frames + " frames")
-                      : ""
-                color: Theme.dim
-                font.pixelSize: 12
+                text: app.st.name || "loading…"
+                color: Theme.text
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsBody
+            }
+            Text {
+                text: app.durationLabel() !== "" ? (app.durationLabel() + " · " + app.formatLabel()) : ""
+                color: Theme.text6
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsCaption
             }
             Item { Layout.fillWidth: true }
 
+            // Unsaved state: an accent dot, nothing shouting. The Save button next to
+            // it is the verb.
             Rectangle {
-                width: 8; height: 8; radius: 4
-                color: app.st.dirty ? Theme.warning : Theme.ok
-                visible: app.st.dirty !== undefined
+                width: 7; height: 7; radius: 3.5
+                color: Theme.accent
+                visible: app.st.dirty === true
             }
-            Text {
-                text: app.st.dirty ? "unsaved" : "saved"
-                color: Theme.dim
-                font.pixelSize: 12
-            }
-            Button {
+            C.GhostButton {
                 text: "Save"
                 onClicked: Bridge.save()
             }
-            Button {
-                text: "Reset edits"
+            C.GhostButton {
+                text: "Reset"
                 onClicked: resetDialog.open()
             }
-            Button {
-                text: Bridge.exportStatus.state === "running" ? "Cancel export" : "Export…"
+            Rectangle { width: 1; height: 16; color: Theme.hairline }
+            C.PrimaryButton {
+                text: Bridge.exportStatus.state === "running" ? "Cancel" : "Export"
                 onClicked: {
                     if (Bridge.exportStatus.state === "running")
                         Bridge.cancelExport()
@@ -83,6 +110,35 @@ ApplicationWindow {
             Layout.fillWidth: true
             Layout.fillHeight: true
             spacing: 0
+
+            // Left rail, 56px (spec §1d region 2): the tools the editor actually has.
+            // The mock shows six; the four below are the ones with behaviour behind
+            // them, and the rail grows as tools do.
+            Item {
+                Layout.preferredWidth: Style.railWidth
+                Layout.maximumWidth: Style.railWidth
+                Layout.fillHeight: true
+
+                Column {
+                    x: (Style.railWidth - 38) / 2
+                    y: 10
+                    spacing: 6
+                    Repeater {
+                        model: [
+                            { id: "select",   glyph: "", tip: "Select" },        // nf-fa-mouse_pointer
+                            { id: "blur",     glyph: "", tip: "Blur box" },      // nf-fa-eye_slash
+                            { id: "pixelate", glyph: "", tip: "Pixelate" },      // nf-fa-th
+                            { id: "text",     glyph: "", tip: "Text" }           // nf-fa-font
+                        ]
+                        C.RailButton {
+                            glyph: modelData.glyph
+                            tip: modelData.tip
+                            active: preview.tool === modelData.id
+                            onClicked: preview.tool = modelData.id
+                        }
+                    }
+                }
+            }
 
             Item {
                 Layout.fillWidth: true
@@ -117,26 +173,35 @@ ApplicationWindow {
                             text: Bridge.proxyStatus.state === "error"
                                   ? "Preview proxy failed"
                                   : "Building the preview proxy"
-                            color: Theme.foreground
-                            font.pixelSize: 18
+                            color: Theme.text
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fsTitle
                             Layout.alignment: Qt.AlignHCenter
                         }
                         Text {
                             text: Bridge.proxyStatus.message
                                   || "The editor never plays the 5K master: seeking it took 517-651ms "
                                    + "and half the seeks delivered no frame at all."
-                            color: Theme.dim
-                            font.pixelSize: 12
+                            color: Theme.text4
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fsRow
                             wrapMode: Text.WordWrap
                             Layout.fillWidth: true
                             horizontalAlignment: Text.AlignHCenter
                         }
-                        ProgressBar {
+                        Item {
                             Layout.fillWidth: true
+                            Layout.preferredHeight: 3
                             visible: Bridge.proxyStatus.state === "building"
-                            from: 0
-                            to: 1
-                            value: Bridge.proxyStatus.progress || 0
+                            Rectangle {
+                                width: parent.width; height: 3; radius: 1
+                                color: Theme.track
+                            }
+                            Rectangle {
+                                width: parent.width * (Bridge.proxyStatus.progress || 0)
+                                height: 3; radius: 1
+                                color: Theme.accent
+                            }
                         }
                     }
                 }
@@ -144,9 +209,15 @@ ApplicationWindow {
 
             SettingsPanel {
                 id: settings
-                Layout.preferredWidth: 360
+                // 268px in the editor (spec §1d region 4); the 320px width is for the
+                // standalone panels.
+                Layout.preferredWidth: Theme.inspectorWidth
+                // Capped as well as preferred: without a maximum, one over-wide control
+                // inside pushes the panel past the window edge and clips itself.
+                Layout.maximumWidth: Theme.inspectorWidth
                 Layout.fillHeight: true
                 selectedId: preview.selectedId
+                preview: preview
                 onSelectLayer: function (id) {
                     preview.selectedId = id
                     preview.webcamSelected = false
@@ -157,40 +228,66 @@ ApplicationWindow {
         Timeline {
             id: timeline
             Layout.fillWidth: true
-            Layout.preferredHeight: 150
+            Layout.preferredHeight: Style.timelineHeight
             preview: preview
         }
     }
 
-    footer: ToolBar {
-        background: Rectangle { color: Theme.surface }
+    // Status strip: only exists while there is something to say (spec has no footer).
+    // Errors and export progress surface here; the rest of the time the tray sits on
+    // the window edge as in the mock.
+    footer: Rectangle {
+        visible: Bridge.lastError !== "" || Bridge.exportStatus.state === "running"
+                 || Bridge.exportStatus.state === "done"
+        height: visible ? 26 : 0
+        color: Theme.bgDeep
+
+        Rectangle { x: 0; y: 0; width: parent.width; height: 1; color: Theme.hairline }
+
         RowLayout {
-            x: Theme.pad
+            x: Style.pad
             y: 0
-            width: parent.width - 2 * Theme.pad
+            width: parent.width - 2 * Style.pad
             height: parent.height
-            spacing: 8
+            spacing: 10
 
             Text {
-                text: Bridge.lastError !== "" ? ("⚠ " + Bridge.lastError)
-                                              : (Bridge.exportStatus.message || Theme.loadedFrom)
-                color: Bridge.lastError !== "" ? Theme.danger : Theme.dim
-                font.pixelSize: 12
+                text: Bridge.lastError !== "" ? Bridge.lastError
+                                              : Bridge.exportStatus.message
+                color: Bridge.lastError !== "" ? Theme.live : Theme.text4
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsCaption
                 elide: Text.ElideMiddle
                 Layout.fillWidth: true
             }
-            ProgressBar {
+            // 3px track, accent fill -- the slider anatomy without the thumb.
+            Item {
                 visible: Bridge.exportStatus.state === "running"
                 Layout.preferredWidth: 240
-                from: 0
-                to: 1
-                value: Bridge.exportStatus.progress || 0
+                Layout.preferredHeight: 3
+                Rectangle {
+                    width: parent.width; height: 3; radius: 1
+                    color: Theme.track
+                }
+                Rectangle {
+                    width: parent.width * (Bridge.exportStatus.progress || 0)
+                    height: 3; radius: 1
+                    color: Theme.accent
+                }
+            }
+            Text {
+                visible: Bridge.exportStatus.state === "running"
+                text: Math.round((Bridge.exportStatus.progress || 0) * 100) + "%"
+                color: Theme.accent
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsCaption
             }
             Text {
                 visible: Bridge.exportStatus.state === "done"
                 text: "export complete"
-                color: Theme.ok
-                font.pixelSize: 12
+                color: Theme.accentDim
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsCaption
             }
         }
     }
@@ -213,7 +310,7 @@ ApplicationWindow {
         onAccepted: Bridge.op("reset", {})
         Text {
             text: "Deletes edit.json and returns to defaults.\nThe recording itself is untouched."
-            color: Theme.foreground
+            color: Theme.text
         }
     }
 
@@ -281,7 +378,8 @@ ApplicationWindow {
             dirty: s.dirty,
             error: Bridge.lastError,
             proxy: Bridge.proxyStatus.state,
-            theme: Theme.loadedFrom,
+            theme: Theme.mode,
+            font: Theme.fontFamily,
             previewFit: preview.fit,
             frame: preview.frame,
             zoomScale: preview.appliedZoomScale,

@@ -198,6 +198,22 @@ class WebcamSettings:
     corner_radius: float = 0.12
     mirror: bool = True
 
+    def placement(self, canvas: Canvas) -> Placement:
+        """The camera box, square in PIXELS for a circle.
+
+        `w` and `h` are normalized against different axes, so equal values give an
+        ellipse on any non-square canvas -- 0.22/0.22 on 1280x720 is 282x158, which is
+        what shipped and looked wrong. The design carries ONE size control (spec 1g),
+        so `w` is the size and a circular camera derives its height from it.
+
+        `rounded` and `rect` keep both values, because a deliberately wide camera box is
+        a legitimate thing to want and only a circle is a lie when it is not round.
+        """
+        h = self.h
+        if self.shape == "circle":
+            h = self.w * canvas.width / canvas.height
+        return Placement(self.x, self.y, self.w, h, "top-left")
+
 
 @dataclass
 class BackdropSettings:

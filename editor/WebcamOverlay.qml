@@ -140,13 +140,25 @@ Item {
         }
     }
 
+    // Selection ring: 1.5px, never a heavy fill (spec §1 "Selected card"). The four
+    // corner dots are the mock's handles; only the bottom-right one actually drags,
+    // through the grip MouseArea sitting on top of it.
     Rectangle {
         x: 0; y: 0
         width: root.width; height: root.height
         visible: root.selected
         color: "transparent"
-        border.color: root.editable ? Theme.accent : Theme.dim
-        border.width: 2
+        border.color: root.editable ? Theme.accent : Theme.text4
+        border.width: 1.5
+    }
+    Repeater {
+        model: root.selected && root.editable ? 4 : 0
+        Rectangle {
+            width: 7; height: 7; radius: 3.5
+            x: (index % 2 === 0 ? 0 : root.width) - 3.5
+            y: (index < 2 ? 0 : root.height) - 3.5
+            color: Theme.accent
+        }
     }
 
     MouseArea {
@@ -171,6 +183,8 @@ Item {
         onReleased: root.endDrag()
     }
 
+    // Invisible: the bottom-right corner dot above is the visual; this is the hit area,
+    // kept at gripSize because a 7px target is not draggable.
     Rectangle {
         id: grip
         visible: root.selected && root.editable
@@ -179,7 +193,7 @@ Item {
         x: root.width - width / 2
         y: root.height - height / 2
         radius: width / 2
-        color: Theme.accent
+        color: "transparent"
         MouseArea {
             x: 0; y: 0
             width: parent.width; height: parent.height

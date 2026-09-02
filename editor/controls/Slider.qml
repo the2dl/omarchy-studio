@@ -22,6 +22,10 @@ Item {
     property bool subject: true
     property bool enabled: true
     signal moved(real value)
+    // Fired once, on release. Callers whose write-back is real work (the zoom amount
+    // rebuilds the whole track) commit on this instead of on every moved().
+    signal committed(real value)
+    readonly property alias dragging: dragArea.pressed
 
     implicitHeight: caption ? 34 : 14
     opacity: enabled ? 1.0 : 0.45
@@ -83,6 +87,7 @@ Item {
         }
 
         MouseArea {
+            id: dragArea
             anchors.fill: parent
             anchors.margins: -8
             enabled: root.enabled
@@ -94,6 +99,7 @@ Item {
             }
             onPressed: function (m) { place(m.x) }
             onPositionChanged: function (m) { if (pressed) place(m.x) }
+            onReleased: root.committed(root.value)
         }
     }
 }

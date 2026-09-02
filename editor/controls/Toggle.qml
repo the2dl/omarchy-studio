@@ -46,9 +46,10 @@ Item {
         anchors.margins: -6   // the pill is small; the hit target should not be
         enabled: root.enabled
         cursorShape: Qt.PointingHandCursor
-        onClicked: {
-            root.checked = !root.checked
-            root.toggled(root.checked)
-        }
+        // Emit only, never self-assign: `checked` is bound to the model, and a local
+        // assignment would destroy that binding -- the control would keep a value the
+        // project may have rejected. The bridge round-trips in 0.27ms, so the knob
+        // still answers the click instantly.
+        onClicked: root.toggled(!root.checked)
     }
 }

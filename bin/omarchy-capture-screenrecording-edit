@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+
+# omarchy:summary=Re-render a screen recording with different webcam, zoom, backdrop and cuts
+# omarchy:group=capture
+# omarchy:args=[<bundle>] [--webcam=<corner|x,y>] [--webcam-size=<s|m|l|N%>] [--webcam-shape=<circle|rounded|rect>] [--no-webcam] [--zoom=<on|off>] [--zoom-amount=<f>] [--zoom-hold=<seconds>] [--backdrop=<off|color|gradient>] [--padding=<f>] [--radius=<f>] [--cut=<start>-<end>] [--reset] [--print-plan] [--json] [-o <out.mp4>]
+# omarchy:examples=omarchy-capture-screenrecording-edit latest --webcam=bottom-left --zoom=on
+#
+# The headless half of the editor. Everything the QML app can do to a recording it does
+# by mutating edit.json and calling render.render(); this does the same from a terminal,
+# so milestone 1 ships a usable product before any window exists, and so the GUI has a
+# scriptable twin to diff against.
+#
+# The capture is never touched. Options are folded into edit.json -- the one mutable
+# file in the bundle -- and the render reads the untouched masters beside it. `--reset`
+# is therefore literally `rm edit.json`, and re-rendering with different options can
+# never degrade the source.
+#
+# Human times on the command line (`--cut=1:05-1:12`) convert through Timebase.to_frame
+# and nothing else. That is the only sanctioned seconds -> frame path in the system, and
+# routing every boundary through it is what keeps cuts on the frame grid: an unsnapped
+# boundary leaves a sub-frame audio residue that accumulates into ~50 ms of A/V skew
+# over six cuts. A `123f` suffix is accepted for a frame index that skips the conversion
+# entirely.
+
+"""Re-render a recording bundle with different edit settings."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+from omarchy_studio import render  # noqa: E402
+from omarchy_studio.project import Bundle, ProjectError  # noqa: E402
+from omarchy_studio.render import RenderError  # noqa: E402
+from omarchy_studio.timebase import FrameRange, Timebase, TimebaseError, normalize  # noqa: E402
+
+DEFAULT_OUTPUT = "export.mp4"
+
+# Fractions of the canvas SHORT side. The tile is kept square in pixels because the
+# default shape is a circle, and a circle mask over a 16:9 rectangle is an ellipse --
+# the webcam settings' w/h are canvas-normalized independently, so squareness has to be
+# computed here rather than assumed.
+WEBCAM_SIZES = {"s": 0.18, "small": 0.18, "m": 0.24, "medium": 0.24, "l": 0.32, "large": 0.32}
+WEBCAM_MARGIN = 0.04
+
+CORNERS = {
+    "top-left": (0, 0), "tl": (0, 0),
+    "top-right": (1, 0), "tr": (1, 0),
+    "bottom-left": (0, 1), "bl": (0, 1),
+    "bottom-right": (1, 1), "br": (1, 1),
+    "center": (0.5, 0.5), "centre": (0.5, 0.5), "c": (0.5, 0.5),
+}
+
+# Paired with BackdropSettings.color to make `--backdrop=gradient` mean something
+# without a second flag. Both are overridable with the `:#hex` suffix.
+DEFAULT_GRADIENT = "#2b3040"
+
+
+class UsageError(ValueError):
+    """A bad command line. Reported without a traceback -- these are user errors."""
+
+
+# --- parsing ----------------------------------------------------------------
+
+
+_TIME_RE = re.compile(r"^(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d+)?)$")
+
+
+def parse_time(spec: str, tb: Timebase) -> int:
+    """A human time -> a frame index, through Timebase.to_frame and nothing else.
+
+    Accepts SS, SS.mmm, MM:SS, HH:MM:SS, and a bare `123f` frame index. The frame form
+    exists because it is the only one that round-trips: `--cut` printed back as seconds
+    and retyped would re-snap, and at 29.97 that is not always the same frame.
+    """
+    s = spec.strip()
+    if not s:
+        raise UsageError("empty time")
+    if s.endswith("f"):
+        try:
+            n = int(s[:-1])
+        except ValueError:
+            raise UsageError(f"bad frame index {spec!r}") from None
+        if n < 0:
+            raise UsageError(f"negative frame index {spec!r}")
+        return n
+    m = _TIME_RE.match(s)
+    if not m:
+        raise UsageError(f"bad time {spec!r}; want SS, MM:SS, HH:MM:SS or Nf")
+    a, b, c = m.groups()
+    parts = [p for p in (a, b) if p is not None]
+    seconds = float(c) + sum(int(p) * 60 ** (len(parts) - i) for i, p in enumerate(parts))
+    try:
+        return tb.to_frame(seconds)
+    except TimebaseError as exc:
+        raise UsageError(str(exc)) from None
+
+
+def parse_cut(spec: str, tb: Timebase) -> FrameRange:
+    """`<start>-<end>` in either time form. '-' is unambiguous: no time form uses it."""
+    if spec.count("-") != 1:
+        raise UsageError(f"bad cut {spec!r}; want <start>-<end>, e.g. 1:05-1:12")
+    lo, hi = spec.split("-")
+    a, b = parse_time(lo, tb), parse_time(hi, tb)
+    if b <= a:
+        raise UsageError(f"cut {spec!r} ends at or before it starts")
+    return FrameRange(a, b)
+
+
+def parse_size(spec: str) -> float:
+    """s/m/l, N%, or a bare 0..1 fraction -- all of the canvas short side."""
+    s = spec.strip().lower()
+    if s in WEBCAM_SIZES:
+        return WEBCAM_SIZES[s]
+    if s.endswith("%"):
+        s = s[:-1]
+        scale = 0.01
+    else:
+        scale = 1.0
+    try:
+        frac = float(s) * scale
+    except ValueError:
+        raise UsageError(f"bad webcam size {spec!r}; want s|m|l, N% or a 0..1 fraction") from None
+    if not 0.0 < frac <= 1.0:
+        raise UsageError(f"webcam size {spec!r} is outside 0..1 of the frame")
+    return frac
+
+
+def parse_position(spec: str) -> tuple[float, float] | str:
+    """A corner name, or explicit normalized coordinates of the tile's top-left."""
+    s = spec.strip().lower()
+    if s in CORNERS:
+        return s
+    if "," not in s:
+        raise UsageError(
+            f"bad webcam position {spec!r}; want a corner ({'|'.join(sorted(set(CORNERS)))}) or x,y"
+        )
+    try:
+        x, y = (float(v) for v in s.split(",", 1))
+    except ValueError:
+        raise UsageError(f"bad webcam coordinates {spec!r}; want x,y as 0..1 fractions") from None
+    return (x, y)
+
+
+def parse_backdrop(spec: str) -> tuple[bool, str | None, str | None]:
+    """`off`, `color[:#hex]`, `gradient[:#hex[,#hex]]` -> (enabled, color, gradient)."""
+    mode, _, rest = spec.strip().lower().partition(":")
+    stops = [c.strip() for c in rest.split(",") if c.strip()]
+    if mode == "off":
+        return False, None, None
+    if mode in ("color", "colour", "solid"):
+        return True, (stops[0] if stops else None), ""
+    if mode == "gradient":
+        color = stops[0] if stops else None
+        second = stops[1] if len(stops) > 1 else DEFAULT_GRADIENT
+        return True, color, second
+    raise UsageError(f"bad backdrop {spec!r}; want off, color or gradient")
+
+
+# --- webcam geometry --------------------------------------------------------
+
+
+def webcam_rect(
+    canvas, *, frac: float, position: tuple[float, float] | str
+) -> tuple[float, float, float, float]:
+    """Canvas-normalized (x, y, w, h) for a square tile of `frac` of the short side.
+
+    Square in PIXELS, which means unequal normalized w and h on any non-square canvas.
+    The circle and rounded masks are generated at the tile's pixel size, so a normalized
+    square would render an ellipse.
+    """
+    side = frac * min(canvas.width, canvas.height)
+    w, h = side / canvas.width, side / canvas.height
+    if isinstance(position, tuple):
+        x, y = position
+    else:
+        fx, fy = CORNERS[position]
+        margin = WEBCAM_MARGIN * min(canvas.width, canvas.height)
+        mx, my = margin / canvas.width, margin / canvas.height
+        # The corner fraction doubles as the interpolation parameter: 0 hugs the left or
+        # top margin, 1 the right or bottom, 0.5 centres with no margin involved.
+        x = mx + fx * (1.0 - w - 2 * mx)
+        y = my + fy * (1.0 - h - 2 * my)
+    x = min(max(x, 0.0), max(0.0, 1.0 - w))
+    y = min(max(y, 0.0), max(0.0, 1.0 - h))
+    return x, y, w, h
+
+
+# --- applying ---------------------------------------------------------------
+
+
+def apply_options(bundle: Bundle, args: argparse.Namespace) -> list[str]:
+    """Fold the command line into bundle.edit. Returns a log of what changed.
+
+    Nothing is written here; `save_edit` does that once, after validation, so a bad
+    option cannot leave edit.json half-updated.
+    """
+    edit = bundle.edit
+    tb = bundle.timebase
+    canvas = bundle.canvas
+    applied: list[str] = []
+
+    if args.reset:
+        bundle.reset_edit()
+        edit = bundle.edit
+        applied.append("reset")
+
+    cam = edit.webcam
+    if args.no_webcam:
+        cam.enabled = False
+        applied.append("webcam=off")
+    if args.webcam is not None or args.webcam_size is not None:
+        if bundle.capture.camera_burned_in:
+            raise UsageError(
+                "the camera is burned into this recording's pixels; it cannot be moved "
+                "or removed. Re-record without --burn-in to keep it editable."
+            )
+        # A resize with no position keeps the existing top-left rather than guessing
+        # which corner the tile was meant to hug; webcam_rect clamps it back on canvas.
+        position = parse_position(args.webcam) if args.webcam is not None else (cam.x, cam.y)
+        frac = (
+            parse_size(args.webcam_size)
+            if args.webcam_size is not None
+            else cam.w * canvas.width / min(canvas.width, canvas.height)
+        )
+        cam.x, cam.y, cam.w, cam.h = webcam_rect(canvas, frac=frac, position=position)
+        if not args.no_webcam:
+            cam.enabled = True
+        applied.append(
+            f"webcam={cam.x:.4f},{cam.y:.4f} size={cam.w * canvas.width:.0f}px"
+        )
+    if args.webcam_shape is not None:
+        if args.webcam_shape not in ("circle", "rounded", "rect"):
+            raise UsageError(f"unknown webcam shape {args.webcam_shape!r}")
+        cam.shape = args.webcam_shape
+        applied.append(f"webcam.shape={cam.shape}")
+
+    if args.zoom is not None:
+        edit.zoom.enabled = args.zoom == "on"
+        applied.append(f"zoom={args.zoom}")
+    if args.zoom_amount is not None:
+        # Zoom refuses to construct below 1.0; clamp rather than raise, so a script
+        # sweeping the amount cannot die on its first step.
+        edit.zoom.amount = max(1.0, float(args.zoom_amount))
+        applied.append(f"zoom.amount={edit.zoom.amount}")
+    if args.zoom_hold is not None:
+        edit.zoom.hold_frames = max(1, tb.to_frame(float(args.zoom_hold)))
+        applied.append(f"zoom.hold={edit.zoom.hold_frames}f")
+
+    if args.backdrop is not None:
+        enabled, color, gradient = parse_backdrop(args.backdrop)
+        edit.backdrop.enabled = enabled
+        if color:
+            edit.backdrop.color = color
+        if gradient is not None:
+            edit.backdrop.gradient = gradient or None
+        applied.append(f"backdrop={args.backdrop}")
+    if args.padding is not None:
+        edit.backdrop.padding = float(args.padding)
+        applied.append(f"backdrop.padding={edit.backdrop.padding}")
+    if args.radius is not None:
+        edit.backdrop.corner_radius = float(args.radius)
+        applied.append(f"backdrop.radius={edit.backdrop.corner_radius}")
+
+    if args.cut:
+        new = [parse_cut(spec, tb) for spec in args.cut]
+        # Merge on insert: a layer spanning ~30 separate output intervals approaches
+        # ffmpeg's 100-term expression budget, and merging is what keeps gates small.
+        edit.cuts = normalize(edit.cuts + new)
+        applied.append("cuts=" + ",".join(f"{c.start}-{c.end}" for c in edit.cuts))
+
+    return applied
+
+
+# --- bundle discovery -------------------------------------------------------
+
+
+def recordings_dir() -> Path:
+    """Where omarchy-capture-screenrecording puts bundles. Same precedence as it uses."""
+    for env in ("OMARCHY_SCREENRECORD_DIR", "XDG_VIDEOS_DIR"):
+        v = os.environ.get(env)
+        if v:
+            return Path(v)
+    return Path.home() / "Videos"
+
+
+def locate_latest() -> Path | None:
+    """The newest bundle, for `latest` and for the menu entries.
+
+    Sorted by capture.json's mtime, not the directory's: a bundle's directory mtime
+    changes when the editor writes edit.json, so directory order would make the last
+    recording *edited* look like the last recording *made*.
+    """
+    root = recordings_dir()
+    if not root.is_dir():
+        return None
+    found = [p for p in root.glob("screenrecording-*") if (p / "capture.json").is_file()]
+    if not found:
+        return None
+    return max(found, key=lambda p: (p / "capture.json").stat().st_mtime)
+
+
+def open_bundle(spec: str) -> Bundle:
+    if spec in ("", "latest"):
+        found = locate_latest()
+        if found is None:
+            raise UsageError(f"no recordings in {recordings_dir()}")
+        return Bundle(found)
+    return Bundle(Path(spec).expanduser())
+
+
+# --- reporting --------------------------------------------------------------
+
+
+def edit_summary(bundle: Bundle) -> dict:
+    tb = bundle.timebase
+    edit = bundle.edit
+    return {
+        "cuts": [
+            {"start": c.start, "end": c.end,
+             "start_s": tb.to_seconds(c.start), "end_s": tb.to_seconds(c.end)}
+            for c in edit.cuts
+        ],
+        "zoom": asdict(edit.zoom),
+        "webcam": asdict(edit.webcam),
+        "backdrop": asdict(edit.backdrop),
+        "layers": [{"id": l.id, "type": l.type, "enabled": l.enabled} for l in edit.layers],
+        "normalize_audio": edit.normalize_audio,
+        "trim_head_frames": edit.trim_head_frames,
+    }
+
+
+def status(bundle: Bundle, applied: list[str], plan) -> dict:
+    tb = bundle.timebase
+    out = {
+        "ok": True,
+        "bundle": str(bundle.root),
+        "applied": applied,
+        "timebase": {"fps_num": tb.fps_num, "fps_den": tb.fps_den},
+        "canvas": {"width": bundle.canvas.width, "height": bundle.canvas.height},
+        "has_camera": bundle.capture.camera is not None,
+        "camera_burned_in": bundle.capture.camera_burned_in,
+        "edit": edit_summary(bundle),
+    }
+    if plan is not None:
+        out["source_frames"] = render.effective_cutmap(bundle).total_frames
+        out["output_frames"] = plan.total_frames
+        out["output_seconds"] = tb.to_seconds(plan.total_frames)
+        out["inputs"] = plan.input_specs
+    return out
+
+
+def _ticker(quiet: bool):
+    """A one-line progress ticker. A menu-launched export has no terminal at all, and a
+    terminal that prints nothing for a minute of encoding looks hung."""
+    last = [-1]
+
+    def report(done: int, total: int) -> None:
+        if quiet or total <= 0:
+            return
+        pct = int(100 * done / total)
+        if pct != last[0]:
+            print(f"\rrendering: {pct:3d}%  ({done}/{total} frames)",
+                  end="", file=sys.stderr, flush=True)
+            last[0] = pct
+
+    return report
+
+
+def notify(title: str, body: str) -> None:
+    """Desktop notification, best effort. The menu is the caller with no stdout."""
+    if not shutil.which("notify-send"):
+        return
+    subprocess.run(
+        ["notify-send", "-a", "Omarchy Studio", "-i", "video-x-generic", title, body],
+        check=False,
+    )
+
+
+# --- entry point ------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="omarchy-capture-screenrecording-edit",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Times accept SS, SS.mmm, MM:SS, HH:MM:SS or a bare frame index like 90f.\n"
+            "Options are written to <bundle>/edit.json; the capture is never modified.\n"
+            "With no bundle, or the literal `latest`, the newest recording is used."
+        ),
+    )
+    ap.add_argument("bundle", nargs="?", default="latest",
+                    help="a recording directory, or `latest` (the default)")
+    ap.add_argument("-o", "--output", metavar="FILE",
+                    help=f"where to write the render (default <bundle>/{DEFAULT_OUTPUT})")
+
+    ap.add_argument("--webcam", metavar="CORNER|X,Y",
+                    help="bottom-left, top-right, ... or explicit normalized x,y")
+    ap.add_argument("--webcam-size", metavar="S", help="s|m|l, N%%, or a 0..1 fraction")
+    ap.add_argument("--webcam-shape", metavar="SHAPE", help="circle|rounded|rect")
+    ap.add_argument("--no-webcam", action="store_true", help="leave the camera out")
+
+    ap.add_argument("--zoom", choices=("on", "off"), help="auto-zoom from the click track")
+    ap.add_argument("--zoom-amount", type=float, metavar="F", help="magnification, >= 1.0")
+    ap.add_argument("--zoom-hold", type=float, metavar="SECONDS",
+                    help="how long each zoom stays in before easing out")
+
+    ap.add_argument("--backdrop", metavar="MODE",
+                    help="off | color[:#hex] | gradient[:#hex,#hex]")
+    ap.add_argument("--padding", type=float, metavar="F",
+                    help="backdrop inset, as a fraction of the short side")
+    ap.add_argument("--radius", type=float, metavar="F",
+                    help="backdrop corner radius, as a fraction of the short side")
+
+    ap.add_argument("--cut", action="append", metavar="START-END", default=[],
+                    help="remove a section; repeatable")
+    ap.add_argument("--reset", action="store_true",
+                    help="delete edit.json first, so the run starts from defaults")
+
+    ap.add_argument("--print-plan", action="store_true",
+                    help="dump the filtergraph and the ffmpeg argv, then exit")
+    ap.add_argument("--no-render", action="store_true",
+                    help="apply the options and save edit.json without rendering")
+    ap.add_argument("--json", action="store_true", help="machine-readable status on stdout")
+    ap.add_argument("--notify", action="store_true", help="send a desktop notification when done")
+    ap.add_argument("--locate", action="store_true",
+                    help="print the resolved bundle path and exit (1 if there is none)")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    emit: dict = {}
+    try:
+        if args.locate:
+            found = locate_latest() if args.bundle == "latest" else Path(args.bundle)
+            if found is None or not (found / "capture.json").is_file():
+                return 1
+            print(found)
+            return 0
+
+        bundle = open_bundle(args.bundle)
+        applied = apply_options(bundle, args)
+        if applied:
+            # save_edit validates first, so an out-of-range cut is refused before it can
+            # reach the disk. Saved even under --print-plan: the options were asked for.
+            bundle.save_edit()
+
+        plan = None
+        if not args.no_render or args.print_plan:
+            plan = render.build_graph(bundle)
+
+        emit = status(bundle, applied, plan)
+
+        if args.print_plan:
+            emit["graph"] = plan.graph
+            emit["argv"] = plan.argv(Path("<graph>"), Path(args.output or "<output>"))
+            if args.json:
+                print(json.dumps(emit, indent=2))
+            else:
+                print(plan.graph)
+                print()
+                print("# " + " ".join(emit["argv"]), file=sys.stderr)
+            return 0
+
+        if args.no_render:
+            emit["rendered"] = False
+            if args.json:
+                print(json.dumps(emit, indent=2))
+            else:
+                _print_human(emit)
+            return 0
+
+        out_path = Path(args.output) if args.output else bundle.root / DEFAULT_OUTPUT
+        started = time.monotonic()
+        render.run_plan(plan, out_path, progress=_ticker(args.json))
+        if not args.json:
+            print(file=sys.stderr)
+        emit["rendered"] = True
+        emit["render"] = {
+            "path": str(out_path),
+            "bytes": out_path.stat().st_size,
+            "frames": plan.total_frames,
+            "seconds": bundle.timebase.to_seconds(plan.total_frames),
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+        if args.json:
+            print(json.dumps(emit, indent=2))
+        else:
+            _print_human(emit)
+        if args.notify:
+            notify("Recording exported", str(out_path))
+        return 0
+
+    except (UsageError, ProjectError, RenderError, TimebaseError, OSError) as exc:
+        if args.json:
+            print(json.dumps({**emit, "ok": False, "error": str(exc)}, indent=2))
+        else:
+            print(f"omarchy-capture-screenrecording-edit: {exc}", file=sys.stderr)
+        if args.notify:
+            notify("Export failed", str(exc))
+        return 1
+
+
+def _print_human(emit: dict) -> None:
+    print(f"bundle:  {emit['bundle']}")
+    if emit["applied"]:
+        print(f"applied: {', '.join(emit['applied'])}")
+    if "output_frames" in emit:
+        print(f"length:  {emit['output_frames']} frames ({emit['output_seconds']:.3f}s)")
+    r = emit.get("render")
+    if r:
+        print(f"wrote:   {r['path']}  ({r['bytes'] / 1e6:.1f} MB in {r['elapsed_s']:.1f}s)")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

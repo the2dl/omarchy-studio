@@ -1,2 +1,14 @@
-module OmarchyStudio
+# A DIRECTORY qmldir, deliberately not a module.
+#
+# bin/omarchy-studio runs `qml6 -I editor editor/main.qml`, so main.qml reaches its
+# siblings through the implicit import of its own directory. Adding a `module Foo` line
+# here turns the directory into a named module and that implicit import stops resolving:
+# every type in the app fails to load, and the only symptom is a window that never
+# appears while the launcher waits out its timeout.
+#
+# Both services are singletons because the model must exist exactly once. Bridge holds
+# the resolved project state that every component binds to; a second instance would hold
+# a second, diverging copy of the project.
 singleton Theme 1.0 Theme.qml
+singleton Bridge 1.0 Bridge.qml
+singleton Style 1.0 Style.qml

@@ -80,7 +80,12 @@ Item {
     Component {
         id: shapeComp
         Rectangle {
+            // The colour and its alpha arrive split, because the project stores one
+            // 'colour@alpha' property and Qt cannot parse that spelling -- handed the
+            // raw string it silently drew white.
             color: root.spec.shape ? root.spec.shape.color : "#ff3b30"
+            opacity: root.spec.shape && root.spec.shape.opacity !== undefined
+                     ? root.spec.shape.opacity : 1
             radius: root.spec.shape ? root.spec.shape.radius : 0
         }
     }
@@ -104,7 +109,13 @@ Item {
                 text: root.spec.text.text
                 color: root.spec.text.color
                 font.pixelSize: root.spec.text.pixelSize
-                font.family: Theme.monoFamily
+                // The font FILE the bridge names, which is the file drawtext is given.
+                // Resolving a family name instead lets fontconfig hand Qt and libavfilter
+                // different faces, and the metrics diverge before the glyphs visibly do.
+                // This is the layer's font, not the editor's chrome font, so it is
+                // deliberately not Theme.fontFamily.
+                font.family: layerFont.status === FontLoader.Ready
+                             ? layerFont.name : "monospace"
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
@@ -170,28 +181,35 @@ Item {
         }
     }
 
+    FontLoader {
+        id: layerFont
+        source: "file://" + (Bridge.state.font_file || "")
+    }
+
     Component {
         id: unknownComp
         Rectangle {
             color: "transparent"
-            border.color: Theme.warning
+            border.color: Theme.accent
             border.width: 2
             Text {
                 x: 6; y: 4
                 text: "unsupported layer: " + root.spec.type
-                color: Theme.warning
+                color: Theme.accent
                 font.pixelSize: 16
             }
         }
     }
 
+    // 1.5px ring, not a heavy border: rings mean selected everywhere in this design
+    // (spec §1 "Selected card / keyframe").
     Rectangle {
         x: 0; y: 0
         width: root.width; height: root.height
         visible: root.selected
         color: "transparent"
         border.color: Theme.accent
-        border.width: 2
+        border.width: 1.5
     }
 
     MouseArea {
@@ -222,6 +240,8 @@ Item {
 
     // Bottom-right resize grip. Square-ish handles at canvas scale would be invisible
     // on a scaled-down stage, so it is sized in canvas pixels against the stage scale.
+    // The grip reads as a small corner handle; the transparent rectangle around it is
+    // the hit area, kept at gripSize because a 7px target is not draggable.
     Rectangle {
         id: grip
         visible: root.selected && root.interactive
@@ -229,8 +249,12 @@ Item {
         height: root.gripSize
         x: root.width - width / 2
         y: root.height - height / 2
-        color: Theme.accent
-        radius: 2
+        color: "transparent"
+        Rectangle {
+            anchors.centerIn: parent
+            width: 7; height: 7; radius: 3.5
+            color: Theme.accent
+        }
         MouseArea {
             x: 0; y: 0
             width: parent.width; height: parent.height

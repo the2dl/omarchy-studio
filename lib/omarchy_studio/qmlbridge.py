@@ -26,14 +26,15 @@ import signal
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
+from . import events as _events
+from . import zoom as _zoom
 from .geometry import Canvas, Placement, Rect, Zoom, qml_blur
 from .project import Bundle, Layer, ProjectError
-from .timebase import FrameRange, Timebase, normalize
+from .timebase import CutMap, FrameRange, Timebase, normalize
 
 # The one font file both engines use. Naming a family instead lets fontconfig hand Qt
 # and libavfilter different faces, and the metrics diverge before the glyphs visibly do.
@@ -237,143 +238,89 @@ def _geom(d: dict, key_w: str = "w", key_h: str = "h") -> tuple[float, float, fl
 
 
 def click_events(bundle: Bundle) -> list[dict]:
-    """Clicks from events/input.jsonl as frame indices and normalized focal points.
+    """Clicks as frame indices and normalized focal points, for the timeline ruler.
 
-    Two conversions, both of which have bitten someone:
-
-    * `t` is CLOCK_MONOTONIC seconds and the screen stream's anchor is CLOCK_MONOTONIC
-      microseconds of frame 0, so the difference -- plus the compositor-to-capture
-      latency -- is what indexes the frame grid.
-    * event coordinates are LOGICAL compositor pixels and the video is PHYSICAL, so they
-      are offset by the captured region's logical origin and scaled by monitor_scale. On
-      a scale-2 display `-w 1600x900+200+200` yields a 3200x1800 video.
+    Delegates to events.map_clicks rather than re-reading input.jsonl. The mapping
+    applies the anchor, the calibration offset and the logical-to-physical scale
+    together, and applying two of the three yields plausible-looking targets that
+    nothing downstream flags -- so there must be exactly one implementation of it.
     """
     path = bundle.events_dir / "input.jsonl"
-    if not path.exists():
+    if not path.exists() or bundle.capture.screen is None:
         return []
-    cap = bundle.capture
-    screen = cap.screen
-    if screen is None:
-        return []
-    tb = Timebase(screen.fps_num, screen.fps_den)
-    anchor_s = (screen.anchor_us or 0) / 1e6
-    lx, ly, _, _ = _geom(cap.logical_geometry)
-    scale = cap.monitor_scale or 1.0
-    cw, ch = screen.width, screen.height
-    out: list[dict] = []
-    for line in path.read_text(errors="replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue  # a truncated tail is normal if the recorder was killed
-        if rec.get("type") != "click":
-            continue
-        rel = float(rec.get("t", 0.0)) - anchor_s + cap.calibration_c_ms / 1000.0
-        if rel < 0:
-            continue  # clicked before frame 0 existed
-        frame = tb.to_frame(rel)
-        px = (float(rec.get("x", 0)) - lx) * scale
-        py = (float(rec.get("y", 0)) - ly) * scale
-        out.append(
-            {
-                "frame": frame,
-                "button": rec.get("button", "left"),
-                "cx": min(max(px / cw, 0.0), 1.0),
-                "cy": min(max(py / ch, 0.0), 1.0),
-            }
-        )
-    out.sort(key=lambda c: c["frame"])
-    return out
-
-
-def _smootherstep(u: float) -> float:
-    """The same quintic the export's zoom envelope uses. C2 at both ends, so a zoom that
-    starts on a click does not visibly kick."""
-    u = 0.0 if u < 0.0 else 1.0 if u > 1.0 else u
-    return u * u * u * (u * (u * 6.0 - 15.0) + 10.0)
-
-
-@dataclass(frozen=True)
-class ZoomEvent:
-    """One merged zoom gesture on the source timeline."""
-
-    start: int  # frame the ease-in begins
-    hold_end: int  # frame the ease-out begins
-    cx: float
-    cy: float
-
-
-def zoom_events(bundle: Bundle, clicks: list[dict] | None = None) -> list[ZoomEvent]:
-    """Merge the click track into zoom gestures.
-
-    Clicks closer together than merge_gap_frames become ONE gesture at the first click's
-    frame, holding until the last one has had its hold, focussed on their mean. Zooming
-    per click instead pumps the frame on any double-click.
-    """
-    z = bundle.edit.zoom
-    if not z.enabled:
-        return []
-    cl = click_events(bundle) if clicks is None else clicks
-    if not cl:
-        return []
-    groups: list[list[dict]] = [[cl[0]]]
-    for c in cl[1:]:
-        if c["frame"] - groups[-1][-1]["frame"] <= z.merge_gap_frames:
-            groups[-1].append(c)
-        else:
-            groups.append([c])
-    out = []
-    for g in groups:
-        cx = sum(c["cx"] for c in g) / len(g)
-        cy = sum(c["cy"] for c in g) / len(g)
-        out.append(ZoomEvent(g[0]["frame"], g[-1]["frame"] + z.hold_frames, cx, cy))
-    return out
+    mapped = _events.map_clicks(
+        _events.read_clicks(path), bundle.capture, bundle.timebase
+    )
+    return [
+        {"frame": m.frame, "button": m.button, "cx": m.cx, "cy": m.cy} for m in mapped
+    ]
 
 
 def zoom_track(bundle: Bundle) -> dict:
-    """Per-frame resolved zoom, as parallel arrays.
+    """Per-frame resolved zoom, as parallel arrays, sampled from the EXPORT's envelope.
 
-    Sampled rather than described because the alternative is QML re-implementing the
-    easing, which is the one thing that must not diverge from the export. Only frames
-    where the zoom is not identity are emitted; the preview holds identity elsewhere.
+    This calls zoom.zoom_segments / zoom.zoom_at -- the same two functions the
+    filtergraph is generated from -- rather than reproducing the easing here. A second
+    implementation of the envelope is the exact failure the geometry seam exists to
+    prevent: it stays plausible while diverging, so the preview lies about timing while
+    looking correct, and nobody notices until frames are compared side by side.
+
+    Sampled rather than described because the alternative is QML doing the easing,
+    which moves the same problem one layer further out. Frames where the zoom is
+    identity are omitted; the preview holds identity between samples.
     """
     canvas = bundle.canvas
+    path = bundle.events_dir / "input.jsonl"
+    clicks = (
+        _events.map_clicks(
+            _events.read_clicks(path), bundle.capture, bundle.timebase
+        )
+        if path.exists()
+        else []
+    )
+    # Not bundle.cutmap(): that probes the media for an exact frame count, and the
+    # preview has to keep working while the master is missing, still being written, or
+    # on another machine. _safe_source_frames falls back to a duration estimate.
+    # _safe_source_frames returns 0 when the media is unreadable, and a CutMap over 0
+    # frames keeps nothing -- every click would map to None and the preview would show
+    # no zoom at all rather than showing it without a duration. Widen the total to cover
+    # everything we actually hold so an unreadable master degrades to "zoom renders,
+    # timeline length unknown" instead of "zoom silently disabled".
     total = _safe_source_frames(bundle)
-    events = zoom_events(bundle)
-    amount = bundle.edit.zoom.amount
-    ease = max(1, bundle.edit.zoom.ease_frames)
+    if bundle.edit.cuts:
+        total = max(total, max(c.end for c in bundle.edit.cuts))
+    if clicks:
+        total = max(total, max(c.frame for c in clicks) + 1)
+    cutmap = CutMap(bundle.edit.cuts, total)
+    segments = _zoom.zoom_segments(clicks, bundle.edit.zoom, bundle.timebase, cutmap)
+    if not segments:
+        return {"frames": [], "scale": [], "x": [], "y": []}
+
     frames: list[int] = []
     scales: list[float] = []
     xs: list[float] = []
     ys: list[float] = []
-    for ev in events:
-        first, last = ev.start, ev.hold_end + ease
-        if total:
-            last = min(last, total)
-        for f in range(first, last):
-            if f < ev.start + ease:
-                env = _smootherstep((f - ev.start) / ease)
-            elif f < ev.hold_end:
-                env = 1.0
-            else:
-                env = 1.0 - _smootherstep((f - ev.hold_end) / ease)
-            scale = 1.0 + (amount - 1.0) * env
-            if scale <= 1.0 + 1e-9:
+    # Segments are on the OUTPUT timeline and disjoint, so walking each one's own span
+    # visits every non-identity frame exactly once without scanning the whole recording.
+    # Each sample is then mapped BACK to source time, because the preview plays the
+    # uncut proxy and steps over cuts: indexing the track by output frame would slide
+    # every zoom earlier by the length of the cuts before it, and only on projects that
+    # have cuts.
+    for seg in segments:
+        for f in range(seg.t.start, seg.t.end):
+            z = _zoom.zoom_at(segments, f)
+            if z.identity:
                 continue
-            q = Zoom(scale, ev.cx, ev.cy).to_qml(canvas)
-            if frames and f == frames[-1]:
-                continue  # two gestures overlapping: the earlier one already placed it
-            frames.append(f)
+            src = cutmap.to_source(f)
+            if frames and src <= frames[-1]:
+                continue
+            q = z.to_qml(canvas)
+            frames.append(src)
             scales.append(q["scale"])
             xs.append(q["x"])
             ys.append(q["y"])
             if len(frames) >= _MAX_ZOOM_SAMPLES:
-                break
-        if len(frames) >= _MAX_ZOOM_SAMPLES:
-            break
+                return {"frames": frames, "scale": scales, "x": xs, "y": ys}
     return {"frames": frames, "scale": scales, "x": xs, "y": ys}
 
 
@@ -650,6 +597,27 @@ def _find_layer(layers: list[Layer], layer_id: str) -> Layer:
         if l.id == layer_id:
             return l
     raise BridgeError(f"no layer {layer_id!r}")
+
+
+# --- theme -------------------------------------------------------------------
+
+
+def theme_tokens() -> dict:
+    """The design tokens for the editor's chrome, resolved from the user's Omarchy theme.
+
+    Served from here because theme.py owns every mix, alpha and contrast decision: QML
+    applies the answer and derives nothing, which is the same rule the geometry seam
+    follows and for the same reason. A missing or unreadable theme is not fatal -- the
+    editor ships a default palette and simply keeps it.
+    """
+    try:
+        from . import theme as theme_mod
+    except ImportError:
+        return {}
+    try:
+        return json.loads(theme_mod.dump())
+    except Exception:
+        return {}
 
 
 # --- proxy -------------------------------------------------------------------
@@ -1025,6 +993,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(self.session.exporter.snapshot())
             if r == "/proxy":
                 return self._send(dict(self.session.proxy.status))
+            if r == "/theme":
+                return self._send(theme_tokens())
         except Exception as e:
             return self._send({"error": f"{type(e).__name__}: {e}"}, 500)
         self._send({"error": "not found"}, 404)

@@ -43,14 +43,20 @@ def make_bundle(
     burned_in: bool = False,
     media: bool = True,
     clicks: tuple[float, ...] = (0.6, 1.4, 1.5, 2.2),
+    cam_anchor_delta_us: int = 120_000,
 ) -> Path:
-    """Lay out a bundle at `root` and return it. `media=False` skips the ffmpeg work."""
+    """Lay out a bundle at `root` and return it. `media=False` skips the ffmpeg work.
+
+    `cam_anchor_delta_us` is the camera anchor relative to the screen anchor. The real
+    offset can be either sign (launch order plus per-pipeline warm-up), so alignment
+    tests need to dial it rather than inherit the one baked-in value.
+    """
     root = Path(root)
     cap = Capture(
         created="2026-09-02T14:32:17",
         screen=Stream("media/screen.mp4", width, height, FPS, 1, ANCHOR_US, has_audio=True),
         camera=(
-            Stream("media/camera.mp4", 640, 480, FPS, 1, ANCHOR_US + 120_000)
+            Stream("media/camera.mp4", 640, 480, FPS, 1, ANCHOR_US + cam_anchor_delta_us)
             if camera and not burned_in
             else None
         ),
@@ -65,14 +71,16 @@ def make_bundle(
         _lavfi(root / "media" / "screen.mp4", "testsrc2", seconds, f"{width}x{height}", True)
         if cap.camera is not None:
             _lavfi(root / "media" / "camera.mp4", "smptebars", seconds, "640x480", False)
+    # The schema events.py reads: CLOCK_MONOTONIC MICROSECONDS as `t_us`. Seconds are
+    # not interchangeable here -- a float-seconds log parses as zero clicks, silently.
     lines = [
-        json.dumps({"t": ANCHOR_US / 1e6, "type": "meta", "schema": 1, "hz": 120.0}),
+        json.dumps({"t_us": ANCHOR_US, "type": "meta", "schema": 1, "hz": 120.0}),
     ]
     for i, t in enumerate(clicks):
         lines.append(
             json.dumps(
                 {
-                    "t": ANCHOR_US / 1e6 + t,
+                    "t_us": ANCHOR_US + round(t * 1_000_000),
                     "type": "click",
                     "button": "left",
                     # Logical pixels inside the captured region, which starts at 200,100.
@@ -81,7 +89,8 @@ def make_bundle(
                 }
             )
         )
-    lines.append(json.dumps({"t": ANCHOR_US / 1e6 + seconds, "type": "end", "clicks": len(clicks)}))
+    lines.append(json.dumps({"t_us": ANCHOR_US + round(seconds * 1_000_000),
+                             "type": "end", "clicks": len(clicks)}))
     (root / "events").mkdir(parents=True, exist_ok=True)
     (root / "events" / "input.jsonl").write_text("\n".join(lines) + "\n")
     return root

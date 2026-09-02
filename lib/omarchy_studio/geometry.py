@@ -15,9 +15,10 @@ Conventions, all measured rather than assumed:
 * Text is anchored by its CENTRE. Centre-anchored text matched to 0.0px; left-anchored
   drifted ~7% of string width, because glyph advances differ between Qt's shaper and
   libavfilter's drawtext even with the same font file.
-* Blur is calibrated, not shared: Qt's MultiEffect blur and ffmpeg's gblur are different
-  kernels. The preview is biased *stronger* than the export -- a redaction that looks
-  sufficient in the preview and renders weaker is a data leak.
+* Redaction is three presets and the canvas renders EXPORT strength, never a heavier
+  preview. Qt's MultiEffect and ffmpeg's gblur are different kernels, so the Qt value is
+  the export sigma mapped back through a measured ratio -- calibrated to match, not
+  chosen to look right. See REDACT_PRESETS.
 """
 
 from __future__ import annotations
@@ -28,8 +29,22 @@ from dataclasses import dataclass
 # Measured by matching perceived radius on a redaction box at 1080p.
 _QT_BLURMAX_TO_GBLUR_SIGMA = 18.0 / 48.0
 
-# The preview leans this much heavier than the export. Never below 1.0.
-_PREVIEW_BLUR_BIAS = 1.15
+# Redaction is three presets, never a continuous strength, and the weakest is already
+# past what OCR can recover. This is the design spec's one non-negotiable rule
+# (docs/design/spec.md, "Redaction -- the one hard rule") and it is a correctness
+# requirement, not a style preference: a slider's whole purpose is to let someone stop
+# at "looks about right", and that is exactly the setting that leaks a password.
+#
+# An earlier version of this file biased the PREVIEW 15% heavier than the export, on the
+# theory that erring safe was safer. It is not: it means the canvas shows something the
+# file does not, so the number the user judged is not the number that shipped. The
+# preview renders export strength exactly.
+REDACT_PRESETS: dict[str, float] = {
+    "strong": 22.0,
+    "heavy": 34.0,
+    "solid": 60.0,
+}
+DEFAULT_REDACT = "strong"
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -184,27 +199,55 @@ class Placement:
         return f"w={int(r.w)}:h={int(r.h)}", f"x={int(r.x)}:y={int(r.y)}"
 
 
-def blur_sigma(strength: float, *, for_preview: bool) -> float:
-    """Map a 0..1 redaction strength onto each engine's blur parameter.
+def blur_sigma(preset: str) -> float:
+    """The gblur sigma for a redaction preset. One value; both engines get the same one.
 
-    The preview is deliberately biased stronger. A user who drags a blur box until the
-    password is unreadable in the preview must not get a weaker blur in the export.
+    An unknown preset raises rather than defaulting. Silently falling back to the
+    weakest setting on a typo is the failure this whole rule exists to prevent.
     """
-    if not 0.0 <= strength <= 1.0:
-        raise ValueError(f"blur strength {strength} outside 0..1")
-    sigma = strength * 48.0 * _QT_BLURMAX_TO_GBLUR_SIGMA
-    return sigma * _PREVIEW_BLUR_BIAS if for_preview else sigma
+    key = (preset or DEFAULT_REDACT).strip().lower()
+    if key not in REDACT_PRESETS:
+        raise ValueError(
+            f"unknown redaction preset {preset!r}; expected one of "
+            f"{', '.join(REDACT_PRESETS)}"
+        )
+    return REDACT_PRESETS[key]
 
 
-def qml_blur(strength: float) -> dict:
-    """MultiEffect properties. blurMax is fixed so `blur` alone carries the strength."""
-    return {"blurEnabled": True, "blurMax": 48, "blur": _clamp(strength * _PREVIEW_BLUR_BIAS, 0.0, 1.0)}
+def qml_blur(preset: str) -> dict:
+    """MultiEffect properties rendering the SAME strength the export will.
+
+    `blurMax` is derived from the target sigma and `blur` is left at 1.0, rather than
+    pinning blurMax and scaling blur. Pinning it at 48 caps the preview at an effective
+    sigma of 18, so `heavy` (34) and `solid` (60) both clamped: the canvas showed a
+    weaker redaction than the file carried, which the parity harness caught as a 25.5px
+    silhouette divergence. Deriving blurMax means every preset is reachable exactly.
+    """
+    sigma = blur_sigma(preset)
+    return {
+        "blurEnabled": True,
+        "blurMax": max(1, round(sigma / _QT_BLURMAX_TO_GBLUR_SIGMA)),
+        "blur": 1.0,
+    }
 
 
-def ffmpeg_blur(strength: float) -> str:
-    """gblur, not boxblur -- a Gaussian is the same kernel family as Qt's, so the two
-    stay comparable as strength varies. boxblur diverges badly at high radius."""
-    return f"gblur=sigma={_fmt(blur_sigma(strength, for_preview=False))}:steps=3"
+def ffmpeg_blur(preset: str) -> str:
+    """gblur, not boxblur -- a Gaussian is the same kernel family as Qt's, so preview and
+    export stay comparable across presets. boxblur diverges badly at high radius."""
+    return f"gblur=sigma={_fmt(blur_sigma(preset))}:steps=3"
+
+
+def ffmpeg_pixelate(preset: str, canvas: Canvas) -> str:
+    """The `pixelate` method. Block size scales with the same preset ladder so switching
+    method does not silently change how much is recoverable."""
+    block = max(4, round(blur_sigma(preset) / 22.0 * 0.012 * canvas.width))
+    return f"pixelize=w={block}:h={block}"
+
+
+def ffmpeg_fill(color: str = "#0d0e10") -> str:
+    """The `fill` method: nothing of the original survives. The safe floor."""
+    r, g, b = _parse(color)
+    return f"drawbox=x=0:y=0:w=iw:h=ih:color=0x{r:02x}{g:02x}{b:02x}:t=fill"
 
 
 def text_placement(text: str, place: Placement, canvas: Canvas, font_px: int) -> dict:

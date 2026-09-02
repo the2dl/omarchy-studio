@@ -23,13 +23,21 @@ Item {
         Behavior on color { ColorAnimation { duration: Theme.durFast } }
     }
 
+    // The spec's shadow is `0 6px 18px rgba(accent, 0.22)` -- an 18px blur under a 30px
+    // button, so it reads as the button sitting slightly proud of the panel. MultiEffect
+    // measures blur against blurMax rather than in pixels, so blurMax is pinned to 18 and
+    // shadowBlur left at 1.0 to mean exactly that radius. Scaling shadowBlur against the
+    // default blurMax of 32 instead spreads the halo past the button's own width, which
+    // stops reading as depth and starts reading as fuzz.
     MultiEffect {
         source: fill
         anchors.fill: fill
         shadowEnabled: true
         shadowColor: Theme.accentGlow
         shadowVerticalOffset: 6
-        shadowBlur: 0.6
+        shadowBlur: 1.0
+        blurMax: 18
+        shadowScale: 1.0
         opacity: root.enabled ? 1 : 0
     }
 

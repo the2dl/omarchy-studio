@@ -80,9 +80,9 @@ def test_resolved_zoom_matches_geometry_and_carries_origin(bundle):
 def test_blur_layer_resolves_to_multieffect_properties(bundle):
     from omarchy_studio.geometry import qml_blur
 
-    bundle.edit.layers.append(Layer(id="b1", type="blur", x=0.1, y=0.1, w=0.2, h=0.2, props={"strength": 0.4}))
+    bundle.edit.layers.append(Layer(id="b1", type="blur", x=0.1, y=0.1, w=0.2, h=0.2, props={"preset": "heavy"}))
     d = qmlbridge.resolve_layer(bundle.edit.layers[-1], bundle.canvas, bundle)
-    assert d["blur"] == qml_blur(0.4)
+    assert d["blur"] == qml_blur("heavy")
     assert d["rect"]["width"] == pytest.approx(0.2 * bundle.canvas.width)
 
 
@@ -236,8 +236,8 @@ def test_add_blur_layer_and_update_it(bundle):
     qmlbridge.apply_op(bundle, "add_blur", {"rect": {"x": 128, "y": 72, "width": 256, "height": 144}})
     lay = bundle.edit.layers[0]
     assert lay.type == "blur" and lay.x == pytest.approx(0.1)
-    qmlbridge.apply_op(bundle, "update_layer", {"id": lay.id, "props": {"strength": 0.9}, "opacity": 0.5})
-    assert lay.props["strength"] == 0.9 and lay.opacity == 0.5
+    qmlbridge.apply_op(bundle, "update_layer", {"id": lay.id, "props": {"preset": "solid"}, "opacity": 0.5})
+    assert lay.props["preset"] == "solid" and lay.opacity == 0.5
     qmlbridge.apply_op(bundle, "delete_layer", {"id": lay.id})
     assert bundle.edit.layers == []
 

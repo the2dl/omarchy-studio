@@ -107,8 +107,16 @@ def test_text_is_centred_on_the_same_point_geometry_reports():
 
 
 def test_blur_sigma_comes_from_geometry():
-    layer = Layer(id="b", type="blur", w=0.25, h=0.25, props={"strength": 0.75})
-    assert ffmpeg_blur(0.75) in compile_one(layer).filter_chain
+    layer = Layer(id="b", type="blur", w=0.25, h=0.25, props={"preset": "heavy"})
+    assert ffmpeg_blur("heavy") in compile_one(layer).filter_chain
+
+
+def test_an_unknown_redaction_preset_raises_rather_than_defaulting():
+    """Falling back to the weakest setting on a typo is the failure the preset ladder
+    exists to prevent -- it would silently ship the least-obscured option."""
+    layer = Layer(id="b", type="blur", w=0.2, h=0.2, props={"preset": "medium"})
+    with pytest.raises(ValueError):
+        compile_one(layer)
 
 
 def test_blur_uses_gblur_not_boxblur():

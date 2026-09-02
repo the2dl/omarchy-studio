@@ -23,6 +23,766 @@
 
 <section style="width: 2100px; box-sizing: border-box; padding: 56px 56px 80px; font-family: 'JetBrains Mono', monospace; color: #eceae7; display: flex; flex-direction: column; gap: 52px;">
 
+  <div style="display: flex; flex-direction: column; gap: 11px; max-width: 1000px;">
+    <div style="font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; color: #6d6863;">Turn 2 · blocking gaps</div>
+    <div style="font-size: 32px; font-weight: 500; letter-spacing: -0.01em;">Layers, cuts, and the states in between</div>
+    <div style="font-size: 14px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">Ids: <a href="#2a">2a</a> layers in the editor · <a href="#2b">2b</a> layer inspectors · <a href="#2c">2c</a> cuts · <a href="#2d">2d</a> recordings · <a href="#2e">2e</a> proxy build · <a href="#2f">2f</a> burned-in webcam · <a href="#2g">2g</a> errors and empties.</div>
+  </div>
+
+  <div style="display: flex; gap: 26px; flex-wrap: wrap;">
+    <div style="width: 490px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · export placement</div>
+      <div style="font-size: 14px; color: #f6f4f2;">A pane, not a modal.</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">1f's card becomes the right inspector's content — same 268px column, same header pattern. A modal would block the canvas for the length of a render, and renders are the one thing you want to keep working alongside. Once a render starts, the pane can be dismissed and the progress collapses into a chip in the top bar (see 2a). Clicking the chip reopens the pane.</div>
+    </div>
+    <div style="width: 490px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · reaching the editor</div>
+      <div style="font-size: 14px; color: #f6f4f2;">Auto-open on stop. Notification only when you didn't press stop.</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">Pressing stop is a deliberate act and editing is what you wanted next, so the editor opens straight into the proxy-build state (2e). If the recording ended some other way — hotkey from another workspace, disk pressure, crash recovery — it lands in the list and posts a notification whose primary action is Edit. The menubar keeps a Recordings entry as the always-there path.</div>
+    </div>
+  </div>
+
+  <div id="2a" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2a</span>
+      <span style="font-size: 14px; font-weight: 500;">Layers in the editor</span>
+      <span style="font-size: 12px; color: #837e79;">rail expands into a layer list; every layer is also a timeline row</span>
+    </div>
+    <div style="width: 1560px; border-radius: 16px; overflow: hidden; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); display: flex; flex-direction: column;">
+      <div style="display: flex; align-items: center; gap: 14px; height: 46px; padding: 0 16px; flex: none;">
+        <span class="ms" style="font-size: 17px; color: #f2a25a;">movie</span>
+        <span style="font-size: 13px; color: #f6f4f2;">Onboarding walkthrough</span>
+        <span style="font-size: 11px; color: #55514d;">02:47 · 4K</span>
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 14px;">
+          <div style="display: flex; align-items: center; gap: 9px; padding: 5px 11px; border-radius: 9px; background: rgba(242,162,90,0.11);">
+            <span style="position: relative; width: 13px; height: 13px; border-radius: 50%; background: conic-gradient(#f2a25a 64%, rgba(255,255,255,0.12) 0);"><span style="position: absolute; inset: 3.5px; border-radius: 50%; background: #121316;"></span></span>
+            <span style="font-size: 11px; color: #f2a25a;">Rendering 64%</span>
+          </div>
+          <span style="width: 1px; height: 16px; background: rgba(255,255,255,0.1);"></span>
+          <span class="ms" style="font-size: 17px; color: #9d9892;">undo</span>
+          <span class="ms" style="font-size: 17px; color: #55514d;">redo</span>
+          <span style="font-size: 12px; color: #b3aea8;">Preview</span>
+          <div style="display: flex; align-items: center; gap: 8px; padding: 7px 15px; border-radius: 10px; background: #f2a25a;">
+            <span class="ms" style="font-size: 15px; color: #1a1006;">file_upload</span>
+            <span style="font-size: 12px; font-weight: 500; color: #1a1006;">Export</span>
+          </div>
+        </div>
+      </div>
+      <div style="display: flex; min-height: 0;">
+        <div style="width: 56px; flex: none; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 0;">
+          <span class="ms" style="font-size: 19px; color: #9d9892; padding: 8px;">zoom_in</span>
+          <span class="ms" style="font-size: 19px; color: #9d9892; padding: 8px;">mouse</span>
+          <span class="ms" style="font-size: 19px; color: #1a1006; background: #f2a25a; border-radius: 9px; padding: 8px;">layers</span>
+          <span class="ms" style="font-size: 19px; color: #9d9892; padding: 8px;">wallpaper</span>
+          <span class="ms" style="font-size: 19px; color: #9d9892; padding: 8px;">videocam</span>
+          <span class="ms" style="font-size: 19px; color: #9d9892; padding: 8px;">content_cut</span>
+        </div>
+        <div style="width: 236px; flex: none; display: flex; flex-direction: column; background: #0a0b0d; border-left: 1px solid rgba(255,255,255,0.05); border-right: 1px solid rgba(255,255,255,0.05);">
+          <div style="display: flex; align-items: center; gap: 10px; padding: 13px 14px 11px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58; flex: 1;">layers</span>
+            <span style="font-size: 10px; color: #4d4945;">front</span>
+            <span class="ms" style="font-size: 17px; color: #f2a25a;">add</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 2px; padding: 0 7px;">
+            <div style="display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 9px;">
+              <span class="ms" style="font-size: 15px; color: #55514d;">drag_indicator</span>
+              <span class="ms" style="font-size: 16px; color: #9d9892;">title</span>
+              <div style="flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0;">
+                <span style="font-size: 12px; color: #b3aea8; overflow: hidden; text-overflow: ellipsis;">"Start here"</span>
+                <span style="font-size: 10px; color: #4d4945;">0:03 – 0:07</span>
+              </div>
+              <span class="ms" style="font-size: 15px; color: #6d6863;">visibility</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 9px; background: rgba(242,162,90,0.11); box-shadow: inset 0 0 0 1.5px rgba(242,162,90,0.4);">
+              <span class="ms" style="font-size: 15px; color: #8a6a45;">drag_indicator</span>
+              <span class="ms" style="font-size: 16px; color: #f2a25a;">blur_on</span>
+              <div style="flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0;">
+                <span style="font-size: 12px; color: #f6f4f2;">Redact · API key</span>
+                <span style="font-size: 10px; color: #8a6a45;">0:12 – 0:18</span>
+              </div>
+              <span class="ms" style="font-size: 15px; color: #f2a25a;">visibility</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 9px;">
+              <span class="ms" style="font-size: 15px; color: #55514d;">drag_indicator</span>
+              <span class="ms" style="font-size: 16px; color: #9d9892;">image</span>
+              <div style="flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0;">
+                <span style="font-size: 12px; color: #b3aea8; overflow: hidden; text-overflow: ellipsis;">logo-mark.png</span>
+                <span style="font-size: 10px; color: #4d4945;">0:00 – 2:47</span>
+              </div>
+              <span class="ms" style="font-size: 15px; color: #6d6863;">visibility</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 9px;">
+              <span class="ms" style="font-size: 15px; color: #55514d;">drag_indicator</span>
+              <span class="ms" style="font-size: 16px; color: #6d6863;">rectangle</span>
+              <div style="flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0;">
+                <span style="font-size: 12px; color: #6d6863; overflow: hidden; text-overflow: ellipsis;">Highlight box</span>
+                <span style="font-size: 10px; color: #4d4945;">1:22 – 1:29</span>
+              </div>
+              <span class="ms" style="font-size: 15px; color: #3d3936;">visibility_off</span>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 11px 14px 13px; margin-top: 4px;">
+            <span style="font-size: 10px; color: #4d4945;">back</span>
+            <span class="ms" style="font-size: 16px; color: #6d6863;">delete</span>
+          </div>
+          <div style="margin: 4px 10px 12px; padding: 16px 12px; border-radius: 11px; background: rgba(242,162,90,0.05); box-shadow: inset 0 0 0 1.5px rgba(242,162,90,0.28); display: flex; flex-direction: column; align-items: center; gap: 7px;">
+            <span class="ms" style="font-size: 20px; color: #f2a25a;">add_photo_alternate</span>
+            <span style="font-size: 11px; color: #b3aea8; text-align: center; line-height: 1.5;">Drop an image<br><span style="color: #625d58;">lands at the playhead</span></span>
+          </div>
+        </div>
+        <div style="flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center; padding: 14px 6px;">
+          <div style="width: 100%; border-radius: 12px; background: linear-gradient(150deg, #1d1a17, #121316); display: flex; align-items: center; justify-content: center; padding: 40px; box-sizing: border-box;">
+            <div style="width: 100%; border-radius: 10px; overflow: hidden; box-shadow: 0 28px 64px rgba(0,0,0,0.6); position: relative;">
+              <div style="height: 330px; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') center/cover no-repeat;"></div>
+              <div style="position: absolute; left: 16%; top: 24%; padding: 7px 13px; border-radius: 7px; background: rgba(13,14,16,0.86); font-size: 13px; color: #f6f4f2;">Start here</div>
+              <div style="position: absolute; left: 30%; top: 46%; width: 250px; height: 46px; border-radius: 5px; overflow: hidden; box-shadow: 0 0 0 1.5px #f2a25a;">
+                <div style="position: absolute; inset: 0; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') -240px -230px no-repeat; filter: blur(11px); transform: scale(1.3);"></div>
+                <div style="position: absolute; inset: 0; background: repeating-linear-gradient(45deg, rgba(242,162,90,0.14) 0 5px, rgba(242,162,90,0) 5px 10px);"></div>
+                <span style="position: absolute; left: 8px; top: 50%; margin-top: -7px; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #f2a25a;">redacted</span>
+              </div>
+              <span style="position: absolute; left: 30%; top: 46%; margin: -5px 0 0 -5px; width: 9px; height: 9px; border-radius: 50%; background: #f2a25a;"></span>
+              <span style="position: absolute; left: 30%; top: 46%; margin: -5px 0 0 244px; width: 9px; height: 9px; border-radius: 50%; background: #f2a25a;"></span>
+              <span style="position: absolute; left: 30%; top: 46%; margin: 42px 0 0 -5px; width: 9px; height: 9px; border-radius: 50%; background: #f2a25a;"></span>
+              <span style="position: absolute; left: 30%; top: 46%; margin: 42px 0 0 244px; width: 9px; height: 9px; border-radius: 50%; background: #f2a25a;"></span>
+              <div style="position: absolute; left: 30%; top: 46%; margin-top: -26px; display: flex; align-items: center; gap: 7px; padding: 4px 8px; border-radius: 6px; background: rgba(13,14,16,0.9);">
+                <span class="ms" style="font-size: 12px; color: #f2a25a;">blur_on</span>
+                <span style="font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: #f2a25a;">redact · strong</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div style="width: 268px; flex: none; display: flex; flex-direction: column; gap: 15px; padding: 16px 16px 16px 4px; box-sizing: border-box;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="ms" style="font-size: 16px; color: #f2a25a;">blur_on</span>
+            <span style="font-size: 12px; color: #f6f4f2; flex: 1;">Redact · API key</span>
+            <span class="ms" style="font-size: 16px; color: #625d58;">more_horiz</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58;">method</span>
+            <div style="display: flex; gap: 4px;">
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; background: rgba(255,255,255,0.07); color: #eceae7;">Blur</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #837e79;">Pixelate</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #837e79;">Fill</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58;">strength</span>
+            <div style="display: flex; gap: 4px;">
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; background: rgba(242,162,90,0.13); color: #f2a25a; box-shadow: inset 0 0 0 1px rgba(242,162,90,0.34);">Strong</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #837e79;">Heavy</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #837e79;">Solid</span>
+            </div>
+            <div style="display: flex; gap: 8px; padding: 9px 11px; border-radius: 9px; background: rgba(255,255,255,0.035);">
+              <span class="ms" style="font-size: 14px; color: #9d9892;">shield</span>
+              <span style="font-size: 10px; line-height: 1.55; color: #837e79; text-wrap: pretty;">Three presets, no slider. The weakest one already exceeds what OCR can recover, and the canvas shows exactly what exports — never a preview that looks safer than the file.</span>
+            </div>
+          </div>
+          <div style="height: 1px; background: rgba(255,255,255,0.07);"></div>
+          <div style="display: flex; flex-direction: column; gap: 9px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58;">timing</span>
+            <div style="display: flex; gap: 8px;">
+              <div style="flex: 1; display: flex; align-items: center; gap: 7px; padding: 8px 10px; border-radius: 9px; background: rgba(255,255,255,0.05);">
+                <span style="font-size: 10px; color: #55514d;">in</span>
+                <span style="font-size: 12px; color: #eceae7;">0:12.4</span>
+              </div>
+              <div style="flex: 1; display: flex; align-items: center; gap: 7px; padding: 8px 10px; border-radius: 9px; background: rgba(255,255,255,0.05);">
+                <span style="font-size: 10px; color: #55514d;">out</span>
+                <span style="font-size: 12px; color: #eceae7;">0:18.0</span>
+              </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 11px;">
+              <span style="width: 30px; height: 17px; border-radius: 9px; background: rgba(255,255,255,0.11); position: relative;"><span style="position: absolute; left: 2px; top: 2px; width: 13px; height: 13px; border-radius: 50%; background: #6d6863;"></span></span>
+              <span style="font-size: 12px; color: #837e79; flex: 1;">Whole recording</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 11px;">
+              <span style="width: 30px; height: 17px; border-radius: 9px; background: #f2a25a; position: relative;"><span style="position: absolute; right: 2px; top: 2px; width: 13px; height: 13px; border-radius: 50%; background: #1a1006;"></span></span>
+              <span style="font-size: 12px; color: #b3aea8; flex: 1;">Follow the window</span>
+            </div>
+          </div>
+          <div style="height: 1px; background: rgba(255,255,255,0.07);"></div>
+          <div style="display: flex; flex-direction: column; gap: 9px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58;">geometry</span>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+              <div style="display: flex; align-items: center; gap: 7px; padding: 8px 10px; border-radius: 9px; background: rgba(255,255,255,0.05);">
+                <span style="font-size: 10px; color: #55514d;">x</span>
+                <span style="font-size: 12px; color: #eceae7;">768</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 7px; padding: 8px 10px; border-radius: 9px; background: rgba(255,255,255,0.05);">
+                <span style="font-size: 10px; color: #55514d;">y</span>
+                <span style="font-size: 12px; color: #eceae7;">612</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 7px; padding: 8px 10px; border-radius: 9px; background: rgba(255,255,255,0.05);">
+                <span style="font-size: 10px; color: #55514d;">w</span>
+                <span style="font-size: 12px; color: #eceae7;">640</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 7px; padding: 8px 10px; border-radius: 9px; background: rgba(255,255,255,0.05);">
+                <span style="font-size: 10px; color: #55514d;">h</span>
+                <span style="font-size: 12px; color: #eceae7;">118</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="flex: none; display: flex; flex-direction: column; background: #0a0b0d; border-top: 1px solid rgba(255,255,255,0.06);">
+        <div style="display: flex; align-items: center; gap: 16px; padding: 11px 16px;">
+          <span class="ms" style="font-size: 20px; color: #f6f4f2;">play_arrow</span>
+          <span style="font-size: 12px; color: #b3aea8;">0:14<span style="color: #55514d;"> / 2:41</span></span>
+          <span style="font-size: 10px; color: #4d4945;">2:47 recorded · 6s cut</span>
+          <div style="margin-left: auto; display: flex; align-items: center; gap: 14px;">
+            <span class="ms" style="font-size: 16px; color: #9d9892;">content_cut</span>
+            <span class="ms" style="font-size: 16px; color: #9d9892;">add</span>
+            <span style="width: 1px; height: 15px; background: rgba(255,255,255,0.1);"></span>
+            <span class="ms" style="font-size: 16px; color: #9d9892;">remove</span>
+            <span style="font-size: 11px; color: #625d58;">Fit</span>
+            <span class="ms" style="font-size: 16px; color: #9d9892;">add</span>
+          </div>
+        </div>
+        <div style="display: flex; gap: 12px; padding: 0 16px 8px;">
+          <div style="width: 74px; flex: none;"></div>
+          <div style="flex: 1; display: flex; justify-content: space-between; font-size: 10px; color: #4d4945;">
+            <span>0:00</span><span>0:30</span><span>1:00</span><span>1:30</span><span>2:00</span><span>2:30</span>
+          </div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 7px; padding: 0 16px 16px;">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span style="width: 74px; flex: none; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">screen</span>
+            <div style="flex: 1; height: 36px; border-radius: 7px; background: rgba(255,255,255,0.045); position: relative; overflow: hidden;">
+              <div style="position: absolute; inset: 0; display: flex; gap: 2px; padding: 3px;">
+                <sc-for list="{{ strip }}" as="s" hint-placeholder-count="8">
+                  <span style="flex: 1; border-radius: 4px; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') center/cover no-repeat; opacity: 0.5;"></span>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span style="width: 74px; flex: none; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #f2a25a;">layers</span>
+            <div style="flex: 1; display: flex; flex-direction: column; gap: 3px;">
+              <div style="height: 18px; border-radius: 6px; background: rgba(255,255,255,0.03); position: relative;">
+                <span style="position: absolute; left: 2%; top: 3px; width: 3%; height: 12px; border-radius: 4px; background: rgba(179,174,168,0.22); box-shadow: inset 0 0 0 1px rgba(179,174,168,0.4);"></span>
+              </div>
+              <div style="height: 18px; border-radius: 6px; background: rgba(255,255,255,0.03); position: relative;">
+                <span style="position: absolute; left: 7%; top: 3px; width: 4%; height: 12px; border-radius: 4px; background: rgba(242,162,90,0.3); box-shadow: inset 0 0 0 1.5px #f2a25a;"></span>
+              </div>
+              <div style="height: 18px; border-radius: 6px; background: rgba(255,255,255,0.03); position: relative;">
+                <span style="position: absolute; left: 0; top: 3px; right: 0; height: 12px; border-radius: 4px; background: rgba(179,174,168,0.16); box-shadow: inset 0 0 0 1px rgba(179,174,168,0.3);"></span>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span style="width: 74px; flex: none; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">zoom</span>
+            <div style="flex: 1; height: 22px; border-radius: 7px; background: rgba(255,255,255,0.03); position: relative;">
+              <span style="position: absolute; left: 3%; top: 3px; width: 9%; height: 16px; border-radius: 5px; background: rgba(242,162,90,0.2); box-shadow: inset 0 0 0 1px rgba(242,162,90,0.45);"></span>
+              <span style="position: absolute; left: 27%; top: 3px; width: 12%; height: 16px; border-radius: 5px; background: rgba(242,162,90,0.2); box-shadow: inset 0 0 0 1px rgba(242,162,90,0.45);"></span>
+              <span style="position: absolute; left: 71%; top: 3px; width: 14%; height: 16px; border-radius: 5px; background: rgba(242,162,90,0.2); box-shadow: inset 0 0 0 1px rgba(242,162,90,0.45);"></span>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span style="width: 74px; flex: none; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">audio</span>
+            <div style="flex: 1; height: 26px; border-radius: 7px; background: rgba(255,255,255,0.03); display: flex; align-items: center; gap: 2px; padding: 0 5px; box-sizing: border-box;">
+              <sc-for list="{{ wave }}" as="bar" hint-placeholder-count="60">
+                <span style="flex: 1; background: #4a4640; border-radius: 1px; align-self: center; height: {{ bar.h }};"></span>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="2c" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2c</span>
+      <span style="font-size: 14px; font-weight: 500;">Cuts</span>
+      <span style="font-size: 12px; color: #837e79;">a fold in the tray, not a hole — three states of the same 6s cut</span>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 18px; width: 1560px;">
+
+      <div style="display: flex; gap: 22px; align-items: flex-start;">
+        <div style="width: 190px; flex: none; padding-top: 6px; display: flex; flex-direction: column; gap: 6px;">
+          <span style="font-size: 12px; color: #f6f4f2;">1 · select a range</span>
+          <span style="font-size: 11px; line-height: 1.6; color: #837e79;">Drag on the ruler, or hit <span style="color: #b3aea8;">C</span> to cut from the playhead. The selection dims the frames it will remove and shows the resulting duration.</span>
+        </div>
+        <div style="flex: 1; border-radius: 12px; background: #0a0b0d; padding: 12px 16px 14px; box-sizing: border-box;">
+          <div style="display: flex; gap: 12px; padding-bottom: 7px;">
+            <div style="width: 74px; flex: none;"></div>
+            <div style="flex: 1; position: relative; height: 14px;">
+              <div style="display: flex; justify-content: space-between; font-size: 10px; color: #4d4945;"><span>0:00</span><span>0:30</span><span>1:00</span><span>1:30</span><span>2:00</span><span>2:30</span></div>
+              <div style="position: absolute; left: 40%; width: 12%; top: -2px; height: 16px; border-radius: 4px 4px 0 0; background: rgba(242,162,90,0.2); display: flex; align-items: center; justify-content: center;">
+                <span style="font-size: 9px; color: #f2a25a;">6.0s</span>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span style="width: 74px; flex: none; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">screen</span>
+            <div style="flex: 1; height: 36px; border-radius: 7px; background: rgba(255,255,255,0.045); position: relative; overflow: hidden;">
+              <div style="position: absolute; inset: 0; display: flex; gap: 2px; padding: 3px;">
+                <sc-for list="{{ strip }}" as="s" hint-placeholder-count="8">
+                  <span style="flex: 1; border-radius: 4px; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') center/cover no-repeat; opacity: 0.5;"></span>
+                </sc-for>
+              </div>
+              <div style="position: absolute; left: 40%; width: 12%; top: 0; bottom: 0; background: rgba(10,11,13,0.72); box-shadow: inset 1.5px 0 0 #f2a25a, inset -1.5px 0 0 #f2a25a;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 22px; align-items: flex-start;">
+        <div style="width: 190px; flex: none; padding-top: 6px; display: flex; flex-direction: column; gap: 6px;">
+          <span style="font-size: 12px; color: #f6f4f2;">2 · cut, collapsed</span>
+          <span style="font-size: 11px; line-height: 1.6; color: #837e79;">The span folds to a 16px seam spanning every row, so the cut is one object rather than a gap repeated four times. The seam carries the removed duration.</span>
+        </div>
+        <div style="flex: 1; border-radius: 12px; background: #0a0b0d; padding: 12px 16px 14px; box-sizing: border-box;">
+          <div style="display: flex; gap: 12px;">
+            <div style="width: 74px; flex: none; display: flex; flex-direction: column; gap: 7px; padding-top: 39px;">
+              <span style="height: 36px; display: flex; align-items: center; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">screen</span>
+              <span style="height: 22px; display: flex; align-items: center; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">zoom</span>
+              <span style="height: 26px; display: flex; align-items: center; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">audio</span>
+            </div>
+            <div style="flex: 1; position: relative; padding-top: 18px;">
+              <div style="display: flex; justify-content: space-between; font-size: 10px; color: #4d4945; height: 14px;"><span>0:00</span><span>0:30</span><span>1:00</span><span>1:30</span><span>2:00</span><span>2:30</span></div>
+              <div style="display: flex; flex-direction: column; gap: 7px; padding-top: 7px;">
+                <div style="height: 36px; border-radius: 7px; background: rgba(255,255,255,0.045); overflow: hidden; display: flex; gap: 2px; padding: 3px; box-sizing: border-box;">
+                  <sc-for list="{{ strip }}" as="s" hint-placeholder-count="8">
+                    <span style="flex: 1; border-radius: 4px; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') center/cover no-repeat; opacity: 0.5;"></span>
+                  </sc-for>
+                </div>
+                <div style="height: 22px; border-radius: 7px; background: rgba(255,255,255,0.03); position: relative;">
+                  <span style="position: absolute; left: 3%; top: 3px; width: 10%; height: 16px; border-radius: 5px; background: rgba(242,162,90,0.2); box-shadow: inset 0 0 0 1px rgba(242,162,90,0.45);"></span>
+                  <span style="position: absolute; left: 55%; top: 3px; width: 15%; height: 16px; border-radius: 5px; background: rgba(242,162,90,0.2); box-shadow: inset 0 0 0 1px rgba(242,162,90,0.45);"></span>
+                </div>
+                <div style="height: 26px; border-radius: 7px; background: rgba(255,255,255,0.03); display: flex; align-items: center; gap: 2px; padding: 0 5px; box-sizing: border-box;">
+                  <sc-for list="{{ wave }}" as="bar" hint-placeholder-count="60">
+                    <span style="flex: 1; background: #4a4640; border-radius: 1px; align-self: center; height: {{ bar.h }};"></span>
+                  </sc-for>
+                </div>
+              </div>
+              <div style="position: absolute; left: 40%; top: 36px; bottom: 0; width: 16px; margin-left: -8px; border-radius: 4px; background: #0a0b0d; box-shadow: inset 0 0 0 1px rgba(242,162,90,0.5); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;">
+                <span style="width: 2px; height: 100%; margin: 4px 0; background: repeating-linear-gradient(180deg, #f2a25a 0 3px, transparent 3px 7px);"></span>
+              </div>
+              <div style="position: absolute; left: 40%; top: 0; margin-left: -19px; display: flex; align-items: center; gap: 5px; padding: 2px 6px; border-radius: 5px; background: rgba(242,162,90,0.14);">
+                <span class="ms" style="font-size: 11px; color: #f2a25a;">unfold_more</span>
+                <span style="font-size: 9px; color: #f2a25a;">6.0s</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 22px; align-items: flex-start;">
+        <div style="width: 190px; flex: none; padding-top: 6px; display: flex; flex-direction: column; gap: 6px;">
+          <span style="font-size: 12px; color: #f6f4f2;">3 · expanded</span>
+          <span style="font-size: 11px; line-height: 1.6; color: #837e79;">Click the seam and the removed frames come back ghosted, in place, with draggable edges. This is the state that makes a cut legibly reversible — the material was never thrown away.</span>
+        </div>
+        <div style="flex: 1; border-radius: 12px; background: #0a0b0d; padding: 12px 16px 14px; box-sizing: border-box;">
+          <div style="display: flex; gap: 12px; padding-bottom: 7px;">
+            <div style="width: 74px; flex: none;"></div>
+            <div style="flex: 1; display: flex; justify-content: space-between; font-size: 10px; color: #4d4945;"><span>0:00</span><span>0:30</span><span>1:00</span><span>1:30</span><span>2:00</span><span>2:30</span></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span style="width: 74px; flex: none; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">screen</span>
+            <div style="flex: 1; height: 36px; border-radius: 7px; background: rgba(255,255,255,0.045); position: relative; overflow: hidden;">
+              <div style="position: absolute; inset: 0; display: flex; gap: 2px; padding: 3px;">
+                <sc-for list="{{ strip }}" as="s" hint-placeholder-count="8">
+                  <span style="flex: 1; border-radius: 4px; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') center/cover no-repeat; opacity: 0.5;"></span>
+                </sc-for>
+              </div>
+              <div style="position: absolute; left: 40%; width: 12%; top: 0; bottom: 0; background: rgba(10,11,13,0.66); background-image: repeating-linear-gradient(45deg, rgba(242,162,90,0.1) 0 5px, rgba(242,162,90,0) 5px 10px);"></div>
+              <span style="position: absolute; left: 40%; top: 0; bottom: 0; width: 3px; margin-left: -1.5px; background: #f2a25a; border-radius: 2px;"></span>
+              <span style="position: absolute; left: 52%; top: 0; bottom: 0; width: 3px; margin-left: -1.5px; background: #f2a25a; border-radius: 2px;"></span>
+            </div>
+          </div>
+          <div style="display: flex; gap: 12px; padding-top: 9px;">
+            <div style="width: 74px; flex: none;"></div>
+            <div style="flex: 1; display: flex; align-items: center; gap: 14px;">
+              <div style="display: flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 8px; background: rgba(255,255,255,0.06);">
+                <span class="ms" style="font-size: 14px; color: #b3aea8;">restore</span>
+                <span style="font-size: 11px; color: #eceae7;">Restore 6.0s</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 8px;">
+                <span class="ms" style="font-size: 14px; color: #6d6863;">unfold_less</span>
+                <span style="font-size: 11px; color: #837e79;">Collapse</span>
+              </div>
+              <span style="font-size: 10px; color: #4d4945;">drag either edge to retime · ⌫ removes the cut</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 44px; align-items: flex-start;">
+
+    <div id="2b" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2b</span>
+        <span style="font-size: 14px; font-weight: 500;">Layer inspectors</span>
+        <span style="font-size: 12px; color: #837e79;">image and text; blur is in 2a</span>
+      </div>
+      <div style="display: flex; gap: 18px;">
+        <div style="width: 268px; border-radius: 15px; overflow: hidden; background: rgba(13,14,16,0.96); box-shadow: 0 20px 52px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.07); display: flex; flex-direction: column; gap: 15px; padding: 15px 16px 18px; box-sizing: border-box;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="ms" style="font-size: 16px; color: #f2a25a;">image</span>
+            <span style="font-size: 12px; color: #f6f4f2; flex: 1;">logo-mark.png</span>
+            <span class="ms" style="font-size: 16px; color: #625d58;">more_horiz</span>
+          </div>
+          <div style="height: 74px; border-radius: 10px; background: rgba(255,255,255,0.04); display: flex; align-items: center; justify-content: center;">
+            <span class="ms" style="font-size: 24px; color: #4d4945;">image</span>
+          </div>
+          <span style="font-size: 10px; color: #4d4945;">1024×1024 · PNG · copied into the project</span>
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+            <div style="display: flex; align-items: baseline;">
+              <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58; flex: 1;">size</span>
+              <span style="font-size: 11px; color: #b3aea8;">12%</span>
+            </div>
+            <div style="position: relative; height: 3px; border-radius: 2px; background: rgba(255,255,255,0.1);">
+              <span style="position: absolute; left: 0; top: 0; width: 24%; height: 3px; border-radius: 2px; background: #f2a25a;"></span>
+              <span style="position: absolute; left: 24%; top: -3.5px; width: 10px; height: 10px; margin-left: -5px; border-radius: 50%; background: #f2a25a;"></span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+            <div style="display: flex; align-items: baseline;">
+              <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58; flex: 1;">opacity</span>
+              <span style="font-size: 11px; color: #b3aea8;">85%</span>
+            </div>
+            <div style="position: relative; height: 3px; border-radius: 2px; background: rgba(255,255,255,0.1);">
+              <span style="position: absolute; left: 0; top: 0; width: 85%; height: 3px; border-radius: 2px; background: #b3aea8;"></span>
+              <span style="position: absolute; left: 85%; top: -3.5px; width: 10px; height: 10px; margin-left: -5px; border-radius: 50%; background: #b3aea8;"></span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58;">position</span>
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(3, 20px); gap: 3px; padding: 4px; border-radius: 9px; background: rgba(255,255,255,0.035);">
+              <span style="border-radius: 5px;"></span><span style="border-radius: 5px;"></span>
+              <span style="border-radius: 5px; background: rgba(242,162,90,0.22); box-shadow: inset 0 0 0 1.5px #f2a25a;"></span>
+              <span style="border-radius: 5px;"></span><span style="border-radius: 5px;"></span><span style="border-radius: 5px;"></span>
+              <span style="border-radius: 5px;"></span><span style="border-radius: 5px;"></span><span style="border-radius: 5px;"></span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58;">timing</span>
+            <div style="display: flex; align-items: center; gap: 11px;">
+              <span style="width: 30px; height: 17px; border-radius: 9px; background: #f2a25a; position: relative;"><span style="position: absolute; right: 2px; top: 2px; width: 13px; height: 13px; border-radius: 50%; background: #1a1006;"></span></span>
+              <span style="font-size: 12px; color: #b3aea8; flex: 1;">Whole recording</span>
+            </div>
+            <div style="display: flex; gap: 4px;">
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #837e79;">Cut</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; background: rgba(255,255,255,0.07); color: #eceae7;">Fade</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #837e79;">Slide</span>
+            </div>
+          </div>
+        </div>
+        <div style="width: 268px; border-radius: 15px; overflow: hidden; background: rgba(13,14,16,0.96); box-shadow: 0 20px 52px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.07); display: flex; flex-direction: column; gap: 15px; padding: 15px 16px 18px; box-sizing: border-box;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="ms" style="font-size: 16px; color: #f2a25a;">title</span>
+            <span style="font-size: 12px; color: #f6f4f2; flex: 1;">"Start here"</span>
+            <span class="ms" style="font-size: 16px; color: #625d58;">more_horiz</span>
+          </div>
+          <div style="padding: 11px 12px; border-radius: 10px; background: rgba(255,255,255,0.05); font-size: 13px; color: #eceae7;">Start here<span style="color: #f2a25a;">|</span></div>
+          <div style="display: flex; flex-direction: column; gap: 9px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58;">style</span>
+            <div style="display: flex; gap: 4px;">
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; background: rgba(255,255,255,0.07); color: #eceae7;">Plate</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #837e79;">Plain</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #837e79;">Outline</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+            <div style="display: flex; align-items: baseline;">
+              <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58; flex: 1;">size</span>
+              <span style="font-size: 11px; color: #b3aea8;">28 px</span>
+            </div>
+            <div style="position: relative; height: 3px; border-radius: 2px; background: rgba(255,255,255,0.1);">
+              <span style="position: absolute; left: 0; top: 0; width: 44%; height: 3px; border-radius: 2px; background: #f2a25a;"></span>
+              <span style="position: absolute; left: 44%; top: -3.5px; width: 10px; height: 10px; margin-left: -5px; border-radius: 50%; background: #f2a25a;"></span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58;">color</span>
+            <div style="display: flex; gap: 7px;">
+              <span style="width: 30px; height: 30px; border-radius: 8px; background: #f6f4f2; box-shadow: inset 0 0 0 1.5px #f2a25a;"></span>
+              <span style="width: 30px; height: 30px; border-radius: 8px; background: #0d0e10; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.1);"></span>
+              <span style="width: 30px; height: 30px; border-radius: 8px; background: #f2a25a;"></span>
+              <span style="width: 30px; height: 30px; border-radius: 8px; background: #e0523f;"></span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #625d58;">timing</span>
+            <div style="display: flex; gap: 8px;">
+              <div style="flex: 1; display: flex; align-items: center; gap: 7px; padding: 8px 10px; border-radius: 9px; background: rgba(255,255,255,0.05);">
+                <span style="font-size: 10px; color: #55514d;">in</span>
+                <span style="font-size: 12px; color: #eceae7;">0:03.0</span>
+              </div>
+              <div style="flex: 1; display: flex; align-items: center; gap: 7px; padding: 8px 10px; border-radius: 9px; background: rgba(255,255,255,0.05);">
+                <span style="font-size: 10px; color: #55514d;">out</span>
+                <span style="font-size: 12px; color: #eceae7;">0:07.0</span>
+              </div>
+            </div>
+            <div style="display: flex; gap: 4px;">
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #837e79;">Cut</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; background: rgba(255,255,255,0.07); color: #eceae7;">Fade</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #837e79;">Slide</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="2d" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2d</span>
+        <span style="font-size: 14px; font-weight: 500;">Recordings</span>
+        <span style="font-size: 12px; color: #837e79;">unedited ones surface first</span>
+      </div>
+      <div style="width: 720px; border-radius: 16px; overflow: hidden; background: #0d0e10; box-shadow: 0 26px 66px rgba(0,0,0,0.6);">
+        <div style="display: flex; align-items: center; gap: 14px; height: 46px; padding: 0 16px;">
+          <span class="ms" style="font-size: 17px; color: #f2a25a;">video_library</span>
+          <span style="font-size: 13px; color: #f6f4f2;">Recordings</span>
+          <span style="font-size: 11px; color: #55514d;">14 · 8.2 GB</span>
+          <div style="margin-left: auto; display: flex; align-items: center; gap: 12px;">
+            <span class="ms" style="font-size: 16px; color: #9d9892;">search</span>
+            <div style="display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 10px; background: #f2a25a;">
+              <span class="ms" style="font-size: 15px; color: #1a1006;">radio_button_checked</span>
+              <span style="font-size: 12px; font-weight: 500; color: #1a1006;">New</span>
+            </div>
+          </div>
+        </div>
+        <div style="height: 1px; background: rgba(255,255,255,0.07);"></div>
+        <div style="display: flex; gap: 4px; padding: 11px 14px 4px;">
+          <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; background: rgba(255,255,255,0.07); color: #eceae7;">All</span>
+          <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; color: #837e79;">Unedited</span>
+          <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; color: #837e79;">Exported</span>
+        </div>
+        <div style="padding: 6px 8px 12px; display: flex; flex-direction: column; gap: 2px;">
+          <div style="display: flex; align-items: center; gap: 13px; padding: 9px 11px; border-radius: 11px; background: rgba(242,162,90,0.09);">
+            <div style="width: 78px; height: 46px; flex: none; border-radius: 7px; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') center/cover no-repeat; position: relative;">
+              <span style="position: absolute; right: 4px; bottom: 4px; font-size: 9px; padding: 1px 4px; border-radius: 4px; background: rgba(10,11,13,0.85); color: #eceae7;">2:47</span>
+            </div>
+            <div style="flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0;">
+              <div style="display: flex; align-items: center; gap: 9px;">
+                <span style="font-size: 13px; color: #f6f4f2;">Onboarding walkthrough</span>
+                <span style="font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 6px; border-radius: 5px; background: rgba(242,162,90,0.18); color: #f2a25a;">new</span>
+              </div>
+              <span style="font-size: 10px; color: #625d58;">2 minutes ago · 4K 60 · 1.4 GB</span>
+            </div>
+            <span class="ms" style="font-size: 16px; color: #6d6863;">more_horiz</span>
+            <div style="display: flex; align-items: center; gap: 7px; padding: 6px 13px; border-radius: 9px; background: #f2a25a;">
+              <span style="font-size: 11px; font-weight: 500; color: #1a1006;">Edit</span>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 13px; padding: 9px 11px; border-radius: 11px;">
+            <div style="width: 78px; height: 46px; flex: none; border-radius: 7px; background: #16171a; position: relative;">
+              <span style="position: absolute; right: 4px; bottom: 4px; font-size: 9px; padding: 1px 4px; border-radius: 4px; background: rgba(10,11,13,0.85); color: #b3aea8;">0:48</span>
+            </div>
+            <div style="flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0;">
+              <span style="font-size: 13px; color: #b3aea8;">Bug repro — scroll jank</span>
+              <span style="font-size: 10px; color: #55514d;">Yesterday · exported MP4 · 412 MB</span>
+            </div>
+            <span class="ms" style="font-size: 16px; color: #4d4945;">more_horiz</span>
+            <span style="font-size: 11px; padding: 6px 13px; border-radius: 9px; background: rgba(255,255,255,0.06); color: #eceae7;">Edit</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 13px; padding: 9px 11px; border-radius: 11px;">
+            <div style="width: 78px; height: 46px; flex: none; border-radius: 7px; background: #16171a; position: relative;">
+              <span style="position: absolute; right: 4px; bottom: 4px; font-size: 9px; padding: 1px 4px; border-radius: 4px; background: rgba(10,11,13,0.85); color: #b3aea8;">5:12</span>
+            </div>
+            <div style="flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0;">
+              <div style="display: flex; align-items: center; gap: 9px;">
+                <span style="font-size: 13px; color: #b3aea8;">Weekly demo</span>
+                <span class="ms" style="font-size: 13px; color: #6d6863;">link_off</span>
+              </div>
+              <span style="font-size: 10px; color: #55514d;">3 days ago · source moved</span>
+            </div>
+            <span class="ms" style="font-size: 16px; color: #4d4945;">more_horiz</span>
+            <span style="font-size: 11px; padding: 6px 13px; border-radius: 9px; color: #6d6863;">Locate…</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="2e" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2e</span>
+        <span style="font-size: 14px; font-weight: 500;">Building the proxy</span>
+        <span style="font-size: 12px; color: #837e79;">editor shell is live, scrubbing isn't</span>
+      </div>
+      <div style="width: 720px; border-radius: 16px; overflow: hidden; background: #0d0e10; box-shadow: 0 26px 66px rgba(0,0,0,0.6); display: flex; flex-direction: column;">
+        <div style="display: flex; align-items: center; gap: 14px; height: 46px; padding: 0 16px;">
+          <span class="ms" style="font-size: 17px; color: #f2a25a;">movie</span>
+          <span style="font-size: 13px; color: #f6f4f2;">Onboarding walkthrough</span>
+          <span style="font-size: 11px; color: #55514d;">02:47 · 4K</span>
+          <div style="margin-left: auto; display: flex; align-items: center; gap: 14px;">
+            <span style="font-size: 12px; color: #4d4945;">Preview</span>
+            <span style="display: flex; align-items: center; gap: 8px; padding: 7px 15px; border-radius: 10px; background: rgba(255,255,255,0.05); font-size: 12px; color: #55514d;">Export</span>
+          </div>
+        </div>
+        <div style="padding: 16px; display: flex; flex-direction: column; gap: 14px;">
+          <div style="border-radius: 12px; background: linear-gradient(150deg, #1d1a17, #121316); padding: 34px; display: flex; flex-direction: column; align-items: center; gap: 17px;">
+            <div style="width: 100%; border-radius: 10px; overflow: hidden; position: relative; box-shadow: 0 20px 44px rgba(0,0,0,0.5);">
+              <div style="height: 190px; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') center/cover no-repeat; opacity: 0.35;"></div>
+            </div>
+            <div style="width: 320px; display: flex; flex-direction: column; gap: 10px; align-items: center;">
+              <div style="display: flex; align-items: baseline; gap: 9px; width: 100%;">
+                <span style="font-size: 12px; color: #eceae7; flex: 1;">Preparing for playback</span>
+                <span style="font-size: 11px; color: #f2a25a;">41%</span>
+                <span style="font-size: 11px; color: #625d58;">~35s</span>
+              </div>
+              <div style="width: 100%; height: 4px; border-radius: 2px; background: rgba(255,255,255,0.08); overflow: hidden;">
+                <span style="display: block; width: 41%; height: 4px; border-radius: 2px; background: #f2a25a;"></span>
+              </div>
+              <span style="font-size: 10px; line-height: 1.6; color: #625d58; text-align: center; text-wrap: pretty;">Building a 1080p working copy. The 4K original is untouched and is what exports.</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="font-size: 11px; padding: 6px 13px; border-radius: 9px; background: rgba(255,255,255,0.06); color: #eceae7;">Trim while it builds</span>
+              <span style="font-size: 11px; padding: 6px 13px; border-radius: 9px; color: #837e79;">Cancel</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <div style="display: flex; align-items: center; gap: 12px;">
+              <span style="width: 74px; flex: none; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">screen</span>
+              <div style="flex: 1; height: 36px; border-radius: 7px; background: rgba(255,255,255,0.045); display: flex; gap: 2px; padding: 3px; box-sizing: border-box; overflow: hidden;">
+                <span style="flex: 1; border-radius: 4px; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') center/cover no-repeat; opacity: 0.5;"></span>
+                <span style="flex: 1; border-radius: 4px; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') center/cover no-repeat; opacity: 0.5;"></span>
+                <span style="flex: 1; border-radius: 4px; background: #000 url('uploads/screenshot-2026-08-27_19-13-33.png') center/cover no-repeat; opacity: 0.5;"></span>
+                <span style="flex: 1; border-radius: 4px; background: rgba(255,255,255,0.03);"></span>
+                <span style="flex: 1; border-radius: 4px; background: rgba(255,255,255,0.03);"></span>
+                <span style="flex: 1; border-radius: 4px; background: rgba(255,255,255,0.03);"></span>
+                <span style="flex: 1; border-radius: 4px; background: rgba(255,255,255,0.03);"></span>
+                <span style="flex: 1; border-radius: 4px; background: rgba(255,255,255,0.03);"></span>
+              </div>
+            </div>
+            <span style="font-size: 10px; color: #4d4945; padding-left: 86px;">thumbnails fill in as the proxy encodes</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="2f" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2f</span>
+        <span style="font-size: 14px; font-weight: 500;">Burned-in webcam</span>
+        <span style="font-size: 12px; color: #837e79;">1g, unavailable — dimmed, present, explained</span>
+      </div>
+      <div style="width: 320px; border-radius: 15px; overflow: hidden; background: rgba(13,14,16,0.96); box-shadow: 0 20px 52px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.07);">
+        <div style="display: flex; align-items: center; gap: 11px; padding: 13px 15px;">
+          <span class="ms" style="font-size: 16px; color: #55514d;">videocam</span>
+          <span style="font-size: 12px; color: #837e79; flex: 1;">Camera</span>
+          <span style="font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 7px; border-radius: 5px; background: rgba(255,255,255,0.055); color: #6d6863;">burned in</span>
+        </div>
+        <div style="height: 1px; background: rgba(255,255,255,0.07);"></div>
+        <div style="padding: 13px 15px; display: flex; gap: 9px; background: rgba(255,255,255,0.025);">
+          <span class="ms" style="font-size: 15px; color: #9d9892;">info</span>
+          <span style="font-size: 11px; line-height: 1.6; color: #b3aea8; text-wrap: pretty;">This take was recorded fullscreen with self-view on, so the camera is part of the frames. Nothing here can move or remove it.</span>
+        </div>
+        <div style="padding: 14px 15px; display: flex; flex-direction: column; gap: 16px;">
+          <div style="display: flex; align-items: center; padding: 9px 12px; border-radius: 9px; background: rgba(255,255,255,0.03);">
+            <span style="font-size: 12px; color: #4d4945; flex: 1;">FaceTime HD</span>
+            <span class="ms" style="font-size: 15px; color: #3d3936;">expand_more</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px;">
+            <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">shape</span>
+            <div style="display: flex; gap: 4px;">
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #4d4945;">Circle</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #4d4945;">Rounded</span>
+              <span style="flex: 1; text-align: center; font-size: 11px; padding: 5px 0; border-radius: 7px; color: #4d4945;">Full</span>
+            </div>
+          </div>
+          <div style="display: flex; gap: 14px; align-items: flex-start;">
+            <div style="display: flex; flex-direction: column; gap: 9px;">
+              <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">position</span>
+              <div style="display: grid; grid-template-columns: repeat(3, 30px); grid-template-rows: repeat(3, 22px); gap: 3px; padding: 4px; border-radius: 9px; background: rgba(255,255,255,0.02);">
+                <span style="border-radius: 5px;"></span><span style="border-radius: 5px;"></span><span style="border-radius: 5px;"></span>
+                <span style="border-radius: 5px;"></span><span style="border-radius: 5px;"></span><span style="border-radius: 5px;"></span>
+                <span style="border-radius: 5px;"></span><span style="border-radius: 5px;"></span>
+                <span style="border-radius: 5px; background: rgba(255,255,255,0.04); display: flex; align-items: center; justify-content: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #3d3936;"></span></span>
+              </div>
+            </div>
+            <div style="flex: 1; display: flex; flex-direction: column; gap: 14px; padding-top: 22px;">
+              <div style="display: flex; flex-direction: column; gap: 8px;">
+                <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">size</span>
+                <div style="height: 3px; border-radius: 2px; background: rgba(255,255,255,0.05);"></div>
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 8px;">
+                <span style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #4d4945;">inset</span>
+                <div style="height: 3px; border-radius: 2px; background: rgba(255,255,255,0.05);"></div>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 9px; background: rgba(255,255,255,0.05);">
+            <span class="ms" style="font-size: 15px; color: #b3aea8;">blur_on</span>
+            <span style="font-size: 11px; color: #eceae7; flex: 1;">Cover it with a redact layer</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="2g" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2g</span>
+        <span style="font-size: 14px; font-weight: 500;">Errors and empties</span>
+        <span style="font-size: 12px; color: #837e79;">every one names the next action</span>
+      </div>
+      <div style="display: grid; grid-template-columns: 350px 350px; gap: 16px;">
+        <div style="border-radius: 13px; background: #121316; padding: 17px 18px; display: flex; flex-direction: column; gap: 11px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="ms" style="font-size: 17px; color: #9d9892;">videocam_off</span>
+            <span style="font-size: 13px; color: #f6f4f2; flex: 1;">No camera found</span>
+          </div>
+          <span style="font-size: 11px; line-height: 1.6; color: #a09b95; text-wrap: pretty;">Recording will continue without one. Plugging a camera in picks it up automatically.</span>
+          <div style="display: flex; gap: 8px;">
+            <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; background: rgba(255,255,255,0.06); color: #eceae7;">Record without</span>
+            <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; color: #837e79;">Check again</span>
+          </div>
+        </div>
+        <div style="border-radius: 13px; background: #121316; padding: 17px 18px; display: flex; flex-direction: column; gap: 11px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="ms" style="font-size: 17px; color: #e0523f;">storage</span>
+            <span style="font-size: 13px; color: #f6f4f2; flex: 1;">Disk almost full</span>
+          </div>
+          <span style="font-size: 11px; line-height: 1.6; color: #a09b95; text-wrap: pretty;">4.1 GB left, about 6 minutes at 4K 60. The recording stops on its own before the disk fills and keeps what it has.</span>
+          <div style="display: flex; gap: 8px;">
+            <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; background: rgba(255,255,255,0.06); color: #eceae7;">Manage recordings</span>
+            <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; color: #837e79;">Record anyway</span>
+          </div>
+        </div>
+        <div style="border-radius: 13px; background: #121316; padding: 17px 18px; display: flex; flex-direction: column; gap: 11px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="ms" style="font-size: 17px; color: #e0523f;">error</span>
+            <span style="font-size: 13px; color: #f6f4f2; flex: 1;">Render stopped at 64%</span>
+          </div>
+          <span style="font-size: 11px; line-height: 1.6; color: #a09b95; text-wrap: pretty;">The encoder exited while writing frame 6,141. Your edit is saved and nothing was lost.</span>
+          <div style="display: flex; gap: 8px;">
+            <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; background: #f2a25a; color: #1a1006;">Retry</span>
+            <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; color: #837e79;">Copy log</span>
+          </div>
+        </div>
+        <div style="border-radius: 13px; background: #121316; padding: 17px 18px; display: flex; flex-direction: column; gap: 11px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="ms" style="font-size: 17px; color: #9d9892;">link_off</span>
+            <span style="font-size: 13px; color: #f6f4f2; flex: 1;">Source file missing</span>
+          </div>
+          <span style="font-size: 11px; line-height: 1.6; color: #a09b95; text-wrap: pretty;">Last seen at <span style="color: #b3aea8;">~/Videos/weekly-demo.mkv</span>. Your zooms, cuts and layers are intact and reattach when you point at it again.</span>
+          <div style="display: flex; gap: 8px;">
+            <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; background: rgba(255,255,255,0.06); color: #eceae7;">Locate…</span>
+            <span style="font-size: 11px; padding: 6px 12px; border-radius: 8px; color: #837e79;">Remove entry</span>
+          </div>
+        </div>
+        <div style="grid-column: span 2; border-radius: 13px; background: #121316; padding: 30px 18px; display: flex; flex-direction: column; align-items: center; gap: 12px;">
+          <span class="ms" style="font-size: 26px; color: #4d4945;">video_library</span>
+          <span style="font-size: 13px; color: #b3aea8;">Nothing recorded yet</span>
+          <span style="font-size: 11px; color: #625d58;">Super+Space, or the button below.</span>
+          <div style="display: flex; align-items: center; gap: 9px; padding: 8px 16px; border-radius: 10px; background: #f2a25a;">
+            <span class="ms" style="font-size: 15px; color: #1a1006;">radio_button_checked</span>
+            <span style="font-size: 12px; font-weight: 500; color: #1a1006;">Record something</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<section style="width: 2100px; box-sizing: border-box; padding: 56px 56px 80px; font-family: 'JetBrains Mono', monospace; color: #eceae7; display: flex; flex-direction: column; gap: 52px;">
+
   <div style="display: flex; flex-direction: column; gap: 11px; max-width: 940px;">
     <div style="font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; color: #6d6863;">Screen recorder · six screens</div>
     <div style="font-size: 32px; font-weight: 500; letter-spacing: -0.01em;">A coat of paint</div>
@@ -657,7 +1417,7 @@ class Component extends DCLogic {
       const env = 0.4 + 0.35 * Math.sin(i / 7) + 0.2 * Math.sin(i / 2.3) + 0.12 * Math.sin(i * 1.7);
       return { h: Math.round(Math.max(0.12, Math.min(1, env)) * 88) + "%" };
     });
-    return { wave };
+    return { wave, strip: Array.from({ length: 8 }, (_, i) => i) };
   }
 }
 

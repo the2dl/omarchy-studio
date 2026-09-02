@@ -40,7 +40,7 @@ import warnings
 from dataclasses import dataclass, field
 
 from .exprs import escape_drawtext, fade_filters, frame_gate
-from .geometry import Canvas, Rect, ffmpeg_blur
+from .geometry import DEFAULT_REDACT, Canvas, Rect, ffmpeg_blur
 from .project import Layer, WebcamSettings
 from .timebase import CutMap, FrameRange, Timebase
 
@@ -419,7 +419,7 @@ def _compile_redaction(
     if layer.type == "blur":
         # gblur, not boxblur: the same Gaussian kernel family as Qt's MultiEffect, so
         # preview and export track each other as strength varies.
-        op = ffmpeg_blur(float(layer.props.get("strength", 0.6)))
+        op = ffmpeg_blur(str(layer.props.get("preset", DEFAULT_REDACT)))
     else:
         block = int(round(block_px(layer.props.get("block", 0.012), canvas)))
         op = f"pixelize=w={block}:h={block}"

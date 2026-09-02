@@ -33,7 +33,7 @@ from typing import Any, Callable
 from . import events as _events
 from . import layers as _layers
 from . import zoom as _zoom
-from .geometry import Canvas, Placement, Rect, Zoom, qml_blur
+from .geometry import DEFAULT_REDACT, Canvas, Placement, Rect, Zoom, qml_blur
 from .project import Bundle, Layer, ProjectError
 from .timebase import CutMap, FrameRange, Timebase, normalize
 
@@ -151,7 +151,7 @@ def resolve_layer(layer: Layer, canvas: Canvas, bundle: Bundle) -> dict:
             "radius": _layers.radius_px(layer.props.get("radius", 0.0), r),
         }
     elif layer.type == "blur":
-        d["blur"] = qml_blur(float(layer.props.get("strength", 0.6)))
+        d["blur"] = qml_blur(str(layer.props.get("preset", DEFAULT_REDACT)))
     elif layer.type == "pixelate":
         # Block size is normalized like every other dimension so a project authored on
         # the 1080p proxy pixelates identically on the master -- but through layers.py,
@@ -542,7 +542,7 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         p = rect_arg()
         props: dict[str, Any] = {}
         if kind == "blur":
-            props["strength"] = float(args.get("strength", 0.6))
+            props["preset"] = str(args.get("preset", DEFAULT_REDACT))
         elif kind == "pixelate":
             props["block"] = float(args.get("block", 0.012))
         elif kind == "text":

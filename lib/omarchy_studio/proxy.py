@@ -26,10 +26,22 @@ from .project import Bundle, ProjectError
 # must invalidate a proxy when it changes.
 GOP = 15
 PROXY_WIDTH = 1920
+# CRF, not a bitrate target. A fixed 10M made the proxy TEN TIMES LARGER than the
+# master it stands in for -- 174MB against 18MB for a 2:13 desktop capture -- because a
+# constant bitrate spends its whole budget on a mostly-static screen that gsr had already
+# compressed to about 1 Mbit/s. At ~5GB per hour of recording that is a worse problem
+# than the slow seeking it was solving.
+#
+# CRF 30 is deliberately low quality: nobody grades colour on a scrub proxy, and the
+# export always reads the master. The short GOP is what makes seeks land, and it is kept
+# -- it costs compression, but against a quality target rather than a bitrate floor it
+# costs a fraction of what it did.
 _VIDEO_ARGS = [
     "-c:v", "libx264",
     "-preset", "veryfast",
-    "-b:v", "10M",
+    "-crf", "30",
+    "-maxrate", "6M",
+    "-bufsize", "12M",
     "-g", str(GOP),
     "-bf", "0",
     "-pix_fmt", "yuv420p",

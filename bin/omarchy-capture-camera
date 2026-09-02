@@ -244,7 +244,14 @@ start_camera() {
         "$FIFO"
       )
     else
-      echo "no room outside the capture for a self-view; recording the camera blind" >&2
+      # Not a failure: the camera still records to its own stream and stays fully
+      # editable afterwards. Only the live preview is unavailable, because the capture
+      # region leaves nowhere on screen to park a window that the capture would not
+      # then swallow. Say what the user can do instead of only what did not happen.
+      echo "self-view off: the capture region fills the screen, so there is nowhere to" >&2
+      echo "  put a preview that would not be recorded. The camera is still being" >&2
+      echo "  recorded separately and stays movable in the editor. For a live preview," >&2
+      echo "  select a smaller region so there is room beside it." >&2
     fi
   fi
 

@@ -49,6 +49,9 @@ WEBCAM_SIZE="medium"
 RESOLUTION=""
 FULLSCREEN="false"
 STOP_RECORDING="false"
+# True when a person asked for the stop, as opposed to the recorder ending some other
+# way. Only a deliberate stop opens the editor unprompted.
+STOPPED_DELIBERATELY="false"
 SCRIPT_ARGS="$*"
 
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
@@ -330,6 +333,18 @@ start_screenrecording() {
   echo "$master" >"$RECORDING_FILE"
   RECORDING_LAUNCHED="true"
   toggle_screenrecording_indicator
+
+  # Run from a terminal this backgrounds a recorder and returns, which on its own is
+  # indistinguishable from having crashed -- especially when the only output was a
+  # warning about the self-view. The bar indicator alone is not enough feedback for
+  # someone who is looking at their prompt, so say it plainly and say how to stop.
+  if [[ -t 1 ]]; then
+    local what="${target#monitor:}"
+    [[ $target == region:* ]] && what="region ${target#region:}"
+    echo "Recording $what -> $BUNDLE"
+    [[ $WEBCAM == "true" && $BURN_IN != "true" ]] && echo "  camera: media/cam.mp4, separate stream (movable in the editor)"
+    echo "  stop:   Alt+PrintScreen, the bar indicator, or run this command again"
+  fi
 }
 
 stop_screenrecording() {
@@ -340,15 +355,24 @@ stop_screenrecording() {
   # the reply is the completion signal. SIGINT remains the fallback for a recording this
   # script did not start -- an older build's, say -- which has no socket.
   if [[ -n $bundle && -S $IPC_SOCKET ]]; then
-    omarchy-studio-ipc "$IPC_SOCKET" stop --timeout 30 >/dev/null || {
+    # 30s was chosen for the finalize wait on a long recording, but it is also how long
+    # this blocks when the socket exists and gsr is not yet answering on it -- which is
+    # exactly the "started it, immediately realised I picked the wrong window, hit stop"
+    # case. Ask briefly, then fall through to the signal, which gsr honours whatever
+    # state it is in. A finalize that needs longer is still waited for below, by the
+    # process-exit loop, so nothing is truncated by asking impatiently.
+    omarchy-studio-ipc "$IPC_SOCKET" stop --timeout 5 >/dev/null || {
       pkill -SIGINT -f "^gpu-screen-recorder"
     }
   else
     pkill -SIGINT -f "^gpu-screen-recorder" # SIGINT required to save video properly
   fi
 
+  # This, not the IPC reply, is what guarantees the file is closed. 30s: a 4K finalize
+  # is well under a second, but an encoder flushing a long recording under load is not,
+  # and killing early is how a video gets truncated.
   local count=0
-  while pgrep -f "^gpu-screen-recorder" >/dev/null && ((count < 50)); do
+  while pgrep -f "^gpu-screen-recorder" >/dev/null && ((count < 300)); do
     sleep 0.1
     count=$((count + 1))
   done
@@ -398,9 +422,28 @@ announce_recording() {
   fi
   ffmpeg -y -i "$master" -ss 00:00:00.1 -vframes 1 -q:v 2 "$preview" -loglevel quiet 2>/dev/null
 
-  omarchy-notification-send "Screen recording saved" "Open with Super + Alt + , (or click this)" \
-    -t 10000 --image "${preview:-$master}" \
-    --exec mpv -- "$master"
+  # A deliberate stop leads straight into the editor (docs/design/spec.md, Decisions):
+  # pressing stop is a decision, and editing is the thing you wanted next. Any other
+  # ending -- a hotkey from another workspace, disk pressure, crash recovery -- has no
+  # such intent behind it, so it only posts a notification whose action opens the editor.
+  local bundle_dir=""
+  [[ $master == */media/screen.mp4 ]] && bundle_dir="${master%/media/screen.mp4}"
+
+  if [[ -n $bundle_dir && $STOPPED_DELIBERATELY == "true" ]] && command -v omarchy-studio >/dev/null; then
+    omarchy-notification-send "Screen recording saved" "Opening the editor" \
+      -t 4000 --image "${preview:-$master}"
+    # setsid so the editor outlives the shell that stopped the recording -- otherwise
+    # closing the terminal takes the window with it.
+    setsid omarchy-studio "$bundle_dir" >/dev/null 2>&1 &
+  elif [[ -n $bundle_dir ]] && command -v omarchy-studio >/dev/null; then
+    omarchy-notification-send "Screen recording saved" "Click to edit" \
+      -t 10000 --image "${preview:-$master}" \
+      --exec omarchy-studio -- "$bundle_dir"
+  else
+    omarchy-notification-send "Screen recording saved" "Open with Super + Alt + , (or click this)" \
+      -t 10000 --image "${preview:-$master}" \
+      --exec mpv -- "$master"
+  fi
 
   # The shell loads the thumbnail into memory when the toast appears and never re-reads
   # the file, so the preview only has to outlive that load -- not the toast.
@@ -419,6 +462,7 @@ screenrecording_active() {
 }
 
 if screenrecording_active; then
+  STOPPED_DELIBERATELY="true"
   stop_screenrecording
 elif [[ $STOP_RECORDING == "true" ]]; then
   exit 1

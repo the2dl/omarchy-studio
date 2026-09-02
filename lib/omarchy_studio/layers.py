@@ -316,11 +316,12 @@ def _tile_text(
 ) -> tuple[list[str], str]:
     text = layer.props.get("text", "")
     w, h = int(rect.w), int(rect.h)
-    font_px = int(layer.props.get("font_px") or max(8, round(h * 0.6)))
+    size = font_px(layer.props.get("font_px"), rect)
     color = _hexcol(layer.props.get("color", "white"))
     fontfile = layer.props.get("fontfile", DEFAULT_FONTFILE)
-    box_rgb, box_alpha = _split_color(layer.props.get("box_color", "black@0.0"))
-    radius = _radius_px(layer.props.get("radius", 0.0), rect)
+    box_rgb, box_alpha = split_color(layer.props.get("box_color", "black@0.0"))
+    box_rgb = _hexcol(box_rgb)
+    radius = radius_px(layer.props.get("radius", 0.0), rect)
 
     chains: list[str] = []
     src = f"[{name}_r]"
@@ -345,7 +346,7 @@ def _tile_text(
     # against the preview, where left-anchoring drifted ~7% of the string width.
     chains.append(
         f"{src}drawtext=fontfile={fontfile}:text='{escape_drawtext(text)}'"
-        f":fontsize={font_px}:fontcolor={color}"
+        f":fontsize={size}:fontcolor={color}"
         f":x=(w-text_w)/2:y=(h-text_h)/2[{name}_s]"
     )
     return chains, f"[{name}_s]"
@@ -355,8 +356,9 @@ def _tile_shape(
     layer: Layer, name: str, rect: Rect, cutmap: CutMap, tb: Timebase, static: bool
 ) -> tuple[list[str], str]:
     w, h = int(rect.w), int(rect.h)
-    rgb, alpha = _split_color(layer.props.get("color", "#ff3b30"))
-    radius = _radius_px(layer.props.get("radius", 0.0), rect)
+    rgb, alpha = split_color(layer.props.get("color", "#ff3b30"))
+    rgb = _hexcol(rgb)
+    radius = radius_px(layer.props.get("radius", 0.0), rect)
     chains = [_color_source(rgb, w, h, cutmap, tb, f"[{name}_r]", static)]
     if radius <= 0 and alpha >= 1.0:
         return chains, f"[{name}_r]"
@@ -389,7 +391,7 @@ def _tile_webcam(
     ]
     if shape == "rect":
         return chains, f"[{name}_c]"
-    radius = _radius_px(layer.props.get("corner_radius", 0.12), rect)
+    radius = radius_px(layer.props.get("corner_radius", 0.12), rect)
     mask = _circle_mask(w, h) if shape == "circle" else _rounded_rect_mask(w, h, radius)
     chains.append(
         f"color=c=black:s={w}x{h}:r=1:d=1,format=gray,geq=lum='{mask}'[{name}_m]"
@@ -419,7 +421,7 @@ def _compile_redaction(
         # preview and export track each other as strength varies.
         op = ffmpeg_blur(float(layer.props.get("strength", 0.6)))
     else:
-        block = max(2, int(layer.props.get("block", 24)))
+        block = int(round(block_px(layer.props.get("block", 0.012), canvas)))
         op = f"pixelize=w={block}:h={block}"
 
     # No fade and no opacity on a redaction, deliberately: a partially transparent
@@ -462,17 +464,50 @@ def _hexcol(c: str) -> str:
     return "0x" + c.lstrip("#") if c.startswith("#") else c
 
 
-def _split_color(spec: str) -> tuple[str, float]:
-    """Split 'colour@alpha' into an ffmpeg colour and a 0..1 alpha."""
+def split_color(spec: str) -> tuple[str, float]:
+    """Split 'colour@alpha' into the bare colour token and a 0..1 alpha.
+
+    Public because the preview needs the identical split: `box_color` is ONE property,
+    and a preview that reads a separate `box_opacity` draws a box the export does not.
+    The colour is returned in the spelling it was written in -- `_hexcol` converts to
+    ffmpeg's 0x form at the point of use, and QML wants the '#' form.
+    """
     rgb, sep, a = str(spec).partition("@")
-    return _hexcol(rgb), (float(a) if sep else 1.0)
+    return rgb, (float(a) if sep else 1.0)
 
 
-def _radius_px(radius: float, rect: Rect) -> float:
-    """Corner radius is stored normalized to the short side so the same project renders
-    identically against a 1080p proxy and a 1440p master."""
+def radius_px(radius: float, rect: Rect) -> float:
+    """Corner radius is stored normalized to the TILE's short side so the same project
+    renders identically against a 1080p proxy and a 1440p master.
+
+    Public for the same reason as `split_color`: the preview normalized against the
+    canvas width instead, so a 0.2 radius on a small tile rounded a shape into a
+    lozenge in the preview and left it square in the export.
+    """
     r = float(radius)
     return r * min(rect.w, rect.h) if r <= 1.0 else r
+
+
+def block_px(block: float, canvas: Canvas) -> float:
+    """Pixelate block size, in output pixels.
+
+    Values at or below 1 are normalized to the canvas WIDTH -- the same "<=1 means
+    normalized" convention `radius_px` uses -- because a mosaic authored on a 1080p
+    proxy has to hide the same words on a 1440p master. The editor writes the
+    normalized form (0.012), and reading it as pixels floored it to a 2 px block: a
+    redaction that previews as an unreadable mosaic and exports as legible text.
+    """
+    b = float(block)
+    return max(2.0, b * canvas.width if b <= 1.0 else b)
+
+
+def font_px(font: float | int | None, rect: Rect) -> int:
+    """Caption size in pixels, defaulting to 0.6 of the tile height.
+
+    Public so the preview sizes from the TILE, as drawtext does, rather than from the
+    canvas height: the two defaults disagreed by more than 2x on a short caption box.
+    """
+    return int(font) if font else max(8, round(rect.h * 0.6))
 
 
 def _rounded_rect_mask(w: int, h: int, r: float) -> str:

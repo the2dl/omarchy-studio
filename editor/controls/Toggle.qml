@@ -1,0 +1,54 @@
+// A 30x17 pill with a 13px knob, 2px inset.
+//
+// Qt's Switch is not restyled here, it is replaced: the native control carries an
+// indicator, a background, a content item and its own implicit sizing, and pinning all
+// four to these numbers takes more code than drawing two rectangles.
+
+import QtQuick
+import ".."
+
+Item {
+    id: root
+
+    property bool checked: false
+    property bool enabled: true
+    signal toggled(bool value)
+
+    implicitWidth: 30
+    implicitHeight: 17
+
+    opacity: enabled ? 1.0 : 0.45
+
+    Rectangle {
+        id: track
+        anchors.fill: parent
+        radius: height / 2
+        color: root.checked ? Theme.accent : Theme.track
+        Behavior on color { ColorAnimation { duration: Theme.durFast } }
+    }
+
+    Rectangle {
+        id: knob
+        width: 13
+        height: 13
+        radius: height / 2
+        y: 2
+        x: root.checked ? parent.width - width - 2 : 2
+        // Off-state knob is a fixed mid-grey in the spec rather than a token, because it
+        // has to read against `track` on both light and dark grounds.
+        color: root.checked ? Theme.accentOn : "#6d6863"
+        Behavior on x { NumberAnimation { duration: Theme.durFast; easing.type: Easing.OutCubic } }
+        Behavior on color { ColorAnimation { duration: Theme.durFast } }
+    }
+
+    MouseArea {
+        anchors.fill: parent
+        anchors.margins: -6   // the pill is small; the hit target should not be
+        enabled: root.enabled
+        cursorShape: Qt.PointingHandCursor
+        onClicked: {
+            root.checked = !root.checked
+            root.toggled(root.checked)
+        }
+    }
+}

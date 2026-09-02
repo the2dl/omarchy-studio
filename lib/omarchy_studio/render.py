@@ -40,7 +40,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import cuts, layers as layers_mod, probe
@@ -293,13 +293,29 @@ def _layer_list(bundle: Bundle, registry: layers_mod.InputRegistry) -> list[Laye
     the camera actually reached the graph, so a burned-in or disabled camera cannot
     leave a webcam layer asking the registry for a stream nobody bound.
     """
-    layer_list = [l for l in bundle.edit.layers if l.enabled]
+    layer_list = [_resolve_asset(l, bundle) for l in bundle.edit.layers if l.enabled]
     has_webcam = any(l.type == "webcam" for l in layer_list)
     if registry.has("camera") and not has_webcam:
         layer_list.append(layers_mod.webcam_layer(bundle.edit.webcam))
     elif has_webcam and not registry.has("camera"):
         layer_list = [l for l in layer_list if l.type != "webcam"]
     return sorted(layer_list, key=lambda l: l.z)
+
+
+def _resolve_asset(layer: Layer, bundle: Bundle) -> Layer:
+    """Turn an image layer's asset NAME into a path ffmpeg can open.
+
+    The editor copies a dropped image into `assets/` and stores the bare filename, so
+    the bundle stays portable across machines. layers.py is pure -- it has never heard
+    of a Bundle -- and handed that filename straight to `-i`, which ffmpeg resolved
+    against its own working directory: every image layer added through the editor died
+    with "No such file or directory" at export. Resolved here, on a copy, because the
+    Edit on disk must keep the portable name.
+    """
+    name = layer.props.get("asset")
+    if layer.type != "image" or not name or layer.props.get("path"):
+        return layer
+    return replace(layer, props={**layer.props, "path": str(bundle.assets_dir / name)})
 
 
 # --- backdrop ---------------------------------------------------------------

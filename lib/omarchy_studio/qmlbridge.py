@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import events as _events
+from . import layers as _layers
 from . import zoom as _zoom
 from .geometry import Canvas, Placement, Rect, Zoom, qml_blur
 from .project import Bundle, Layer, ProjectError
@@ -119,29 +120,44 @@ def resolve_layer(layer: Layer, canvas: Canvas, bundle: Bundle) -> dict:
     elif layer.type == "text":
         # Centre-anchored: left-anchored text drifted ~7% of the string width between
         # Qt's shaper and libavfilter's drawtext even on the same font file.
+        #
+        # Every default below is layers.py's, reached through layers.py's own helpers.
+        # They used to be this module's own, and the preview lied four ways at once: a
+        # #101820 caption box at 0.85 where drawtext drew none (box_color carries the
+        # alpha, and there is no separate box_opacity property), and a font sized off
+        # the canvas height where drawtext sizes off the tile.
         r = layer.placement.resolve(canvas)
+        box_rgb, box_alpha = _layers.split_color(layer.props.get("box_color", "black@0.0"))
         d["text"] = {
             "text": layer.props.get("text", ""),
             "cx": r.x + r.w / 2.0,
             "cy": r.y + r.h / 2.0,
-            "pixelSize": int(layer.props.get("font_px", max(16, int(canvas.height * 0.045)))),
+            "pixelSize": _layers.font_px(layer.props.get("font_px"), r),
             "color": layer.props.get("color", "#ffffff"),
-            "box_color": layer.props.get("box_color", "#101820"),
-            "box_opacity": float(layer.props.get("box_opacity", 0.85)),
-            "radius": float(layer.props.get("radius", 0.012)) * canvas.width,
+            "box_color": box_rgb,
+            "box_opacity": box_alpha,
+            "radius": _layers.radius_px(layer.props.get("radius", 0.0), r),
             "font_file": FONT_FILE,
         }
     elif layer.type == "shape":
+        r = layer.placement.resolve(canvas)
+        rgb, alpha = _layers.split_color(layer.props.get("color", "#ff3b30"))
         d["shape"] = {
-            "color": layer.props.get("color", "#ff3b30"),
-            "radius": float(layer.props.get("radius", 0.008)) * canvas.width,
+            "color": rgb,
+            "opacity": alpha,
+            # Against the TILE's short side, which is what the export's mask uses. The
+            # canvas width was a different basis entirely: 0.2 on a small shape rounded
+            # to a lozenge here and stayed square in the render.
+            "radius": _layers.radius_px(layer.props.get("radius", 0.0), r),
         }
     elif layer.type == "blur":
         d["blur"] = qml_blur(float(layer.props.get("strength", 0.6)))
     elif layer.type == "pixelate":
         # Block size is normalized like every other dimension so a project authored on
-        # the 1080p proxy pixelates identically on the master.
-        d["pixelate"] = {"block": max(2.0, float(layer.props.get("block", 0.012)) * canvas.width)}
+        # the 1080p proxy pixelates identically on the master -- but through layers.py,
+        # because reading the editor's normalized 0.012 as pixels floored the export to
+        # a 2 px block: a mosaic that previewed unreadable and rendered legible.
+        d["pixelate"] = {"block": _layers.block_px(layer.props.get("block", 0.012), canvas)}
     return d
 
 

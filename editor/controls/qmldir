@@ -1,0 +1,9 @@
+# A directory qmldir, like editor/'s -- no `module` line, or the implicit
+# same-directory import stops resolving and every type fails to load silently.
+Toggle 1.0 Toggle.qml
+Slider 1.0 Slider.qml
+Segmented 1.0 Segmented.qml
+Caption 1.0 Caption.qml
+PrimaryButton 1.0 PrimaryButton.qml
+GhostButton 1.0 GhostButton.qml
+RailButton 1.0 RailButton.qml

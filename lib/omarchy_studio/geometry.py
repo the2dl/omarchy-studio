@@ -237,10 +237,21 @@ def ffmpeg_blur(preset: str) -> str:
     return f"gblur=sigma={_fmt(blur_sigma(preset))}:steps=3"
 
 
+def pixelate_block_px(preset: str, canvas: Canvas) -> int:
+    """Mosaic block size in output pixels, on the same preset ladder as blur.
+
+    One function so the preview and the export cannot compute it separately -- that is
+    exactly how pixelate previewed as an unreadable mosaic and exported as legible text.
+    Scaled against canvas WIDTH so a redaction authored on the 1080p proxy hides the same
+    words on the master.
+    """
+    return max(4, round(blur_sigma(preset) / 22.0 * 0.012 * canvas.width))
+
+
 def ffmpeg_pixelate(preset: str, canvas: Canvas) -> str:
-    """The `pixelate` method. Block size scales with the same preset ladder so switching
-    method does not silently change how much is recoverable."""
-    block = max(4, round(blur_sigma(preset) / 22.0 * 0.012 * canvas.width))
+    """The `pixelate` method. Rides the preset ladder so switching method never silently
+    changes how much is recoverable."""
+    block = pixelate_block_px(preset, canvas)
     return f"pixelize=w={block}:h={block}"
 
 

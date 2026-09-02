@@ -33,7 +33,8 @@ from typing import Any, Callable
 from . import events as _events
 from . import layers as _layers
 from . import zoom as _zoom
-from .geometry import DEFAULT_REDACT, Canvas, Placement, Rect, Zoom, qml_blur
+from .geometry import (DEFAULT_REDACT, Canvas, Placement, Rect, Zoom,
+                       pixelate_block_px, qml_blur)
 from .project import Bundle, Layer, ProjectError
 from .timebase import CutMap, FrameRange, Timebase, normalize
 
@@ -157,7 +158,11 @@ def resolve_layer(layer: Layer, canvas: Canvas, bundle: Bundle) -> dict:
         # the 1080p proxy pixelates identically on the master -- but through layers.py,
         # because reading the editor's normalized 0.012 as pixels floored the export to
         # a 2 px block: a mosaic that previewed unreadable and rendered legible.
-        d["pixelate"] = {"block": _layers.block_px(layer.props.get("block", 0.012), canvas)}
+        d["pixelate"] = {
+            "block": _layers.block_px(layer.props["block"], canvas)
+            if "block" in layer.props
+            else pixelate_block_px(str(layer.props.get("preset", DEFAULT_REDACT)), canvas)
+        }
     return d
 
 

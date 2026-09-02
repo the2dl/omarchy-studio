@@ -40,7 +40,7 @@ import warnings
 from dataclasses import dataclass, field
 
 from .exprs import escape_drawtext, fade_filters, frame_gate
-from .geometry import DEFAULT_REDACT, Canvas, Rect, ffmpeg_blur
+from .geometry import DEFAULT_REDACT, Canvas, Rect, ffmpeg_blur, ffmpeg_pixelate
 from .project import Layer, WebcamSettings
 from .timebase import CutMap, FrameRange, Timebase
 
@@ -416,13 +416,22 @@ def _compile_redaction(
         )
         return None
 
+    preset = str(layer.props.get("preset", DEFAULT_REDACT))
     if layer.type == "blur":
         # gblur, not boxblur: the same Gaussian kernel family as Qt's MultiEffect, so
-        # preview and export track each other as strength varies.
-        op = ffmpeg_blur(str(layer.props.get("preset", DEFAULT_REDACT)))
+        # preview and export track each other across presets.
+        op = ffmpeg_blur(preset)
     else:
-        block = int(round(block_px(layer.props.get("block", 0.012), canvas)))
-        op = f"pixelize=w={block}:h={block}"
+        # Pixelate rides the SAME preset ladder as blur. It used to take a continuous
+        # `block` prop, which is a slider by another name -- and it is the path that
+        # already shipped one leak (normalized 0.012 read as pixels, floored to a 2px
+        # mosaic: previewed unreadable, exported legible). A caller that still passes an
+        # explicit `block` is honoured, but nothing writes one any more.
+        if "block" in layer.props:
+            block = int(round(block_px(layer.props["block"], canvas)))
+            op = f"pixelize=w={block}:h={block}"
+        else:
+            op = ffmpeg_pixelate(preset, canvas)
 
     # No fade and no opacity on a redaction, deliberately: a partially transparent
     # blur box leaks the pixels it exists to hide.

@@ -126,8 +126,14 @@ def install_window_rules() -> None:
         # Overlays are transparent monitor-sized sheets: shadow and rounding on
         # them would draw a visible halo around the whole screen, and stealing
         # focus from the bar would break its keyboard handling.
+        # no_focus, not just no_initial_focus: with focus-follows-mouse, moving the
+        # pointer across the sheet handed it focus, Hyprland raised the focused window,
+        # and the bar went back under it -- unrecoverably, because the pointer has to
+        # cross the sheet to reach the bar. Keeping focus on the bar is what makes the
+        # raise below stick. Pointer clicks still reach the sheet; only keyboard focus
+        # is refused, and the bar owns every shortcut anyway.
         f'hl.window_rule({{ match = {{ title = "^{OVERLAY_PREFIX}.*$" }}, {common}, '
-        f'rounding = 0, no_shadow = true, no_initial_focus = true }})',
+        f'rounding = 0, no_shadow = true, no_initial_focus = true, no_focus = true }})',
     ]
     for rule in rules:
         subprocess.run(["hyprctl", "eval", rule], capture_output=True)
@@ -141,6 +147,7 @@ def position_windows(mons: list[dict], focused_name: str) -> None:
     by_name = {m["name"]: m for m in mons}
     deadline = time.monotonic() + 3.0
     placed: set[str] = set()
+    bar_addr = ""
     want = {BAR_TITLE} | {OVERLAY_PREFIX + m["name"] for m in mons}
     while time.monotonic() < deadline and placed != want:
         for c in _run_json(["hyprctl", "clients", "-j"]):
@@ -151,6 +158,7 @@ def position_windows(mons: list[dict], focused_name: str) -> None:
             if not addr:
                 continue
             if title == BAR_TITLE:
+                bar_addr = addr
                 mon = by_name.get(focused_name) or mons[0]
                 w, h = int(c["size"][0]), int(c["size"][1])
                 x = mon["x"] + (mon["width"] - w) // 2
@@ -166,6 +174,27 @@ def position_windows(mons: list[dict], focused_name: str) -> None:
             placed.add(title)
         if placed != want:
             time.sleep(0.05)
+
+    # The overlays are monitor-sized sheets with a full-fill MouseArea, and they map
+    # after the bar (they are instantiated from /sources, which arrives async), so
+    # Hyprland stacks them on top of it. The bar stays visible through the transparent
+    # sheet but every click over it lands on the overlay instead -- proven by clicks
+    # inside the bar's rect arriving at the overlay's handler. Raising the bar last,
+    # once everything has mapped, is what makes its controls clickable at all. The
+    # picker remaps the surfaces, so this runs again on every reposition.
+    # Raised repeatedly rather than once: after the area picker the surfaces are
+    # destroyed and remapped, and an overlay whose surface commits after our raise
+    # lands back on top. Re-raising across the settle window costs nothing (the
+    # dispatch is idempotent) and is what keeps the bar clickable on the second and
+    # later visits, not just at launch.
+    for i in range(6):
+        if not bar_addr:
+            break
+        hypr_dispatch(
+            f'hl.dsp.window.bring_to_top({{ window = "address:{bar_addr}" }})',
+            ["alterzorder", f"top,address:{bar_addr}"])
+        if i < 5:
+            time.sleep(0.2)
 
 
 # --- mic level ----------------------------------------------------------------

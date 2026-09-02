@@ -6,7 +6,11 @@ import ".."
 Item {
     id: root
     property string text: ""
-    property bool enabled: true
+    // No `property bool enabled` here: Item already declares it, and redeclaring
+    // shadows the base property. Qt warns on it and newer builds make it a hard
+    // "Cannot override FINAL property" error, which fails the whole QML load with
+    // no symptom but a window that never appears. Item.enabled already does what
+    // is wanted -- it blocks input and propagates to children.
     signal clicked()
 
     implicitWidth: label.implicitWidth + 20

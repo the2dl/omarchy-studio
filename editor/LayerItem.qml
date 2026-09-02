@@ -201,6 +201,61 @@ Item {
         }
     }
 
+    // -- redaction marker (spec §2a, "the one hard rule") ---------------------
+    //
+    // The 45° accent hatch at 14% plus a small uppercase "redacted" label mark a
+    // redaction as an EDITING OBJECT without changing what it obscures. The pixels
+    // underneath are the components above: the real blur/pixelate/fill at export
+    // strength, always. There is deliberately no hover, select or scrub state that
+    // lightens or removes the obscuring -- a preview that ever shows the un-blurred
+    // content is a data leak, whatever it looks like.
+    //
+    // Suppressed under --selftest: the parity harness grabs the stage and compares it
+    // against the export frame at a half-peak threshold, and the accent label measures
+    // 165/255 grey -- bright enough to register as geometry (it widened the measured
+    // blur silhouette by 257px). The marker is interactive chrome, like the selection
+    // ring; hiding it in headless grabs changes nothing about what the redaction
+    // renders, which is the thing the harness exists to measure.
+    readonly property bool isRedaction: spec.type === "blur" || spec.type === "pixelate"
+        || (spec.type === "shape" && spec.props && spec.props.redact === true)
+    readonly property bool decorate: isRedaction && Bridge.selftestMs === 0
+
+    Canvas {
+        id: hatch
+        x: 0; y: 0
+        width: root.width
+        height: root.height
+        visible: root.decorate
+        onWidthChanged: requestPaint()
+        onHeightChanged: requestPaint()
+        property real step: root.px(10)   // mock: 5px stripe, 5px gap at screen scale
+        onStepChanged: requestPaint()
+        onPaint: {
+            var ctx = getContext("2d")
+            ctx.clearRect(0, 0, width, height)
+            ctx.strokeStyle = Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.14)
+            ctx.lineWidth = step / 2
+            ctx.beginPath()
+            for (var d = -height; d < width; d += step) {
+                ctx.moveTo(d, height)
+                ctx.lineTo(d + height, 0)
+            }
+            ctx.stroke()
+        }
+    }
+
+    Text {
+        visible: root.decorate
+        x: root.px(8)
+        y: (root.height - height) / 2
+        text: "redacted"
+        color: Theme.accent
+        font.family: Theme.fontFamily
+        font.pixelSize: root.px(10)
+        font.letterSpacing: root.px(10) * Theme.capsSpacing
+        font.capitalization: Font.AllUppercase
+    }
+
     // 1.5px ring, not a heavy border: rings mean selected everywhere in this design
     // (spec §1 "Selected card / keyframe").
     Rectangle {
@@ -209,7 +264,7 @@ Item {
         visible: root.selected
         color: "transparent"
         border.color: Theme.accent
-        border.width: 1.5
+        border.width: Math.max(1, root.px(1.5))
     }
 
     MouseArea {
@@ -238,39 +293,117 @@ Item {
         onReleased: root.endDrag()
     }
 
-    // Bottom-right resize grip. Square-ish handles at canvas scale would be invisible
-    // on a scaled-down stage, so it is sized in canvas pixels against the stage scale.
-    // The grip reads as a small corner handle; the transparent rectangle around it is
-    // the hit area, kept at gripSize because a 7px target is not draggable.
-    Rectangle {
-        id: grip
-        visible: root.selected && root.interactive
-        width: root.gripSize
-        height: root.gripSize
-        x: root.width - width / 2
-        y: root.height - height / 2
-        color: "transparent"
-        Rectangle {
-            anchors.centerIn: parent
-            width: 7; height: 7; radius: 3.5
-            color: Theme.accent
-        }
-        MouseArea {
-            x: 0; y: 0
-            width: parent.width; height: parent.height
-            cursorShape: Qt.SizeFDiagCursor
-            onPressed: root.beginDrag()
-            onPositionChanged: function (m) {
-                if (!pressed)
-                    return
-                root.liveW = Math.max(root.gripSize, root.liveW + m.x - grip.width / 2)
-                root.liveH = Math.max(root.gripSize, root.liveH + m.y - grip.height / 2)
+    // -- selection dressing (spec §2a): 9px accent handles at the four corners plus a
+    // type chip above the top-left corner. Everything is sized through px() because
+    // this item lives on a scaled stage: a 9px handle authored in canvas pixels would
+    // render at 4px on a half-scale stage and be untouchable.
+    Repeater {
+        model: root.selected && root.interactive ? 4 : 0
+        delegate: Item {
+            required property int index
+            // `left`/`top` are FINAL Item anchor properties; shadowing them fails the whole type.
+            readonly property bool onLeft: index % 2 === 0
+            readonly property bool onTop: index < 2
+            x: (onLeft ? 0 : root.width) - width / 2
+            y: (onTop ? 0 : root.height) - height / 2
+            width: root.px(18)   // the hit target; the visible dot sits inside it
+            height: width
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: root.px(9)
+                height: width
+                radius: width / 2
+                color: Theme.accent
             }
-            onReleased: root.endDrag()
+            MouseArea {
+                anchors.fill: parent
+                cursorShape: (parent.onLeft === parent.onTop) ? Qt.SizeFDiagCursor
+                                                          : Qt.SizeBDiagCursor
+                onPressed: root.beginDrag()
+                onPositionChanged: function (m) {
+                    if (!pressed)
+                        return
+                    var min = root.px(18)
+                    var dx = m.x - width / 2
+                    var dy = m.y - height / 2
+                    // Each corner moves its own two edges; the opposite corner stays
+                    // put. Deltas converge because the handle rides the live rect.
+                    if (parent.onLeft) {
+                        var nw = Math.max(min, root.liveW - dx)
+                        root.liveX += root.liveW - nw
+                        root.liveW = nw
+                    } else {
+                        root.liveW = Math.max(min, root.liveW + dx)
+                    }
+                    if (parent.onTop) {
+                        var nh = Math.max(min, root.liveH - dy)
+                        root.liveY += root.liveH - nh
+                        root.liveH = nh
+                    } else {
+                        root.liveH = Math.max(min, root.liveH + dy)
+                    }
+                }
+                onReleased: root.endDrag()
+            }
         }
     }
 
-    property real gripSize: 18
+    // The type chip: glyph + lowercase type (and the redaction's preset, so the
+    // strength is readable at the box itself). Mock 2a: 4px/8px padding, radius 6,
+    // bgFloat plate, accent 10px uppercase at 0.06em.
+    Rectangle {
+        visible: root.selected
+        x: 0
+        // Above the top-left corner, unless the layer touches the canvas top -- the
+        // viewport clips, and a chip pushed off the edge is a label nobody can read.
+        y: root.y > height + root.px(8) ? -height - root.px(8) : root.px(8)
+        width: chipRow.width + root.px(16)
+        height: chipRow.height + root.px(9)
+        radius: root.px(6)
+        color: Theme.bgFloat
+
+        Row {
+            id: chipRow
+            x: root.px(8)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: root.px(7)
+            Text {
+                text: root.spec.type === "image" ? ""
+                    : root.spec.type === "text" ? ""
+                    : root.spec.type === "pixelate" ? ""
+                    : root.spec.type === "shape" && !root.isRedaction ? ""
+                    : ""
+                color: Theme.accent
+                font.family: Theme.fontFamily
+                font.pixelSize: root.px(11)
+            }
+            Text {
+                text: {
+                    if (root.isRedaction) {
+                        var p = root.spec.props && root.spec.props.preset ? root.spec.props.preset : ""
+                        var how = root.spec.type === "shape" ? "fill" : p
+                        return how !== "" ? ("redact · " + how) : "redact"
+                    }
+                    return root.spec.type
+                }
+                color: Theme.accent
+                font.family: Theme.fontFamily
+                font.pixelSize: root.px(10)
+                font.letterSpacing: root.px(10) * 0.06
+                font.capitalization: Font.AllUppercase
+            }
+        }
+    }
+
+    // Screen pixels -> stage (canvas) pixels. The stage is one uniform Scale inside a
+    // viewport sized canvas*fit, so the factor is read off those two widths; the
+    // fallback keeps a LayerItem usable outside that structure (tests, harnesses).
+    readonly property real viewScale: parent && parent.parent && parent.width > 0
+                                      && parent.parent.width > 0
+                                      && parent.parent.width < parent.width
+                                      ? parent.parent.width / parent.width : 1
+    function px(n) { return n / viewScale }
 
     function beginDrag() {
         liveX = rect.x

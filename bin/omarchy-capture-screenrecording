@@ -49,6 +49,11 @@ WEBCAM_SIZE="medium"
 RESOLUTION=""
 FULLSCREEN="false"
 STOP_RECORDING="false"
+# The setup bar is the default way in. --no-setup drops straight to the legacy slurp
+# picker, which is what --fullscreen and scripted callers want.
+SETUP="true"
+SETUP_COUNTDOWN=""
+COUNTDOWN_SECONDS=0
 # True when a person asked for the stop, as opposed to the recorder ending some other
 # way. Only a deliberate stop opens the editor unprompted.
 STOPPED_DELIBERATELY="false"
@@ -84,6 +89,8 @@ for arg in "$@"; do
   --webcam-size=*) WEBCAM_SIZE="${arg#*=}" ;;
   --resolution=*) RESOLUTION="${arg#*=}" ;;
   --fullscreen) FULLSCREEN="true" ;;
+  --no-setup) SETUP="false" ;;
+  --countdown=*) SETUP_COUNTDOWN="${arg#*=}" ;;
   --stop-recording) STOP_RECORDING="true" ;;
   esac
 done
@@ -244,8 +251,46 @@ start_screenrecording() {
   trap 'cleanup_start; exit 130' INT TERM HUP
 
   local target
+  COUNTDOWN_SECONDS=0
   if [[ $FULLSCREEN == "true" ]]; then
     target="monitor:$(omarchy-hyprland-monitor-focused)"
+  elif [[ $SETUP == "true" ]] && command -v omarchy-capture-setup >/dev/null; then
+    # The setup bar is the default entry point: hotkey -> pick source, mic and camera ->
+    # Record -> the bar destroys itself -> capture runs with nothing on screen. It prints
+    # one line of JSON the MOMENT Record is pressed, specifically so gsr initialisation
+    # happens inside the countdown rather than after it -- capture start can take
+    # seconds, and making the user watch that after they already committed is the thing
+    # the countdown exists to hide.
+    local setup_json
+    setup_json=$(omarchy-capture-setup ${SETUP_COUNTDOWN:+--countdown "$SETUP_COUNTDOWN"}) || return 1
+    [[ -n $setup_json ]] || return 1
+
+    local setup_vars
+    setup_vars=$(studio_capture setup --json "$setup_json") || {
+      omarchy-notification-send -u critical -t 3000 "Screen recording error" "Could not read the setup selection"
+      return 1
+    }
+    eval "$setup_vars"
+    target="$TARGET"
+
+    # The bar owns these choices now, so they override whatever the flags said.
+    [[ $SETUP_MIC == "true" ]] && MICROPHONE_AUDIO="true" || MICROPHONE_AUDIO="false"
+    [[ $SETUP_DESKTOP_AUDIO == "true" ]] && DESKTOP_AUDIO="true" || DESKTOP_AUDIO="false"
+    if [[ $SETUP_CAMERA != "off" ]]; then
+      WEBCAM="true"
+      [[ -n $SETUP_CAMERA_DEVICE ]] && WEBCAM_DEVICE="$SETUP_CAMERA_DEVICE"
+    else
+      WEBCAM="false"
+    fi
+
+    # Everything before the countdown expires contains the setup surfaces, which the
+    # contract guarantees are destroyed by then. Those frames are recorded (we started
+    # early on purpose) and simply not kept: trim_head_frames is already handled as a
+    # leading cut by render.py, so events, layers and zoom all remap through the same
+    # CutMap and nothing has to know this was a countdown rather than an edit.
+    # Seconds, not frames: the real fps is not known until finalize probes the file,
+    # and multiplying by an assumed 60 here would silently mistrim every 30fps capture.
+    COUNTDOWN_SECONDS="$SETUP_COUNTDOWN_S"
   else
     target=$(select_capture_target) || return 1
   fi
@@ -396,7 +441,9 @@ stop_screenrecording() {
   if [[ -n $bundle && -d $bundle ]]; then
     local camera_args=()
     [[ -f $bundle/media/cam.mp4 ]] && camera_args=(--camera media/cam.mp4)
-    if ! studio_capture finalize --root "$bundle" "${camera_args[@]}" >>"$LOG_FILE" 2>&1; then
+    local trim_args=()
+    ((COUNTDOWN_SECONDS > 0)) && trim_args=(--trim-head-seconds "$COUNTDOWN_SECONDS")
+    if ! studio_capture finalize --root "$bundle" "${camera_args[@]}" "${trim_args[@]}" >>"$LOG_FILE" 2>&1; then
       omarchy-notification-send -u critical -t 5000 "Screen recording error" \
         "The media was saved but capture.json could not be completed: $bundle"
     fi

@@ -256,13 +256,55 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--burn-in", action="store_true")
     b.add_argument("--calibration-ms", type=float, default=0.0)
 
+    su = sub.add_parser("setup", help="parse the setup bar's JSON into shell assignments")
+    su.add_argument("--json", required=True)
+
     f = sub.add_parser("finalize", help="probe the media and complete capture.json")
     f.add_argument("--root", required=True)
     f.add_argument("--screen", default="media/screen.mp4")
     f.add_argument("--camera", default=None)
     f.add_argument("--camera-timestamps", default="media/cam.tsv")
+    f.add_argument(
+        "--trim-head-seconds",
+        type=float,
+        default=0.0,
+        help="drop this many seconds from the head (the setup countdown)",
+    )
 
     a = parser.parse_args(argv)
+
+    if a.cmd == "setup":
+        # One authoritative parse. The shell could pick these out with jq, but the target
+        # forms and their validation live in setup_sources, and a second implementation
+        # in bash is exactly how the two drift.
+        from .setup_sources import parse_target
+
+        cfg = json.loads(a.json)
+        target = str(cfg["target"])
+        parts = parse_target(target)  # validates; raises on a malformed form
+        if parts["kind"] == "camera":
+            # The recorder has no camera-only path -- that is a different pipeline with
+            # no screen stream at all. Fail loudly here rather than letting gsr be handed
+            # a target it will reject with something unreadable.
+            print(
+                "camera-only recording is not supported by this recorder yet",
+                file=sys.stderr,
+            )
+            return 2
+        emit = {
+            # Passed through verbatim: the recorder's own select_capture_target emits
+            # these same two forms, so the setup bar is a drop-in for it.
+            "TARGET": target,
+            "TARGET_KIND": parts["kind"],
+            "SETUP_MIC": "true" if cfg.get("mic") else "false",
+            "SETUP_DESKTOP_AUDIO": "true" if cfg.get("desktop_audio") else "false",
+            "SETUP_CAMERA": str(cfg.get("camera") or "off"),
+            "SETUP_CAMERA_DEVICE": str(cfg.get("camera_device") or ""),
+            "SETUP_COUNTDOWN_S": str(int(cfg.get("countdown") or 0)),
+        }
+        for k, v in emit.items():
+            print(f"{k}={shlex.quote(v)}")
+        return 0
 
     if a.cmd == "begin":
         logical = parse_geometry(a.logical)
@@ -297,6 +339,21 @@ def main(argv: list[str] | None = None) -> int:
         camera_timestamps=a.camera_timestamps,
     )
     s = bundle.capture.screen
+
+    # The countdown's frames are recorded on purpose -- capture starts the moment Record
+    # is pressed so gsr's startup hides inside the countdown -- and simply not kept.
+    # render.py already treats trim_head_frames as a leading cut, so events, layers and
+    # zoom all remap through the same CutMap and nothing downstream has to know these
+    # frames were a countdown rather than an edit. Converted here because this is the
+    # first point that knows the real frame rate; assuming 60 would mistrim every 30fps
+    # capture by half.
+    if a.trim_head_seconds > 0:
+        bundle.edit.trim_head_frames = round(
+            a.trim_head_seconds * s.fps_num / s.fps_den
+        )
+        bundle.save_edit()
+        print(f"TRIM_HEAD_FRAMES={bundle.edit.trim_head_frames}")
+
     print(f"SCREEN={s.width}x{s.height}@{s.fps_num}/{s.fps_den} anchor={s.anchor_us}")
     if bundle.capture.camera:
         c = bundle.capture.camera

@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Launch the recordings library (or, with --dropdown, the menubar dropdown panel):
+scan-and-serve first, window second.
+
+Same two environment details as bin/omarchy-studio, each of which cost a debugging
+session there:
+
+* /usr/bin/qml6 by absolute path. Plain `qml` on PATH is Qt 5.15 and fails with
+  "Did not load any objects, exiting" and nothing else -- no file, no line, no type.
+* QT_ASSUME_STDERR_HAS_CONSOLE=1, or Qt routes console.log into the journal and the
+  self-test lines this launcher watches for disappear.
+
+usage: omarchy-recordings [--dropdown] [--selftest MS]
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+from omarchy_studio import library  # noqa: E402
+
+QML6 = "/usr/bin/qml6"
+EDITOR = REPO / "editor"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="omarchy-recordings", description=__doc__)
+    ap.add_argument("--dropdown", action="store_true",
+                    help="open the menubar dropdown panel instead of the library window")
+    ap.add_argument("--selftest", type=int, default=0, metavar="MS",
+                    help="load the UI, print a summary after MS milliseconds, and exit")
+    ap.add_argument("--port", type=int, default=0)
+    a = ap.parse_args(argv)
+
+    if not Path(QML6).exists():
+        print(f"{QML6} is missing; install qt6-declarative", file=sys.stderr)
+        return 2
+
+    session = library.Session(REPO)
+    server = library.serve(session, a.port)
+
+    # The first scan probes every entry with ffprobe/ffmpeg; doing it before the window
+    # maps means the list appears populated instead of popping in row by row. Thumbnails
+    # are cached, so only the first launch after a new recording pays this.
+    session.library()
+
+    env = dict(os.environ)
+    env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
+    qml = EDITOR / "library" / ("MenuDropdown.qml" if a.dropdown else "Recordings.qml")
+    argvq = [
+        QML6, "-I", str(EDITOR), str(qml), "--",
+        "--port", str(server.server_port),
+        "--token", session.token,
+    ]
+    if a.selftest:
+        argvq += ["--selftest", str(a.selftest)]
+
+    proc = subprocess.Popen(argvq, env=env)
+    # The window asks the server to quit when it closes; watching for that as well means
+    # a crashed UI does not leave the server running.
+    watcher = threading.Thread(
+        target=lambda: (session.quit_requested.wait(), proc.poll() is None and proc.terminate()),
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        rc = proc.wait(timeout=(a.selftest / 1000.0 + 30) if a.selftest else None)
+    except subprocess.TimeoutExpired:
+        print("selftest: the window did not exit; killing it", file=sys.stderr)
+        proc.kill()
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        rc = proc.wait()
+    session.quit_requested.set()
+    server.shutdown()
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

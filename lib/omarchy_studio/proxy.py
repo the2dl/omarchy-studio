@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
+from .probe import frame_count
 from .project import Bundle, ProjectError
 
 # Measured: this is the setting that makes seeks land, so it is also the setting that
@@ -96,13 +99,23 @@ def is_stale(bundle: Bundle, stream: str = "screen") -> bool:
         return True
 
 
-def ensure_proxy(bundle: Bundle, stream: str = "screen") -> Path:
+def ensure_proxy(
+    bundle: Bundle,
+    stream: str = "screen",
+    progress: Callable[[float, str], None] | None = None,
+) -> Path:
     """Return a short-GOP preview proxy, generating it only if it is stale.
 
     Reuse is checked against a fingerprint of the source rather than a timestamp
     comparison: media/ is immutable, so a mismatch means this proxy belongs to a
     different recording or was made with different settings, and either way the answer
     is to regenerate.
+
+    `progress` is called with (fraction 0..1, message) as ffmpeg encodes. Without it the
+    editor opens on a recording it cannot yet scrub and can only show an indeterminate
+    bar -- which on a long capture is several minutes of a UI that looks stuck. The
+    fraction is frames encoded over `probe.frame_count`, not ffmpeg's own out_time,
+    because the frame count is what the timeline is already indexed by.
     """
     spec = _spec(bundle, stream)
     if not is_stale(bundle, stream):
@@ -125,16 +138,67 @@ def ensure_proxy(bundle: Bundle, stream: str = "screen") -> Path:
         "-c:a", "copy",
         str(tmp),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
+    if progress is None:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        rc, err = r.returncode, r.stderr
+    else:
+        rc, err = _encode_with_progress(cmd, spec, progress)
+    if rc != 0:
         tmp.unlink(missing_ok=True)
-        raise ProxyError(f"proxy generation failed:\n{r.stderr.strip()[-2000:]}")
+        raise ProxyError(f"proxy generation failed:\n{err.strip()[-2000:]}")
 
     # Replace only once ffmpeg has succeeded: a half-written proxy that looks complete
     # would be reused, and the editor would preview a truncated recording.
     tmp.replace(spec.dest)
     spec.stamp.write_text(json.dumps(_fingerprint(spec), indent=2) + "\n")
     return spec.dest
+
+
+def _encode_with_progress(
+    cmd: list[str], spec: ProxySpec, progress: Callable[[float, str], None]
+) -> tuple[int, str]:
+    """Run the encode, reporting frames done over the source's total.
+
+    `-progress pipe:1` emits key=value blocks on stdout; `frame=` is the one that maps
+    onto the timeline. stderr is drained on a thread rather than left to fill: ffmpeg
+    blocks when a pipe buffer fills, and an encode that stalls at 60% with no error is
+    far harder to diagnose than one that fails outright.
+    """
+    try:
+        total = float(frame_count(spec.source))
+    except Exception:
+        total = 0.0
+
+    proc = subprocess.Popen(
+        [*cmd[:1], "-progress", "pipe:1", "-nostats", *cmd[1:]],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    err_chunks: list[str] = []
+    drain = threading.Thread(
+        target=lambda: err_chunks.append(proc.stderr.read() or ""), daemon=True
+    )
+    drain.start()
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        key, _, value = line.strip().partition("=")
+        if key != "frame" or not total:
+            continue
+        try:
+            done = int(value)
+        except ValueError:
+            continue
+        # Clamped: ffmpeg can report one more frame than the probe counted on a stream
+        # whose last packet carries no picture, and a bar that reaches 101% reads as a bug.
+        progress(min(done / total, 1.0), f"{done}/{int(total)} frames")
+
+    rc = proc.wait()
+    drain.join(timeout=2)
+    if rc == 0:
+        progress(1.0, "done")
+    return rc, "".join(err_chunks)
 
 
 def clear(bundle: Bundle) -> None:

@@ -7,8 +7,8 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
-import QtQuick.Dialogs
 import "controls" as C
+import "shell" as S
 
 ApplicationWindow {
     id: app
@@ -20,6 +20,15 @@ ApplicationWindow {
     title: "Omarchy Studio — " + (Bridge.state.name || Bridge.bundle)
 
     readonly property var st: Bridge.state
+
+    // 1f is a pane, not a modal (spec §4): while open it replaces the inspector's
+    // content in the same 268px column, so a render can keep going beside live work.
+    property bool exportOpen: false
+
+    // 2e: the proxy build. The timeline (another agent's file) binds the same
+    // Bridge.proxyStatus singleton -- .state === "building" and .progress (0..1) -- to
+    // fill its thumbnail cells left to right; nothing here needs to be passed down.
+    readonly property bool proxyBuilding: Bridge.proxyStatus.state === "building"
 
     // m:ss from source frames -- whole seconds; the frame-exact counter lives in the
     // timeline transport where scrubbing needs it.
@@ -74,6 +83,14 @@ ApplicationWindow {
             }
             Item { Layout.fillWidth: true }
 
+            // Once a render starts the pane can be dismissed; progress collapses into
+            // this chip (spec §4, drawn in mock 2a). Clicking it reopens the pane.
+            S.RenderChip {
+                visible: Bridge.exportStatus.state === "running" && !app.exportOpen
+                progress: Bridge.exportStatus.progress || 0
+                onClicked: app.exportOpen = true
+            }
+
             // Unsaved state: an accent dot, nothing shouting. The Save button next to
             // it is the verb.
             Rectangle {
@@ -90,14 +107,33 @@ ApplicationWindow {
                 onClicked: resetDialog.open()
             }
             Rectangle { width: 1; height: 16; color: Theme.hairline }
-            C.PrimaryButton {
-                text: Bridge.exportStatus.state === "running" ? "Cancel" : "Export"
-                onClicked: {
-                    if (Bridge.exportStatus.state === "running")
-                        Bridge.cancelExport()
-                    else
-                        exportDialog.open()
+
+            // While the proxy builds, Export demotes to text-6 with no fill (spec §2e:
+            // the shell is real, only playback is not -- nothing on this bar should
+            // outshine the build). It still opens the pane: the render reads the
+            // master, so exporting during the build is legal, just not invited.
+            Item {
+                visible: app.proxyBuilding
+                width: dimExport.implicitWidth + 20
+                height: 28
+                Text {
+                    id: dimExport
+                    anchors.centerIn: parent
+                    text: "Export"
+                    color: Theme.text6
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsRow
                 }
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: app.exportOpen = !app.exportOpen
+                }
+            }
+            C.PrimaryButton {
+                visible: !app.proxyBuilding
+                text: "Export"
+                onClicked: app.exportOpen = !app.exportOpen
             }
         }
     }
@@ -152,75 +188,53 @@ ApplicationWindow {
                     height: parent.height
                 }
 
-                // The proxy is generated before anything is playable; showing the
-                // progress here is the difference between "starting" and "hung".
-                Rectangle {
+                // 2e -- the proxy build. Not a scrim: the shell is real and the canvas
+                // stays what it is (Preview draws the first frame at 35% behind this);
+                // the overlay adds only the 320px progress block from the mock.
+                S.ProxyBuildOverlay {
                     x: 0
                     y: 0
                     width: parent.width
                     height: parent.height
-                    visible: Bridge.proxyStatus.state === "building"
-                             || Bridge.proxyStatus.state === "error"
-                    color: Qt.rgba(0, 0, 0, 0.72)
-
-                    ColumnLayout {
-                        x: (parent.width - width) / 2
-                        y: (parent.height - height) / 2
-                        width: Math.min(460, parent.width - 80)
-                        spacing: 10
-
-                        Text {
-                            text: Bridge.proxyStatus.state === "error"
-                                  ? "Preview proxy failed"
-                                  : "Building the preview proxy"
-                            color: Theme.text
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fsTitle
-                            Layout.alignment: Qt.AlignHCenter
-                        }
-                        Text {
-                            text: Bridge.proxyStatus.message
-                                  || "The editor never plays the 5K master: seeking it took 517-651ms "
-                                   + "and half the seeks delivered no frame at all."
-                            color: Theme.text4
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fsRow
-                            wrapMode: Text.WordWrap
-                            Layout.fillWidth: true
-                            horizontalAlignment: Text.AlignHCenter
-                        }
-                        Item {
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 3
-                            visible: Bridge.proxyStatus.state === "building"
-                            Rectangle {
-                                width: parent.width; height: 3; radius: 1
-                                color: Theme.track
-                            }
-                            Rectangle {
-                                width: parent.width * (Bridge.proxyStatus.progress || 0)
-                                height: 3; radius: 1
-                                color: Theme.accent
-                            }
-                        }
-                    }
                 }
             }
 
-            SettingsPanel {
-                id: settings
-                // 268px in the editor (spec §1d region 4); the 320px width is for the
-                // standalone panels.
-                Layout.preferredWidth: Theme.inspectorWidth
+            // The inspector slot: one 268px column (spec §1d region 4) whose content
+            // swaps between the contextual inspector and the export pane (spec §4:
+            // "1f's card becomes the right inspector's content in the same column").
+            // A plain Item rather than Layout props on SettingsPanel itself so the
+            // swap never rebuilds the panel and its scroll position survives.
+            Item {
+                id: inspectorSlot
                 // Capped as well as preferred: without a maximum, one over-wide control
                 // inside pushes the panel past the window edge and clips itself.
+                Layout.preferredWidth: Theme.inspectorWidth
                 Layout.maximumWidth: Theme.inspectorWidth
                 Layout.fillHeight: true
-                selectedId: preview.selectedId
-                preview: preview
-                onSelectLayer: function (id) {
-                    preview.selectedId = id
-                    preview.webcamSelected = false
+
+                SettingsPanel {
+                    id: settings
+                    // 268px in the editor; the 320px width is for standalone panels.
+                    x: 0
+                    y: 0
+                    width: parent.width
+                    height: parent.height
+                    visible: !app.exportOpen
+                    selectedId: preview.selectedId
+                    preview: preview
+                    onSelectLayer: function (id) {
+                        preview.selectedId = id
+                        preview.webcamSelected = false
+                    }
+                }
+
+                S.ExportPane {
+                    x: 0
+                    y: 0
+                    width: parent.width
+                    height: parent.height
+                    visible: app.exportOpen
+                    onClosed: app.exportOpen = false
                 }
             }
         }
@@ -236,9 +250,12 @@ ApplicationWindow {
     // Status strip: only exists while there is something to say (spec has no footer).
     // Errors and export progress surface here; the rest of the time the tray sits on
     // the window edge as in the mock.
+    // Live render progress moved to the export pane and the top-bar chip (spec §4),
+    // so the strip no longer duplicates it; it keeps errors and the completion line,
+    // which need to surface even with the pane dismissed.
     footer: Rectangle {
-        visible: Bridge.lastError !== "" || Bridge.exportStatus.state === "running"
-                 || Bridge.exportStatus.state === "done"
+        visible: Bridge.lastError !== "" || Bridge.exportStatus.state === "done"
+                 || Bridge.exportStatus.state === "error"
         height: visible ? 26 : 0
         color: Theme.bgDeep
 
@@ -260,28 +277,6 @@ ApplicationWindow {
                 elide: Text.ElideMiddle
                 Layout.fillWidth: true
             }
-            // 3px track, accent fill -- the slider anatomy without the thumb.
-            Item {
-                visible: Bridge.exportStatus.state === "running"
-                Layout.preferredWidth: 240
-                Layout.preferredHeight: 3
-                Rectangle {
-                    width: parent.width; height: 3; radius: 1
-                    color: Theme.track
-                }
-                Rectangle {
-                    width: parent.width * (Bridge.exportStatus.progress || 0)
-                    height: 3; radius: 1
-                    color: Theme.accent
-                }
-            }
-            Text {
-                visible: Bridge.exportStatus.state === "running"
-                text: Math.round((Bridge.exportStatus.progress || 0) * 100) + "%"
-                color: Theme.accent
-                font.family: Theme.fontFamily
-                font.pixelSize: Theme.fsCaption
-            }
             Text {
                 visible: Bridge.exportStatus.state === "done"
                 text: "export complete"
@@ -290,15 +285,6 @@ ApplicationWindow {
                 font.pixelSize: Theme.fsCaption
             }
         }
-    }
-
-    FileDialog {
-        id: exportDialog
-        title: "Export to"
-        fileMode: FileDialog.SaveFile
-        nameFilters: ["MP4 video (*.mp4)"]
-        currentFolder: "file://" + (Bridge.bundle || "")
-        onAccepted: Bridge.startExport(decodeURIComponent(selectedFile.toString().replace("file://", "")))
     }
 
     Dialog {

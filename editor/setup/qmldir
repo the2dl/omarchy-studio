@@ -1,0 +1,5 @@
+# A directory qmldir, like editor/'s and controls/'s -- no `module` line, or the
+# implicit same-directory import stops resolving and every type fails to load with
+# no symptom but a window that never appears.
+MonitorOverlay 1.0 MonitorOverlay.qml
+MicMeter 1.0 MicMeter.qml

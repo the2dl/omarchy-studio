@@ -1,0 +1,11 @@
+# A DIRECTORY qmldir, like editor/'s -- no `module` line, or the implicit
+# same-directory import stops resolving and every type here fails to load silently.
+ValueField 1.0 ValueField.qml
+ModelSlider 1.0 ModelSlider.qml
+TimingSection 1.0 TimingSection.qml
+PlacementGrid 1.0 PlacementGrid.qml
+PresetChips 1.0 PresetChips.qml
+ImageInspector 1.0 ImageInspector.qml
+TextInspector 1.0 TextInspector.qml
+RedactInspector 1.0 RedactInspector.qml
+ShapeInspector 1.0 ShapeInspector.qml

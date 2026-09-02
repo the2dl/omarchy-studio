@@ -35,6 +35,17 @@ Item {
     readonly property var cameraMedia: st.media ? st.media.camera : null
     readonly property bool hasScreen: screenMedia !== null && screenMedia !== undefined && screenMedia.ready === true
     readonly property bool hasCamera: cameraMedia !== null && cameraMedia !== undefined && cameraMedia.ready === true
+
+    // 2e -- while the proxy builds, the canvas shows the recording's FIRST FRAME at
+    // 35% opacity behind the progress block (spec §2e). There is no still in the
+    // bundle, so the frame comes from the master -- the one bounded use the master
+    // gets: primed once, paused, never seeked. The master's pathology is seeking
+    // (517-651ms with half the seeks delivering nothing); decoding frame 0 forward is
+    // the case that works, and the player unloads the moment the proxy is ready.
+    readonly property bool proxyPending: !hasScreen
+        && (Bridge.proxyStatus.state === "building" || Bridge.proxyStatus.state === "error")
+    readonly property string masterUrl:
+        screenMedia && screenMedia.master ? "file://" + screenMedia.master : ""
     readonly property real cameraOffsetMs: st.media ? st.media.camera_offset_ms : 0
 
     property string tool: "select"
@@ -254,6 +265,20 @@ Item {
         layer.effect: MultiEffect {
             maskEnabled: true
             maskSource: viewportMask
+        }
+
+        // The 2e first frame, under the stage so real content always wins. Sized to
+        // the viewport, not the stage: nothing here is transformed, so no zoom or
+        // placement maths applies -- it is a still, not a preview.
+        VideoOutput {
+            id: firstFrameOut
+            x: 0
+            y: 0
+            width: viewport.width
+            height: viewport.height
+            visible: root.proxyPending
+            opacity: 0.35            // spec §2e, verbatim
+            fillMode: VideoOutput.Stretch
         }
 
         Item {
@@ -609,6 +634,31 @@ Item {
         videoOutput: webcam.videoOutput
     }
 
+    // Delivers frame 0 of the master for the 2e backdrop. Primed the same way as
+    // screenPlayer (a paused player that never played shows nothing), then left
+    // paused; no audioOutput, so it can never be heard, and no seek ever happens.
+    MediaPlayer {
+        id: firstFramePlayer
+        source: root.proxyPending ? root.masterUrl : ""
+        videoOutput: firstFrameOut
+        property bool primed: false
+        onSourceChanged: primed = false
+        onMediaStatusChanged: {
+            if (!primed && (mediaStatus === MediaPlayer.LoadedMedia
+                            || mediaStatus === MediaPlayer.BufferedMedia)) {
+                primed = true
+                play()
+                firstFrameTimer.restart()
+            }
+        }
+    }
+    Timer {
+        id: firstFrameTimer
+        interval: 120
+        repeat: false
+        onTriggered: firstFramePlayer.pause()
+    }
+
     Timer {
         id: primeTimer
         interval: 120
@@ -639,9 +689,9 @@ Item {
     Text {
         x: viewport.x + (viewport.width - width) / 2
         y: viewport.y + (viewport.height - height) / 2
-        text: root.hasScreen ? "" : (Bridge.proxyStatus.state === "building"
-                                     ? "building preview proxy…"
-                                     : "no preview media")
+        // The build itself is narrated by the 2e overlay (main.qml); this only covers
+        // the state where there is nothing to play and nothing being built either.
+        text: root.hasScreen || root.proxyPending ? "" : "no preview media"
         color: Theme.text5
         font.family: Theme.fontFamily
         font.pixelSize: Theme.fsRow

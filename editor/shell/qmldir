@@ -1,0 +1,6 @@
+# A directory qmldir, like editor/'s and controls/' -- NO `module` line, or the
+# implicit same-directory import stops resolving and every type fails to load with a
+# window that never appears.
+ProxyBuildOverlay 1.0 ProxyBuildOverlay.qml
+ExportPane 1.0 ExportPane.qml
+RenderChip 1.0 RenderChip.qml

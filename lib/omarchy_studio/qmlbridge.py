@@ -677,6 +677,7 @@ class ProxyBuilder:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._procs: list[subprocess.Popen] = []
+        self._cancelled = False
         self.on_change: Callable[[dict], None] | None = None
 
     def _set(self, **kw: Any) -> None:
@@ -691,9 +692,13 @@ class ProxyBuilder:
         self._thread.start()
 
     def stop(self) -> None:
+        self._cancelled = True
         for p in self._procs:
             if p.poll() is None:
                 p.terminate()
+        # Without this the UI keeps showing "building" against a build that has stopped,
+        # which is worse than no progress at all: it is progress that is lying.
+        self._set(state="cancelled", message="proxy build cancelled")
 
     def _jobs(self) -> list[str]:
         out = []
@@ -1040,6 +1045,14 @@ class _Handler(BaseHTTPRequestHandler):
             if r == "/export/cancel":
                 self.session.exporter.cancel()
                 return self._send(self.session.exporter.snapshot())
+            if r == "/proxy/cancel":
+                # Cancelling leaves the recording perfectly usable -- the master is
+                # untouched and is what exports; only scrubbing is unavailable until a
+                # proxy exists. ensure_proxy writes through a .part file and replaces
+                # only on success, so a terminated encode leaves nothing half-written
+                # for the next open to mistake for a finished proxy.
+                self.session.proxy.stop()
+                return self._send(dict(self.session.proxy.status))
             if r == "/quit":
                 self.session.quit_requested.set()
                 return self._send({"ok": True})

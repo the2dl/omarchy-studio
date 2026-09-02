@@ -1,0 +1,499 @@
+"""Layer -> filtergraph fragment.
+
+ONE PRIMITIVE. Every non-redact layer becomes an RGBA tile of the layer's size, an
+alpha ramp, then an `overlay` at the layer's position gated on the frame index. image,
+text, shape and webcam differ only in how the tile is produced. That is what keeps the
+QML preview and the ffmpeg export in agreement: in QML the same layer is an Item with
+explicit x/y/width/height, an opacity ramp and a visible gate, and the two composites
+measured geometrically identical to within 2 px at 1920x1080.
+
+`blur` and `pixelate` are the one exception -- they read the pixels beneath them, so
+they compile to split -> crop -> gblur/pixelize -> overlay-back.
+
+Things this module deliberately does not do:
+
+* It never computes a placement. Every number comes from `geometry.Placement.resolve`
+  and every blur sigma from `geometry.ffmpeg_blur`; a second implementation of the same
+  maths drifts, and the drift is invisible until someone diffs rendered frames.
+* It never cuts anything. Cuts are applied FIRST, upstream, by `cuts.cut_chain` (2.20 s
+  versus 2.83 s on the same project), so the labels reaching this module are already on
+  the output timeline and layer gates are `CutMap.remap`ped to match.
+* It never resamples the camera. `trim` cuts on frame indices, so a camera stream has to
+  be put on the project frame grid (`timebase_chain`) BEFORE it is cut, not after.
+
+Cost, measured: ~0.7-1.0 ms per layer per 1080p frame, linear in the number of layers
+EVER ADDED. `enable` saves nothing -- a layer visible 1 s out of 20 costs the same as
+one visible throughout (2.75 s vs 2.70 s at n=5, 18.30 s vs 17.49 s at n=40) -- so the
+only mitigation for a heavy project is baking co-temporal static layers into a cached
+plate, which is the caller's decision, not this module's.
+
+What this module can do about it, and does: a tile with no fade is generated as a
+SINGLE frame and held by overlay's eof_action=repeat. Measured at 1080p with 40 shape
+layers over 60 frames -- 0.129 s against 1.294 s for full-length tile sources, with
+bit-identical output.
+"""
+
+from __future__ import annotations
+
+import re
+import warnings
+from dataclasses import dataclass, field
+
+from .exprs import escape_drawtext, fade_filters, frame_gate
+from .geometry import Canvas, Rect, ffmpeg_blur
+from .project import Layer, WebcamSettings
+from .timebase import CutMap, FrameRange, Timebase
+
+# One font file, named identically here and in QML. Resolving a family name through
+# fontconfig gives libavfilter and Qt different faces, and the metrics diverge long
+# before anybody notices the glyphs did.
+DEFAULT_FONTFILE = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"
+
+_OVERLAY_TYPES = frozenset({"image", "text", "shape", "webcam"})
+_REDACT_TYPES = frozenset({"blur", "pixelate"})
+# `zoom` is a crop on the base video, not an overlay; the zoom compiler owns it and
+# silently skipping it here keeps a normal project from emitting a warning per zoom.
+_NOT_AN_OVERLAY = frozenset({"zoom"})
+# Deferred from v1: the arrow head geometry diverged 93% between drawtext-era masks and
+# the QML preview, and no calibration was found.
+_DEFERRED_TYPES = frozenset({"arrow"})
+
+
+class LayerError(ValueError):
+    pass
+
+
+class UnsupportedLayer(UserWarning):
+    """A layer was skipped. Forward compatibility is a stated property of the format:
+    a project written by a newer build must degrade to 'some overlays missing'."""
+
+
+class InputRegistry:
+    """Allocates ffmpeg input indices and resolves named source streams.
+
+    Two kinds of entry, because layers need both:
+
+    * inputs the graph opens (`add`) -- an image asset gets a real `-i`;
+    * labels the caller has already produced (`bind`) -- the camera reaches a webcam
+      layer as an in-graph label, because it must be resampled and cut before use.
+    """
+
+    def __init__(self) -> None:
+        self._args: list[list[str]] = []
+        self._labels: dict[str, str] = {}
+
+    def add(self, args: list[str], key: str | None = None) -> int:
+        """Register an ffmpeg input argument group; returns its input index."""
+        idx = len(self._args)
+        self._args.append(list(args))
+        if key is not None:
+            self._labels[key] = f"[{idx}:v]"
+        return idx
+
+    def bind(self, key: str, label: str) -> None:
+        """Point a named source at an existing stream label, e.g. the cut camera."""
+        self._labels[key] = label
+
+    def has(self, key: str) -> bool:
+        return key in self._labels
+
+    def label(self, key: str) -> str:
+        if key not in self._labels:
+            raise LayerError(f"no source registered under {key!r}")
+        return self._labels[key]
+
+    @property
+    def inputs(self) -> list[list[str]]:
+        return self._args
+
+    def argv(self) -> list[str]:
+        """The flattened `-i ...` arguments, in index order. This is the authoritative
+        list -- `LayerFragment.extra_inputs` is a view of the groups one layer added."""
+        return [a for group in self._args for a in group]
+
+
+@dataclass
+class LayerFragment:
+    """One layer's contribution to the graph.
+
+    `filter_chain` is ';'-joined and has no trailing separator, so fragments join with
+    ';'. `label_out` is what the next layer takes as its `label_in`.
+    """
+
+    filter_chain: str
+    label_in: str
+    label_out: str
+    extra_inputs: list[list[str]] = field(default_factory=list)
+
+
+def timebase_chain(label_in: str, tb: Timebase, label_out: str) -> str:
+    """Put a source on the project frame grid. Must run BEFORE the cut.
+
+    `trim` counts frames on its input's own grid, so cutting a 30 fps camera against
+    frame indices computed for a 60 fps screen removes the wrong material. Resampling
+    first makes the two grids the same object.
+    """
+    return f"{label_in}fps={tb.fps_num}/{tb.fps_den},setsar=1{label_out}"
+
+
+def webcam_layer(settings: WebcamSettings, t: FrameRange | None = None, z: int = 100) -> Layer:
+    """Adapt `Edit.webcam` into the Layer the one primitive understands.
+
+    The webcam is a layer like any other -- it is stored as settings only because the
+    editor gives it a dedicated panel.
+    """
+    return Layer(
+        id="webcam",
+        type="webcam",
+        t=t,
+        x=settings.x,
+        y=settings.y,
+        w=settings.w,
+        h=settings.h,
+        z=z,
+        props={
+            "shape": settings.shape,
+            "corner_radius": settings.corner_radius,
+            "mirror": settings.mirror,
+        },
+    )
+
+
+def compile_layer(
+    layer: Layer,
+    canvas: Canvas,
+    cutmap: CutMap,
+    tb: Timebase,
+    inputs: InputRegistry,
+    *,
+    label_in: str | None = None,
+) -> LayerFragment | None:
+    """Compile one layer into a filtergraph fragment.
+
+    Returns None when the layer contributes nothing -- disabled, an unknown or deferred
+    type, or a time range that a cut removed entirely. The caller then carries its
+    current label forward unchanged.
+
+    `label_in` defaults to a label derived from the layer id; pass the current head of
+    the video chain instead, which is what the assembler does.
+    """
+    name = _safe_name(layer.id)
+    lin = label_in if label_in is not None else f"[{name}_in]"
+
+    if not layer.enabled:
+        return None
+    if layer.type in _NOT_AN_OVERLAY:
+        return None
+    if layer.type in _DEFERRED_TYPES:
+        warnings.warn(
+            f"layer {layer.id!r}: {layer.type!r} is deferred from v1 and was skipped",
+            UnsupportedLayer,
+            stacklevel=2,
+        )
+        return None
+    if layer.type not in _OVERLAY_TYPES and layer.type not in _REDACT_TYPES:
+        warnings.warn(
+            f"layer {layer.id!r}: unknown type {layer.type!r} was skipped",
+            UnsupportedLayer,
+            stacklevel=2,
+        )
+        return None
+
+    span = layer.t if layer.t is not None else FrameRange(0, cutmap.total_frames)
+    ranges = cutmap.remap(span)
+    if not ranges:
+        return None  # the whole layer sits inside a cut
+    gate = frame_gate(ranges)
+    # The ramp runs over the layer's OUTPUT extent; remap already merged the pieces.
+    ramp_span = FrameRange(ranges[0].start, ranges[-1].end)
+
+    if layer.type in _REDACT_TYPES:
+        return _compile_redaction(layer, name, canvas, gate, lin)
+    return _compile_overlay(layer, name, canvas, cutmap, tb, inputs, gate, ramp_span, lin)
+
+
+# -- the one primitive -------------------------------------------------------
+
+
+def _compile_overlay(
+    layer: Layer,
+    name: str,
+    canvas: Canvas,
+    cutmap: CutMap,
+    tb: Timebase,
+    inputs: InputRegistry,
+    gate: str,
+    ramp_span: FrameRange,
+    lin: str,
+) -> LayerFragment | None:
+    # No clamping: an overlay may legitimately hang off the canvas edge, and `overlay`
+    # accepts negative coordinates. (Redactions ARE clamped -- `crop` cannot.)
+    rect = layer.placement.resolve(canvas).to_even()
+    if rect.w < 2 or rect.h < 2:
+        warnings.warn(
+            f"layer {layer.id!r}: degenerate size {rect.w}x{rect.h} after even-snapping",
+            UnsupportedLayer,
+            stacklevel=3,
+        )
+        return None
+
+    # A tile that never changes is generated ONCE and held by overlay's
+    # eof_action=repeat. Measured at 1080p with 40 shape layers over 60 frames: 0.129 s
+    # against 1.294 s for full-length tile sources, bit-identical output. Only a fade
+    # forces real frames, because `fade` counts them.
+    ramp = fade_filters(ramp_span, layer.fade_frames)
+
+    before = len(inputs.inputs)
+    if layer.type == "image":
+        chains, tile = _tile_image(layer, name, rect, cutmap, tb, inputs, not ramp)
+    elif layer.type == "text":
+        chains, tile = _tile_text(layer, name, rect, cutmap, tb, not ramp)
+    elif layer.type == "shape":
+        chains, tile = _tile_shape(layer, name, rect, cutmap, tb, not ramp)
+    else:
+        chains, tile = _tile_webcam(layer, name, rect, inputs)
+    extra_inputs = inputs.inputs[before:]
+
+    tail = ",".join(b for b in (ramp, _opacity(layer)) if b)
+    if tail:
+        chains.append(f"{tile}{tail}[{name}_f]")
+        tile = f"[{name}_f]"
+
+    out = f"[{name}_o]"
+    # eof_action=repeat + shortest=0 because the streams end at different instants:
+    # a 227 ms tail difference was measured against a 179 ms start offset, purely from
+    # camera frame granularity. The base must define the length, never the tile.
+    chains.append(
+        f"{lin}{tile}overlay=x={int(rect.x)}:y={int(rect.y)}:enable='{gate}'"
+        f":eof_action=repeat:shortest=0:format=auto{out}"
+    )
+    return LayerFragment(";".join(chains), lin, out, extra_inputs)
+
+
+def _opacity(layer: Layer) -> str:
+    if not 0.0 <= layer.opacity <= 1.0:
+        raise LayerError(f"layer {layer.id!r} opacity {layer.opacity} outside 0..1")
+    if layer.opacity >= 1.0:
+        return ""
+    return f"colorchannelmixer=aa={layer.opacity:.6f}"
+
+
+# -- tile producers ----------------------------------------------------------
+
+
+def _tile_image(
+    layer: Layer,
+    name: str,
+    rect: Rect,
+    cutmap: CutMap,
+    tb: Timebase,
+    inputs: InputRegistry,
+    static: bool,
+) -> tuple[list[str], str]:
+    path = layer.props.get("path") or layer.props.get("asset")
+    if not path:
+        raise LayerError(f"image layer {layer.id!r} has no props['path']")
+    args = ["-i", str(path)] if static else [
+        "-loop", "1",
+        "-framerate", f"{tb.fps_num}/{tb.fps_den}",
+        "-t", f"{_output_seconds(cutmap, tb):.6f}",
+        "-i", str(path),
+    ]
+    idx = inputs.add(args)
+    w, h = int(rect.w), int(rect.h)
+    if layer.props.get("fit") == "contain":
+        scale = (
+            f"scale={w}:{h}:flags=bicubic:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0.0"
+        )
+    else:
+        scale = f"scale={w}:{h}:flags=bicubic"
+    return ([f"[{idx}:v]format=rgba,{scale},setsar=1[{name}_s]"], f"[{name}_s]")
+
+
+def _tile_text(
+    layer: Layer, name: str, rect: Rect, cutmap: CutMap, tb: Timebase, static: bool
+) -> tuple[list[str], str]:
+    text = layer.props.get("text", "")
+    w, h = int(rect.w), int(rect.h)
+    font_px = int(layer.props.get("font_px") or max(8, round(h * 0.6)))
+    color = _hexcol(layer.props.get("color", "white"))
+    fontfile = layer.props.get("fontfile", DEFAULT_FONTFILE)
+    box_rgb, box_alpha = _split_color(layer.props.get("box_color", "black@0.0"))
+    radius = _radius_px(layer.props.get("radius", 0.0), rect)
+
+    chains: list[str] = []
+    src = f"[{name}_r]"
+    if box_alpha <= 0.0:
+        chains.append(_color_source("black@0.0", w, h, cutmap, tb, src, static))
+    else:
+        chains.append(_color_source(box_rgb, w, h, cutmap, tb, src, static))
+        # alphamerge REPLACES the alpha plane, so a translucent box colour would come
+        # out fully opaque. Fold the box alpha into the mask instead, and draw the text
+        # AFTER the merge so the glyphs stay at alpha 1 -- which is what the QML sibling
+        # Text item does, and the mismatch was found by the preview cross-check.
+        chains.append(
+            f"color=c=black:s={w}x{h}:r=1:d=1,format=gray,"
+            f"geq=lum='({_rounded_rect_mask(w, h, radius)})*{box_alpha:.6f}'[{name}_m]"
+        )
+        chains.append(f"{src}[{name}_m]alphamerge=repeatlast=1:shortest=0[{name}_b]")
+        src = f"[{name}_b]"
+
+    # Tile-relative centring. The tile's origin IS the placement rect's origin, so
+    # (w-text_w)/2 is algebraically the same point as geometry.text_placement's
+    # canvas-absolute cx-text_w/2 -- and centre-anchoring is what measured 0.0 px
+    # against the preview, where left-anchoring drifted ~7% of the string width.
+    chains.append(
+        f"{src}drawtext=fontfile={fontfile}:text='{escape_drawtext(text)}'"
+        f":fontsize={font_px}:fontcolor={color}"
+        f":x=(w-text_w)/2:y=(h-text_h)/2[{name}_s]"
+    )
+    return chains, f"[{name}_s]"
+
+
+def _tile_shape(
+    layer: Layer, name: str, rect: Rect, cutmap: CutMap, tb: Timebase, static: bool
+) -> tuple[list[str], str]:
+    w, h = int(rect.w), int(rect.h)
+    rgb, alpha = _split_color(layer.props.get("color", "#ff3b30"))
+    radius = _radius_px(layer.props.get("radius", 0.0), rect)
+    chains = [_color_source(rgb, w, h, cutmap, tb, f"[{name}_r]", static)]
+    if radius <= 0 and alpha >= 1.0:
+        return chains, f"[{name}_r]"
+    chains.append(
+        f"color=c=black:s={w}x{h}:r=1:d=1,format=gray,"
+        f"geq=lum='({_rounded_rect_mask(w, h, radius)})*{alpha:.6f}'[{name}_m]"
+    )
+    chains.append(f"[{name}_r][{name}_m]alphamerge=repeatlast=1:shortest=0[{name}_s]")
+    return chains, f"[{name}_s]"
+
+
+def _tile_webcam(
+    layer: Layer, name: str, rect: Rect, inputs: InputRegistry
+) -> tuple[list[str], str]:
+    cam = inputs.label("camera")
+    w, h = int(rect.w), int(rect.h)
+    shape = layer.props.get("shape", "circle")
+    # A square centre crop expressed in `crop`'s own expressions, so the compiler stays
+    # pure -- probing the camera file here would make every layer test need media.
+    # `shape=rect` skips it and stretches the native frame into the box instead.
+    side = "min(iw,ih)"
+    pre = (
+        f"crop=w='{side}':h='{side}':x='(iw-{side})/2':y='(ih-{side})/2',"
+        if shape in ("circle", "rounded")
+        else ""
+    )
+    mirror = "hflip," if layer.props.get("mirror", True) else ""
+    chains = [
+        f"{cam}{pre}{mirror}scale={w}:{h}:flags=bicubic,setsar=1,format=rgba[{name}_c]"
+    ]
+    if shape == "rect":
+        return chains, f"[{name}_c]"
+    radius = _radius_px(layer.props.get("corner_radius", 0.12), rect)
+    mask = _circle_mask(w, h) if shape == "circle" else _rounded_rect_mask(w, h, radius)
+    chains.append(
+        f"color=c=black:s={w}x{h}:r=1:d=1,format=gray,geq=lum='{mask}'[{name}_m]"
+    )
+    chains.append(f"[{name}_c][{name}_m]alphamerge=repeatlast=1:shortest=0[{name}_s]")
+    return chains, f"[{name}_s]"
+
+
+# -- redaction ---------------------------------------------------------------
+
+
+def _compile_redaction(
+    layer: Layer, name: str, canvas: Canvas, gate: str, lin: str
+) -> LayerFragment | None:
+    # Clamped, unlike an overlay: `crop` outside the frame is a hard error.
+    rect = layer.placement.resolve(canvas).clamped_to(canvas).to_even()
+    if rect.w < 2 or rect.h < 2:
+        warnings.warn(
+            f"layer {layer.id!r}: degenerate redaction {rect.w}x{rect.h}",
+            UnsupportedLayer,
+            stacklevel=3,
+        )
+        return None
+
+    if layer.type == "blur":
+        # gblur, not boxblur: the same Gaussian kernel family as Qt's MultiEffect, so
+        # preview and export track each other as strength varies.
+        op = ffmpeg_blur(float(layer.props.get("strength", 0.6)))
+    else:
+        block = max(2, int(layer.props.get("block", 24)))
+        op = f"pixelize=w={block}:h={block}"
+
+    # No fade and no opacity on a redaction, deliberately: a partially transparent
+    # blur box leaks the pixels it exists to hide.
+    x, y = int(rect.x), int(rect.y)
+    chains = [
+        f"{lin}split=2[{name}_a][{name}_b]",
+        f"[{name}_a]crop=w={int(rect.w)}:h={int(rect.h)}:x={x}:y={y},{op},"
+        f"format=rgba[{name}_t]",
+        f"[{name}_b][{name}_t]overlay=x={x}:y={y}:enable='{gate}'"
+        f":eof_action=repeat:shortest=0:format=auto[{name}_o]",
+    ]
+    return LayerFragment(";".join(chains), lin, f"[{name}_o]", [])
+
+
+# -- small helpers -----------------------------------------------------------
+
+
+def _safe_name(layer_id: str) -> str:
+    s = re.sub(r"[^0-9A-Za-z_]", "_", str(layer_id))
+    if not s or s[0].isdigit():
+        s = "L" + s
+    return s
+
+
+def _output_seconds(cutmap: CutMap, tb: Timebase) -> float:
+    return cutmap.output_frames * tb.fps_den / tb.fps_num
+
+
+def _color_source(
+    color: str, w: int, h: int, cutmap: CutMap, tb: Timebase, label: str, static: bool
+) -> str:
+    rate = "r=1:d=1" if static else (
+        f"r={tb.fps_num}/{tb.fps_den}:d={_output_seconds(cutmap, tb):.6f}"
+    )
+    return f"color=c={color}:s={w}x{h}:{rate},format=rgba{label}"
+
+
+def _hexcol(c: str) -> str:
+    return "0x" + c.lstrip("#") if c.startswith("#") else c
+
+
+def _split_color(spec: str) -> tuple[str, float]:
+    """Split 'colour@alpha' into an ffmpeg colour and a 0..1 alpha."""
+    rgb, sep, a = str(spec).partition("@")
+    return _hexcol(rgb), (float(a) if sep else 1.0)
+
+
+def _radius_px(radius: float, rect: Rect) -> float:
+    """Corner radius is stored normalized to the short side so the same project renders
+    identically against a 1080p proxy and a 1440p master."""
+    r = float(radius)
+    return r * min(rect.w, rect.h) if r <= 1.0 else r
+
+
+def _rounded_rect_mask(w: int, h: int, r: float) -> str:
+    """Antialiased rounded-rect coverage, ~1 px of edge softening.
+
+    Built from a 1-frame lavfi source so `geq` -- a per-pixel interpreter -- runs once
+    for the whole render rather than once per frame.
+    """
+    if r <= 0:
+        return "255"
+    r = min(r, min(w, h) / 2.0)
+    dx = f"max(max({r:.4f}-X,X-({w}-1-{r:.4f})),0)"
+    dy = f"max(max({r:.4f}-Y,Y-({h}-1-{r:.4f})),0)"
+    return f"clip(255*({r:.4f}-hypot({dx},{dy})+0.5),0,255)"
+
+
+def _circle_mask(w: int, h: int) -> str:
+    """An ellipse inscribed in the tile; for a square tile that is a circle."""
+    rx, ry = w / 2.0, h / 2.0
+    r = min(rx, ry)
+    return (
+        f"clip(255*({r:.4f}-hypot((X-{rx:.4f}+0.5)*{r / rx:.6f},"
+        f"(Y-{ry:.4f}+0.5)*{r / ry:.6f})+0.5),0,255)"
+    )

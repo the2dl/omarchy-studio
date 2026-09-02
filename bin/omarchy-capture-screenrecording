@@ -1,0 +1,427 @@
+#!/bin/bash
+
+# omarchy:summary=Start or stop screen recording
+# omarchy:group=capture
+# omarchy:args=[--fullscreen] [--with-desktop-audio] [--with-microphone-audio] [--with-webcam] [--burn-in] [--webcam-device=<device>] [--webcam-size=<small|medium|large>] [--resolution=<size>] [--stop-recording]
+# omarchy:examples=omarchy screenrecord | omarchy capture screenrecording --with-webcam
+# omarchy:aliases=omarchy screenrecord
+#
+# A recording is a bundle directory, not a file: the screen, the camera and the input
+# events are captured as separate streams beside an immutable capture.json, so the
+# webcam can be moved, the zoom retimed and sections cut long after the fact. See
+# lib/omarchy_studio/project.py for the layout.
+#
+# Nothing here re-encodes or trims the master. The old finalize step (-ss 0.1 plus
+# loudnorm, then mv over the original) is gone -- overwriting the capture is exactly
+# what a non-destructive pipeline cannot do, and the -100ms shift it applied silently
+# invalidated the first-frame anchor everything else is timed against. Loudness
+# normalization now happens at export, where it can be turned off again.
+#
+# Env: OMARCHY_SCREENRECORD_DEBUG=true appends gpu-screen-recorder's stderr to
+# /tmp/omarchy-screenrecord.log.
+#
+# OMARCHY_SCREENRECORD_USE_PORTAL is gone. The portal backend never reports which
+# rectangle of which monitor it handed over, and capture.json cannot be written without
+# it: every cursor sample is a logical coordinate that has to be mapped into the video,
+# and guessing the origin puts the zoom focal point somewhere else entirely. HDR and
+# external-GPU captures need the portal to publish its geometry before they can come
+# back.
+
+set -uo pipefail
+
+STUDIO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+PATH="$STUDIO_ROOT/bin:$PATH"
+
+[[ -f ~/.config/user-dirs.dirs ]] && source ~/.config/user-dirs.dirs
+OUTPUT_DIR="${OMARCHY_SCREENRECORD_DIR:-${XDG_VIDEOS_DIR:-$HOME/Videos}}"
+
+if [[ ! -d $OUTPUT_DIR ]]; then
+  omarchy-notification-send -u critical -t 3000 "Screen recording directory does not exist: $OUTPUT_DIR"
+  exit 1
+fi
+
+DESKTOP_AUDIO="false"
+MICROPHONE_AUDIO="false"
+WEBCAM="false"
+BURN_IN="false"
+WEBCAM_DEVICE=""
+WEBCAM_SIZE="medium"
+RESOLUTION=""
+FULLSCREEN="false"
+STOP_RECORDING="false"
+SCRIPT_ARGS="$*"
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+RECORDING_FILE="/tmp/omarchy-screenrecord-filename"
+BUNDLE_FILE="$RUNTIME_DIR/omarchy-studio-bundle"
+IPC_SOCKET="$RUNTIME_DIR/omarchy-studio-gsr.sock"
+REGION_FILE="$RUNTIME_DIR/omarchy-screenrecord-region"
+LOG_FILE=$([[ ${OMARCHY_SCREENRECORD_DEBUG:-false} == "true" ]] && echo "/tmp/omarchy-screenrecord.log" || echo "/dev/null")
+
+# The one place cursor capture is decided. gsr burns the cursor into the frame and
+# magnifies it softly under zoom; the fix is a synthetic cursor rendered from the event
+# track at export, and until that exists a cursorless recording is the worse regression.
+# Flip to "no" here, and only here, when it lands.
+CURSOR_CAPTURE="yes"
+
+STUDIO_PYTHON="${OMARCHY_STUDIO_PYTHON:-$STUDIO_ROOT/.venv/bin/python}"
+[[ -x $STUDIO_PYTHON ]] || STUDIO_PYTHON="python3"
+
+studio_capture() {
+  PYTHONPATH="$STUDIO_ROOT/lib${PYTHONPATH:+:$PYTHONPATH}" "$STUDIO_PYTHON" -m omarchy_studio.capture "$@"
+}
+
+for arg in "$@"; do
+  case "$arg" in
+  --with-desktop-audio) DESKTOP_AUDIO="true" ;;
+  --with-microphone-audio) MICROPHONE_AUDIO="true" ;;
+  --with-webcam) WEBCAM="true" ;;
+  --burn-in) BURN_IN="true" ;;
+  --webcam-device=*) WEBCAM_DEVICE="${arg#*=}" ;;
+  --webcam-size=*) WEBCAM_SIZE="${arg#*=}" ;;
+  --resolution=*) RESOLUTION="${arg#*=}" ;;
+  --fullscreen) FULLSCREEN="true" ;;
+  --stop-recording) STOP_RECORDING="true" ;;
+  esac
+done
+
+case $WEBCAM_SIZE in
+small | medium | large) ;;
+*)
+  echo "Invalid webcam size: $WEBCAM_SIZE (expected small, medium, or large)" >&2
+  exit 1
+  ;;
+esac
+
+# --- the burned-in camera path (unchanged behaviour) -------------------------
+#
+# An mpv overlay inside the captured region, recorded as pixels. Nothing in the editor
+# can move or remove it afterwards, which is why it is not the default -- but it is what
+# people are using today, so it stays exactly as it was.
+
+start_webcam_overlay() {
+  cleanup_webcam
+
+  if [[ -z $WEBCAM_DEVICE ]]; then
+    WEBCAM_DEVICE=$(omarchy-capture-webcam-list | sed -n '1s/[[:space:]].*//p')
+    if [[ -z $WEBCAM_DEVICE ]]; then
+      omarchy-notification-send -u critical -t 3000 "No webcam devices found"
+      return 1
+    fi
+  fi
+
+  local preferred_resolutions=("640x360" "1280x720" "1920x1080")
+  local capture_options="framerate=30"
+  local available_formats=$(v4l2-ctl --list-formats-ext -d "$WEBCAM_DEVICE" 2>/dev/null)
+
+  for resolution in "${preferred_resolutions[@]}"; do
+    if echo "$available_formats" | grep -q "$resolution"; then
+      capture_options="video_size=$resolution,$capture_options"
+      break
+    fi
+  done
+
+  mpv "av://v4l2:$WEBCAM_DEVICE" \
+    --profile=low-latency --untimed --no-cache \
+    --demuxer-lavf-o="$capture_options" \
+    '--vf=lavfi=[crop=ih*8/9:ih]' \
+    --title="WebcamOverlay" --wayland-app-id="WebcamOverlay-$WEBCAM_SIZE" \
+    --no-border --no-audio --no-osc --osd-level=0 \
+    --really-quiet &>/dev/null &
+
+  # The move has to settle before gpu-screen-recorder starts, or the camera is
+  # recorded sliding into its corner.
+  local waited=0
+  while ((waited < 40)) && ! hyprctl clients -j | jq -e 'any(.[]; .title == "WebcamOverlay")' >/dev/null 2>&1; do
+    sleep 0.05
+    ((waited++))
+  done
+
+  [[ ${1:-} == region:* ]] && echo "${1#region:}" >"$REGION_FILE"
+  omarchy-capture-webcam-resize "$WEBCAM_SIZE"
+
+  sleep 0.6
+}
+
+cleanup_webcam() {
+  pkill -f "WebcamOverlay" 2>/dev/null
+  rm -f "$REGION_FILE"
+}
+
+# --- target selection --------------------------------------------------------
+
+# Echoes "monitor:NAME" when the selection matches an entire monitor (prefer
+# -w <monitor> over a region capture -- same kms backend, but no scaling math and full
+# native res), otherwise "region:WxH+X+Y". Returns non-zero if the user cancelled.
+select_capture_target() {
+  local target
+  target=$(omarchy-capture-region smart --match-monitor) || return 1
+
+  if [[ $target == monitor:* ]]; then
+    echo "$target"
+    return
+  fi
+
+  [[ $target =~ ^(-?[0-9]+),(-?[0-9]+)[[:space:]]([0-9]+)x([0-9]+)$ ]] || return 1
+
+  # gpu-screen-recorder wants region geometry in the compositor's logical coordinate
+  # space -- the same space slurp returns -- so pass the values through untouched.
+  echo "region:${BASH_REMATCH[3]}x${BASH_REMATCH[4]}+${BASH_REMATCH[1]}+${BASH_REMATCH[2]}"
+}
+
+# Resolves a target into MONITOR_NAME, MONITOR_SCALE and LOGICAL_GEOMETRY. The scale is
+# read here, at record time, because it is unrecoverable afterwards: cursor events are
+# logical and the video is physical, and a monitor rescaled between record and edit
+# would silently double or halve every zoom focal point.
+resolve_target_geometry() {
+  local target=$1
+  local monitors
+  monitors=$(hyprctl monitors -j) || return 1
+
+  local jq_logical='
+    .transform as $t |
+    { name: .name, scale: .scale, x: .x, y: .y,
+      w: (if $t == 1 or $t == 3 then (.height / .scale | floor) else (.width / .scale | floor) end),
+      h: (if $t == 1 or $t == 3 then (.width / .scale | floor) else (.height / .scale | floor) end) }'
+
+  case $target in
+  monitor:*)
+    read -r MONITOR_NAME MONITOR_SCALE LOGICAL_GEOMETRY < <(
+      jq -r --arg name "${target#monitor:}" \
+        "first(.[] | select(.name == \$name) | $jq_logical) | \"\(.name) \(.scale) \(.w)x\(.h)+\(.x)+\(.y)\"" <<<"$monitors"
+    )
+    ;;
+  region:*)
+    [[ ${target#region:} =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]] || return 1
+    LOGICAL_GEOMETRY="${target#region:}"
+    # The monitor under the region's centre owns the scale. A region straddling two
+    # displays has no single answer, and the centre is the least surprising one.
+    local cx=$((BASH_REMATCH[3] + BASH_REMATCH[1] / 2))
+    local cy=$((BASH_REMATCH[4] + BASH_REMATCH[2] / 2))
+    read -r MONITOR_NAME MONITOR_SCALE < <(
+      jq -r --argjson cx "$cx" --argjson cy "$cy" \
+        "[.[] | $jq_logical] | (first(.[] | select(\$cx >= .x and \$cx < .x + .w and \$cy >= .y and \$cy < .y + .h)) // .[0]) | \"\(.name) \(.scale)\"" <<<"$monitors"
+    )
+    ;;
+  *) return 1 ;;
+  esac
+
+  [[ -n ${MONITOR_NAME:-} && -n ${MONITOR_SCALE:-} && -n ${LOGICAL_GEOMETRY:-} ]]
+}
+
+# A self-view can only be shown where the capture cannot see it. gsr has no exclusion
+# flag and Hyprland has no hide-from-capture rule -- verified, there is no software
+# trick -- so a fullscreen capture on the only monitor gets no self-view at all.
+self_view_possible() {
+  local target=$1
+  [[ $target == region:* ]] && return 0
+  (($(hyprctl monitors -j | jq 'length') > 1))
+}
+
+# --- recording ---------------------------------------------------------------
+
+GSR_PID=""
+BUNDLE=""
+RECORDING_LAUNCHED="false"
+
+cleanup_start() {
+  [[ $RECORDING_LAUNCHED == "true" ]] && return
+  [[ -n $GSR_PID ]] && kill -INT "$GSR_PID" 2>/dev/null
+  omarchy-capture-camera stop 2>/dev/null
+  cleanup_webcam
+  # A bundle whose media directory never received a frame is litter, not a recording.
+  if [[ -n $BUNDLE && -d $BUNDLE ]] && [[ -z $(ls -A "$BUNDLE/media" 2>/dev/null) ]]; then
+    rm -rf "$BUNDLE"
+  fi
+  rm -f "$BUNDLE_FILE"
+}
+
+start_screenrecording() {
+  trap cleanup_start EXIT
+  trap 'cleanup_start; exit 130' INT TERM HUP
+
+  local target
+  if [[ $FULLSCREEN == "true" ]]; then
+    target="monitor:$(omarchy-hyprland-monitor-focused)"
+  else
+    target=$(select_capture_target) || return 1
+  fi
+
+  resolve_target_geometry "$target" || {
+    omarchy-notification-send -u critical -t 3000 "Screen recording error" "Could not resolve the capture geometry"
+    return 1
+  }
+
+  local burned_in_flag=()
+  [[ $WEBCAM == "true" && $BURN_IN == "true" ]] && burned_in_flag=(--burn-in)
+
+  local begin_output
+  begin_output=$(studio_capture begin \
+    --root "$OUTPUT_DIR/screenrecording-$(date +'%Y-%m-%d_%H-%M-%S')" \
+    --logical "$LOGICAL_GEOMETRY" \
+    --monitor "$MONITOR_NAME" \
+    --scale "$MONITOR_SCALE" \
+    "${burned_in_flag[@]}") || {
+    omarchy-notification-send -u critical -t 3000 "Screen recording error" "Could not create the recording bundle"
+    return 1
+  }
+
+  local CAPTURE_SIZE=""
+  eval "$begin_output"
+  [[ -n $BUNDLE && -n $CAPTURE_SIZE ]] || return 1
+
+  # gsr's -region flag is deprecated in 6.0.1; region geometry goes straight to -w.
+  local capture_args=(-w "${target#*:}" -s "${RESOLUTION:-$CAPTURE_SIZE}")
+
+  [[ $WEBCAM == "true" && $BURN_IN == "true" ]] && start_webcam_overlay "$target"
+
+  local audio_devices=""
+  local audio_args=()
+  [[ $DESKTOP_AUDIO == "true" ]] && audio_devices+="default_output"
+  if [[ $MICROPHONE_AUDIO == "true" ]]; then
+    # Merge audio tracks into one - separate tracks only play one at a time in most players
+    [[ -n $audio_devices ]] && audio_devices+="|"
+    audio_devices+="default_input"
+  fi
+  [[ -n $audio_devices ]] && audio_args+=(-a "$audio_devices" -ac aac)
+
+  local master="$BUNDLE/media/screen.mp4"
+  rm -f "$IPC_SOCKET"
+
+  echo "===== $(date '+%F %T') args: $SCRIPT_ARGS target: $target bundle: $BUNDLE =====" >>"$LOG_FILE"
+  gpu-screen-recorder "${capture_args[@]}" \
+    -k auto -f 60 -fm cfr -fallback-cpu-encoding yes \
+    -cursor "$CURSOR_CAPTURE" \
+    -write-first-frame-ts yes \
+    -ipc "$IPC_SOCKET" \
+    -o "$master" "${audio_args[@]}" 2>>"$LOG_FILE" &
+  GSR_PID=$!
+
+  while kill -0 $GSR_PID 2>/dev/null && [[ ! -f $master ]]; do
+    sleep 0.2
+  done
+  kill -0 $GSR_PID 2>/dev/null || return 1
+
+  # The camera is a separate stream so the editor can move, resize or remove it. Its
+  # offset against the screen is measured per recording from the two anchors: launch
+  # order plus per-pipeline warm-up (KMS 128-137ms, V4L2 210-228ms) is not a constant.
+  if [[ $WEBCAM == "true" && $BURN_IN != "true" ]]; then
+    local camera_args=(--size="$WEBCAM_SIZE" --outside="$LOGICAL_GEOMETRY")
+    [[ -n $WEBCAM_DEVICE ]] && camera_args+=(--device="$WEBCAM_DEVICE")
+    if self_view_possible "$target"; then
+      camera_args+=(--self-view=yes)
+    else
+      camera_args+=(--self-view=no)
+    fi
+    omarchy-capture-camera start "$BUNDLE" "${camera_args[@]}" ||
+      omarchy-notification-send -u critical -t 3000 "Webcam not recorded" "The screen recording is running without it"
+  fi
+
+  # Built by another part of the system; a missing event daemon costs auto-zoom and the
+  # synthetic cursor, not the recording. The scale goes with it because events are
+  # logical pixels and the video is physical -- the daemon cannot read it off the
+  # compositor later without risking a different answer than the one in capture.json.
+  if command -v omarchy-capture-input-events >/dev/null; then
+    omarchy-capture-input-events start "$BUNDLE/events" --scale="$MONITOR_SCALE" >>"$LOG_FILE" 2>&1 ||
+      echo "input events failed to start" >>"$LOG_FILE"
+  fi
+
+  echo "$BUNDLE" >"$BUNDLE_FILE"
+  echo "$master" >"$RECORDING_FILE"
+  RECORDING_LAUNCHED="true"
+  toggle_screenrecording_indicator
+}
+
+stop_screenrecording() {
+  local bundle
+  bundle=$(cat "$BUNDLE_FILE" 2>/dev/null)
+
+  # 'stop' is answered only once the file is finalized (136ms after a 6s recording), so
+  # the reply is the completion signal. SIGINT remains the fallback for a recording this
+  # script did not start -- an older build's, say -- which has no socket.
+  if [[ -n $bundle && -S $IPC_SOCKET ]]; then
+    omarchy-studio-ipc "$IPC_SOCKET" stop --timeout 30 >/dev/null || {
+      pkill -SIGINT -f "^gpu-screen-recorder"
+    }
+  else
+    pkill -SIGINT -f "^gpu-screen-recorder" # SIGINT required to save video properly
+  fi
+
+  local count=0
+  while pgrep -f "^gpu-screen-recorder" >/dev/null && ((count < 50)); do
+    sleep 0.1
+    count=$((count + 1))
+  done
+
+  omarchy-capture-camera stop
+  command -v omarchy-capture-input-events >/dev/null &&
+    omarchy-capture-input-events stop >/dev/null 2>&1
+  toggle_screenrecording_indicator
+  cleanup_webcam
+
+  if pgrep -f "^gpu-screen-recorder" >/dev/null; then
+    pkill -9 -f "^gpu-screen-recorder"
+    omarchy-notification-send -u critical -t 5000 "Screen recording error" "Recording process had to be force-killed. Video may be corrupted."
+    rm -f "$RECORDING_FILE" "$BUNDLE_FILE"
+    return
+  fi
+
+  local master
+  master=$(cat "$RECORDING_FILE" 2>/dev/null)
+
+  if [[ -n $bundle && -d $bundle ]]; then
+    local camera_args=()
+    [[ -f $bundle/media/cam.mp4 ]] && camera_args=(--camera media/cam.mp4)
+    if ! studio_capture finalize --root "$bundle" "${camera_args[@]}" >>"$LOG_FILE" 2>&1; then
+      omarchy-notification-send -u critical -t 5000 "Screen recording error" \
+        "The media was saved but capture.json could not be completed: $bundle"
+    fi
+    master="$bundle/media/screen.mp4"
+  fi
+
+  echo "$master"
+  announce_recording "$master"
+  rm -f "$RECORDING_FILE" "$BUNDLE_FILE"
+}
+
+announce_recording() {
+  local master=$1
+  [[ -f $master ]] || return
+
+  # The thumbnail comes out of the master and never back into it: the master is read-only
+  # from the moment gsr closes it, and media/ holds nothing that was not captured.
+  local preview
+  if [[ $master == */media/screen.mp4 ]]; then
+    preview="${master%/media/screen.mp4}/.preview.png"
+  else
+    preview="${master%.mp4}-preview.png"
+  fi
+  ffmpeg -y -i "$master" -ss 00:00:00.1 -vframes 1 -q:v 2 "$preview" -loglevel quiet 2>/dev/null
+
+  omarchy-notification-send "Screen recording saved" "Open with Super + Alt + , (or click this)" \
+    -t 10000 --image "${preview:-$master}" \
+    --exec mpv -- "$master"
+
+  # The shell loads the thumbnail into memory when the toast appears and never re-reads
+  # the file, so the preview only has to outlive that load -- not the toast.
+  (
+    sleep 2
+    rm -f "$preview"
+  ) &
+}
+
+toggle_screenrecording_indicator() {
+  omarchy-shell -q omarchy.indicators refresh
+}
+
+screenrecording_active() {
+  pgrep -f "^gpu-screen-recorder" >/dev/null
+}
+
+if screenrecording_active; then
+  stop_screenrecording
+elif [[ $STOP_RECORDING == "true" ]]; then
+  exit 1
+else
+  start_screenrecording
+fi

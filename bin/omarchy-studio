@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Launch the editor: bridge first, proxy build second, window third.
+
+Three environment details are not optional, and each cost a debugging session:
+
+* /usr/bin/qml6 by absolute path. Plain `qml` on PATH is Qt 5.15 and fails with
+  "Did not load any objects, exiting" and nothing else -- no file, no line, no type.
+* QT_ASSUME_STDERR_HAS_CONSOLE=1, or Qt routes console.log into the journal and every
+  QML warning this launcher is watching for disappears.
+* QML_XHR_ALLOW_FILE_READ=1, or Theme.qml cannot read the theme's colors.toml and the
+  editor silently falls back to its built-in palette.
+
+usage: omarchy-studio BUNDLE [--selftest MS] [--no-proxy]
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+from omarchy_studio.project import Bundle, ProjectError  # noqa: E402
+from omarchy_studio import qmlbridge  # noqa: E402
+
+QML6 = "/usr/bin/qml6"
+EDITOR = REPO / "editor"
+
+
+def _print_proxy_progress(status: dict, last: list) -> None:
+    """A one-line ticker while the proxy builds.
+
+    The window shows the same progress, but the build starts before it is mapped and a
+    terminal that prints nothing for twenty seconds looks hung.
+    """
+    if status["state"] != "building":
+        if status["state"] != last[0]:
+            print(f"proxy: {status['state']} {status.get('message', '')}".rstrip(), file=sys.stderr)
+        last[0] = status["state"]
+        return
+    pct = int(status.get("progress", 0) * 100)
+    if pct != last[1]:
+        print(f"\rproxy: {pct:3d}%  {status.get('message', '')}", end="", file=sys.stderr, flush=True)
+        last[1] = pct
+        last[0] = status["state"]
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="omarchy-studio", description=__doc__)
+    ap.add_argument("bundle", help="a recording directory containing capture.json")
+    ap.add_argument("--selftest", type=int, default=0, metavar="MS",
+                    help="load the UI, print a summary after MS milliseconds, and exit")
+    ap.add_argument("--grab", metavar="PNG",
+                    help="with --selftest: save a full-resolution grab of the stage")
+    ap.add_argument("--frame", type=int, metavar="N",
+                    help="with --selftest: park the playhead on this source frame")
+    ap.add_argument("--selftest-op", metavar="JSON",
+                    help='with --selftest: apply one intent first, e.g. \'{"op":"set_webcam",'
+                         '"args":{"shape":"rect"}}\'')
+    ap.add_argument("--no-proxy", action="store_true", help="skip the proxy build")
+    ap.add_argument("--port", type=int, default=0)
+    a = ap.parse_args(argv)
+
+    if not Path(QML6).exists():
+        print(f"{QML6} is missing; install qt6-declarative", file=sys.stderr)
+        return 2
+
+    try:
+        bundle = Bundle(Path(a.bundle).expanduser().resolve())
+    except ProjectError as e:
+        print(e, file=sys.stderr)
+        return 2
+
+    session = qmlbridge.Session(bundle, REPO)
+    server = qmlbridge.serve(session, a.port)
+
+    if not a.no_proxy:
+        last = ["", -1]
+        session.proxy.on_change = lambda s: _print_proxy_progress(s, last)
+        session.proxy.start()
+
+    env = dict(os.environ)
+    env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
+    env["QML_XHR_ALLOW_FILE_READ"] = "1"
+    argvq = [
+        QML6, "-I", str(EDITOR), str(EDITOR / "main.qml"), "--",
+        "--port", str(server.server_port),
+        "--token", session.token,
+        "--bundle", str(bundle.root),
+    ]
+    if a.selftest:
+        argvq += ["--selftest", str(a.selftest)]
+    if a.grab:
+        argvq += ["--grab", str(Path(a.grab).expanduser().resolve())]
+    if a.frame is not None:
+        argvq += ["--frame", str(a.frame)]
+    if a.selftest_op:
+        argvq += ["--selftest-op", a.selftest_op]
+
+    proc = subprocess.Popen(argvq, env=env)
+    # The editor asks the bridge to quit when its window closes; watching for that as
+    # well means a crashed UI does not leave the server (and the proxy build) running.
+    watcher = threading.Thread(
+        target=lambda: (session.quit_requested.wait(), proc.poll() is None and proc.terminate()),
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        # A self-test that never reaches its timer would otherwise leave a window (and a
+        # bridge) behind on a machine nobody is watching.
+        rc = proc.wait(timeout=(a.selftest / 1000.0 + 30) if a.selftest else None)
+    except subprocess.TimeoutExpired:
+        print("selftest: the editor did not exit; killing it", file=sys.stderr)
+        proc.kill()
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        rc = proc.wait()
+    session.quit_requested.set()
+    session.proxy.stop()
+    session.exporter.cancel()
+    server.shutdown()
+    if session.dirty:
+        print("note: edit.json has unsaved changes from this session", file=sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

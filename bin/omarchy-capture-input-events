@@ -1,0 +1,178 @@
+#!/bin/bash
+
+# omarchy:summary=Record the cursor and click track beside a screen recording
+# omarchy:group=capture
+# omarchy:args=start <events-dir> [--hz=<n>] [--scale=<n>] [--duration=<sec>] [--with-scroll] [--no-clicks] | stop | mark [<label>] | status | sweep
+# omarchy:examples=omarchy-capture-input-events start ~/Videos/rec-1/events | omarchy-capture-input-events stop
+#
+# Writes events/cursor.bin and events/input.jsonl. Runs alongside
+# gpu-screen-recorder; it captures no pixels and takes no V4L2 lock, so it does
+# not contend with either the screen or the camera recorder.
+#
+# `stop` is the only supported way to end a run. It sends SIGTERM, which
+# unbinds the compositor-side click binds before the process exits. A SIGKILL
+# instead leaves those binds live until the recorder's dead-man timer expires
+# (15s) or the next `start` sweeps them -- recoverable, but the user's mouse is
+# altered in the meantime, so do not do it.
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+DAEMON="$ROOT/daemon/input_recorder.py"
+PYTHON="${OMARCHY_STUDIO_PYTHON:-$ROOT/.venv/bin/python}"
+[[ -x $PYTHON ]] || PYTHON="$(command -v python3)"
+
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/omarchy-studio"
+STATE_FILE="$STATE_DIR/input-events.state"
+LOG_FILE="$STATE_DIR/input-events.log"
+
+die() {
+  echo "$1" >&2
+  exit 1
+}
+
+# Echoes the running recorder's pid, or nothing. Clears the state file when the
+# pid is gone, so a crashed recorder does not block the next start forever.
+running_pid() {
+  local pid
+  [[ -f $STATE_FILE ]] || return 1
+  pid=$(sed -n '1p' "$STATE_FILE")
+  if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
+    echo "$pid"
+    return 0
+  fi
+  rm -f "$STATE_FILE"
+  return 1
+}
+
+events_dir() {
+  [[ -f $STATE_FILE ]] && sed -n '2p' "$STATE_FILE"
+}
+
+cmd_start() {
+  local dir="${1:-}"
+  shift || true
+  [[ -n $dir ]] || die "usage: $(basename "$0") start <events-dir> [options]"
+
+  if running_pid >/dev/null; then
+    die "already recording input events (pid $(running_pid))"
+  fi
+
+  local args=()
+  for arg in "$@"; do
+    case "$arg" in
+    --hz=*) args+=(--hz "${arg#*=}") ;;
+    --scale=*) args+=(--scale "${arg#*=}") ;;
+    --duration=*) args+=(--duration "${arg#*=}") ;;
+    --with-scroll) args+=(--with-scroll) ;;
+    --no-clicks) args+=(--no-clicks) ;;
+    *) die "unknown option: $arg" ;;
+    esac
+  done
+
+  mkdir -p "$STATE_DIR" "$dir"
+  : >"$LOG_FILE"
+
+  setsid "$PYTHON" "$DAEMON" "$dir" "${args[@]}" >>"$LOG_FILE" 2>&1 &
+  local pid=$!
+  printf '%s\n%s\n' "$pid" "$(cd "$dir" && pwd)" >"$STATE_FILE"
+
+  # The binds are registered before the first cursor sample, so cursor.bin
+  # appearing means the compositor side is up. Waiting for it here is what lets
+  # the caller start gpu-screen-recorder immediately afterwards without racing.
+  local waited=0
+  while ((waited < 50)) && kill -0 "$pid" 2>/dev/null && [[ ! -s $dir/cursor.bin ]]; do
+    sleep 0.05
+    ((waited++))
+  done
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$STATE_FILE"
+    cat "$LOG_FILE" >&2
+    die "input recorder exited during startup"
+  fi
+  echo "$pid"
+}
+
+cmd_stop() {
+  local pid
+  pid=$(running_pid) || die "no input recording in progress"
+
+  kill -TERM "$pid" 2>/dev/null
+
+  local waited=0
+  while ((waited < 50)) && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1
+    ((waited++))
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null
+    # SIGKILL runs no handler, so nothing has unbound. Clear the binds from here
+    # rather than leaving the user's mouse altered until the dead-man expires.
+    cmd_sweep
+    rm -f "$STATE_FILE"
+    die "input recorder did not stop; force-killed and swept its binds"
+  fi
+
+  rm -f "$STATE_FILE"
+  tail -n 1 "$LOG_FILE" 2>/dev/null
+}
+
+# A chapter mark is a line appended to the recorder's spool, not a signal: the
+# recorder already tails that file every millisecond, and a line carries a label
+# where a signal carries nothing.
+cmd_mark() {
+  local dir
+  running_pid >/dev/null || die "no input recording in progress"
+  dir=$(events_dir)
+  [[ -n $dir && -d $dir ]] || die "state file names no events directory"
+  printf 'chapter %s\n' "${*:-}" >>"$dir/spool"
+}
+
+cmd_status() {
+  local pid
+  if pid=$(running_pid); then
+    echo "recording (pid $pid) -> $(events_dir)"
+  else
+    echo "idle"
+  fi
+  local stale
+  stale=$(hyprctl binds | grep -c 'OMARCHY-STUDIO-INPUT' || true)
+  echo "click binds registered: $stale"
+}
+
+# Removes binds left behind by a recorder that died without cleaning up. Safe to
+# run at any time: it only touches binds whose description carries our tag.
+cmd_sweep() {
+  hyprctl eval '
+local R = _OMARCHY_STUDIO
+if R and R.release then pcall(R.release) end
+' >/dev/null
+  local left
+  left=$(hyprctl binds | grep -c 'OMARCHY-STUDIO-INPUT' || true)
+  ((left == 0)) || die "$left click bind(s) could not be swept"
+}
+
+case "${1:-}" in
+start)
+  shift
+  cmd_start "$@"
+  ;;
+stop)
+  cmd_stop
+  ;;
+mark)
+  shift
+  cmd_mark "$@"
+  ;;
+status)
+  cmd_status
+  ;;
+sweep)
+  cmd_sweep
+  ;;
+*)
+  die "usage: $(basename "$0") {start <events-dir> [opts] | stop | mark [label] | status | sweep}"
+  ;;
+esac

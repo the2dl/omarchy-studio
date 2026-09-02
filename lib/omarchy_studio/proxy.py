@@ -1,0 +1,131 @@
+"""Short-GOP preview proxies.
+
+The editor's preview must never read the master. Seeking the 5K master took 517-651 ms
+and half the seeks never delivered a frame at all; the proxy seeks in 15-53 ms with every
+seek landing. That difference is the GOP, not the resolution -- `-g 15 -bf 0` is what
+makes a seek land on a nearby keyframe, and the downscale is only there to keep the
+decode cheap enough to composite live.
+
+The proxy is derived, disposable state: it lives in the bundle's proxy/ directory, which
+can be deleted at any time and regenerates on demand. It is deliberately NOT part of the
+capture, so a stale one is a performance bug rather than a correctness one -- but it is
+still fingerprinted against its source, because a proxy of the wrong recording would be
+a correctness bug of the worst kind.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+from .project import Bundle, ProjectError
+
+# Measured: this is the setting that makes seeks land, so it is also the setting that
+# must invalidate a proxy when it changes.
+GOP = 15
+PROXY_WIDTH = 1920
+_VIDEO_ARGS = [
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-b:v", "10M",
+    "-g", str(GOP),
+    "-bf", "0",
+    "-pix_fmt", "yuv420p",
+]
+
+
+class ProxyError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ProxySpec:
+    """Which stream is being proxied and where it lands."""
+
+    source: Path
+    dest: Path
+    stamp: Path
+
+
+def _spec(bundle: Bundle, stream: str) -> ProxySpec:
+    s = getattr(bundle.capture, stream, None)
+    if s is None:
+        raise ProjectError(f"capture has no {stream} stream to proxy")
+    src = bundle.media(Path(s.path).name)
+    if not src.exists():
+        raise ProxyError(f"missing media {src}")
+    return ProxySpec(
+        source=src,
+        dest=bundle.proxy_dir / f"{stream}-proxy.mp4",
+        stamp=bundle.proxy_dir / f"{stream}-proxy.json",
+    )
+
+
+def _fingerprint(spec: ProxySpec) -> dict:
+    st = spec.source.stat()
+    return {
+        "source": spec.source.name,
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+        "gop": GOP,
+        "width": PROXY_WIDTH,
+    }
+
+
+def is_stale(bundle: Bundle, stream: str = "screen") -> bool:
+    spec = _spec(bundle, stream)
+    if not spec.dest.exists() or not spec.stamp.exists():
+        return True
+    try:
+        return json.loads(spec.stamp.read_text()) != _fingerprint(spec)
+    except (OSError, ValueError):
+        return True
+
+
+def ensure_proxy(bundle: Bundle, stream: str = "screen") -> Path:
+    """Return a short-GOP preview proxy, generating it only if it is stale.
+
+    Reuse is checked against a fingerprint of the source rather than a timestamp
+    comparison: media/ is immutable, so a mismatch means this proxy belongs to a
+    different recording or was made with different settings, and either way the answer
+    is to regenerate.
+    """
+    spec = _spec(bundle, stream)
+    if not is_stale(bundle, stream):
+        return spec.dest
+
+    bundle.proxy_dir.mkdir(parents=True, exist_ok=True)
+    # The temp name keeps the .mp4 last: ffmpeg picks the muxer from the extension, and
+    # a trailing ".tmp" leaves it with nothing to infer from.
+    tmp = spec.dest.with_name(spec.dest.stem + ".part.mp4")
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(spec.source),
+        # min() rather than a bare width: a camera stream is already below the proxy
+        # width, and scaling it UP would cost decode time to gain nothing. The GOP is
+        # the point; the scale is the concession.
+        "-vf", f"scale='min({PROXY_WIDTH},iw)':-2:flags=bicubic",
+        *_VIDEO_ARGS,
+        # Audio is copied because the preview scrubs against it and re-encoding would
+        # shift it relative to the video it is supposed to be checking.
+        "-c:a", "copy",
+        str(tmp),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        raise ProxyError(f"proxy generation failed:\n{r.stderr.strip()[-2000:]}")
+
+    # Replace only once ffmpeg has succeeded: a half-written proxy that looks complete
+    # would be reused, and the editor would preview a truncated recording.
+    tmp.replace(spec.dest)
+    spec.stamp.write_text(json.dumps(_fingerprint(spec), indent=2) + "\n")
+    return spec.dest
+
+
+def clear(bundle: Bundle) -> None:
+    """Drop every proxy. Safe at any time -- proxies are derived state."""
+    for p in sorted(bundle.proxy_dir.glob("*-proxy.*")):
+        p.unlink(missing_ok=True)

@@ -1,0 +1,160 @@
+// The editor's connection to lib/omarchy_studio/qmlbridge.py.
+//
+// This file is deliberately dumb: it moves JSON, and it never computes anything about
+// the project. Every rectangle, every zoom transform and every frame index in the UI
+// arrives already resolved by geometry.py, because a second implementation in
+// JavaScript would drift from the export and the drift is invisible until someone
+// diffs rendered frames.
+//
+// Measured: 100 sequential round trips in 27ms (0.27ms each), so a drag can push an
+// intent per frame and read back the authoritative answer without any local guessing.
+pragma Singleton
+import QtQuick
+
+QtObject {
+    id: bridge
+
+    property int port: 0
+    property string token: ""
+    property string bundle: ""
+    property int selftestMs: 0
+
+    property var state: ({})
+    property var proxyStatus: ({ state: "unknown", progress: 0, message: "" })
+    property var exportStatus: ({ state: "idle", progress: 0, message: "" })
+    property bool connected: false
+    property string lastError: ""
+
+    signal stateUpdated()
+
+    function arg(name, fallback) {
+        var a = Qt.application.arguments
+        for (var i = 0; i < a.length - 1; ++i)
+            if (a[i] === name)
+                return a[i + 1]
+        return fallback
+    }
+
+    function url(path) {
+        return "http://127.0.0.1:" + port + path
+    }
+
+    function send(method, path, body, cb) {
+        var x = new XMLHttpRequest()
+        x.onreadystatechange = function () {
+            if (x.readyState !== XMLHttpRequest.DONE)
+                return
+            var reply = null
+            try {
+                reply = JSON.parse(x.responseText)
+            } catch (e) {
+                reply = null
+            }
+            if (x.status === 200) {
+                lastError = ""
+                connected = true
+                if (cb)
+                    cb(reply, true)
+                return
+            }
+            // A rejected intent is normal -- a burned-in webcam, a cut past the end --
+            // and the bridge sends the unchanged state back with it so the UI can snap
+            // back to the truth instead of keeping the value the user just tried.
+            lastError = reply && reply.error ? reply.error : ("bridge error " + x.status)
+            if (reply && reply.state)
+                apply(reply.state)
+            // The callback runs either way: a caller waiting on a reply must not be left
+            // waiting forever because the intent was refused.
+            if (cb)
+                cb(reply, false)
+        }
+        x.open(method, url(path))
+        x.setRequestHeader("X-Studio-Token", token)
+        x.setRequestHeader("Content-Type", "application/json")
+        x.send(body === undefined || body === null ? "" : JSON.stringify(body))
+    }
+
+    function apply(s) {
+        // An omitted zoom_track means "unchanged": drag replies leave it out so the
+        // socket does not carry tens of thousands of samples per second.
+        if (s.zoom_track === undefined && state.zoom_track !== undefined)
+            s.zoom_track = state.zoom_track
+        state = s
+        if (s.proxy)
+            proxyStatus = s.proxy
+        if (s["export"])
+            exportStatus = s["export"]   // "export" is a JS keyword; index it
+        stateUpdated()
+    }
+
+    function refresh() {
+        send("GET", "/state", null, function (s, ok) { if (ok) apply(s) })
+    }
+
+    function op(name, args, cb) {
+        send("POST", "/op", { op: name, args: args || {} }, function (s, ok) {
+            if (ok)
+                apply(s)
+            if (cb)
+                cb(s, ok)
+        })
+    }
+
+    function save(cb) {
+        send("POST", "/save", {}, function (s, ok) {
+            if (ok)
+                apply(s)
+            if (cb)
+                cb(s, ok)
+        })
+    }
+
+    function startExport(output) {
+        send("POST", "/export", { output: output || null }, function (s, ok) {
+            if (ok)
+                exportStatus = s
+        })
+    }
+
+    function cancelExport() {
+        send("POST", "/export/cancel", {}, function (s, ok) {
+            if (ok)
+                exportStatus = s
+        })
+    }
+
+    function quit() {
+        send("POST", "/quit", {}, null)
+    }
+
+    readonly property bool busy: proxyStatus.state === "building"
+                                 || exportStatus.state === "running"
+
+    // Polls only the two small status endpoints. Polling /state instead would drag the
+    // whole resolved project (and its zoom track) across twice a second for a number.
+    property Timer poller: Timer {
+        interval: 400
+        repeat: true
+        running: bridge.busy
+        onTriggered: {
+            bridge.send("GET", "/proxy", null, function (s, ok) {
+                if (!ok)
+                    return
+                var wasBuilding = bridge.proxyStatus.state === "building"
+                bridge.proxyStatus = s
+                if (wasBuilding && s.state === "ready")
+                    bridge.refresh()   // the proxy URLs only exist once the files do
+            })
+            if (bridge.exportStatus.state === "running")
+                bridge.send("GET", "/export", null, function (s, ok) { if (ok) bridge.exportStatus = s })
+        }
+    }
+
+    Component.onCompleted: {
+        port = parseInt(arg("--port", "0"))
+        token = arg("--token", "")
+        bundle = arg("--bundle", "")
+        selftestMs = parseInt(arg("--selftest", "0"))
+        refresh()
+    }
+}

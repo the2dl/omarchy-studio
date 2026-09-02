@@ -1,0 +1,391 @@
+#!/bin/bash
+
+# omarchy:summary=Record the webcam into a recording bundle as its own stream
+# omarchy:group=capture
+# omarchy:args=start <bundle-dir> [--device=<dev>] [--size=<small|medium|large>] [--self-view=<yes|no>] [--outside=<WxH+X+Y>] | stop | status
+# omarchy:hidden=true
+#
+# One ffmpeg process opens the camera ONCE and fans it out: cam.mp4 for the editor,
+# cam.tsv (mkvtimestamp_v2) as a per-frame CLOCK_REALTIME track, and -- when a self-view
+# is wanted -- a copy of the camera's native MJPEG to a FIFO that mpv displays with no
+# re-encode.
+#
+# Three details are non-negotiable, each having failed the other way:
+#   * the preview branch goes through ffmpeg's `fifo` pseudo-muxer. Piped directly, a
+#     dying preview truncated a 10-second recording to 3.4 seconds.
+#   * the FIFO is read by `cat fifo | mpv fd://0`; mpv cannot open a FIFO itself.
+#   * -copyts is global. It cannot be applied to one output, so the whole command wears
+#     it, which is what puts true wallclock in cam.tsv.
+#
+# The camera is NOT burned into the screen here -- that is the --burn-in path in
+# omarchy-capture-screenrecording. This stream stays separate so the editor can move,
+# resize or remove it afterwards.
+
+set -uo pipefail
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+PID_FILE="$RUNTIME_DIR/omarchy-studio-camera.pid"
+PREVIEW_PID_FILE="$RUNTIME_DIR/omarchy-studio-camera-preview.pid"
+FIFO="$RUNTIME_DIR/omarchy-studio-camera.fifo"
+LOG_FILE="$RUNTIME_DIR/omarchy-studio-camera.log"
+
+readonly MARGIN=40
+readonly SELF_VIEW_MARKER="omarchy_studio_selfview=1"
+
+DEVICE=""
+SIZE="medium"
+SELF_VIEW="no"
+OUTSIDE=""
+FPS=30
+
+usage() {
+  echo "Usage: omarchy-capture-camera start <bundle-dir> [--device=<dev>] [--size=<small|medium|large>] [--self-view=<yes|no>] [--outside=<WxH+X+Y>]" >&2
+  echo "       omarchy-capture-camera stop|status" >&2
+  exit 1
+}
+
+# Lua form first, legacy dispatch second: the string forms are dead under Omarchy's Lua
+# parser on current builds, and the Lua form is missing on older ones.
+hypr_dispatch() {
+  local lua="$1"
+  shift
+  hyprctl dispatch "$lua" >/dev/null 2>&1 || hyprctl dispatch "$@" >/dev/null 2>&1
+}
+
+alive() {
+  local pid=${1:-}
+  [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null
+}
+
+resolve_device() {
+  [[ -n $DEVICE ]] && return 0
+  DEVICE=$(omarchy-capture-webcam-list | sed -n '1s/[[:space:]].*//p')
+  [[ -n $DEVICE ]]
+}
+
+# The fan-out copies the camera's native MJPEG to the preview branch, so an MJPEG mode
+# is required rather than preferred: without one the preview would have to be re-encoded
+# and the zero-copy branch is the reason the self-view is free.
+resolve_capture_format() {
+  local formats
+  formats=$(v4l2-ctl --list-formats-ext -d "$DEVICE" 2>/dev/null)
+  grep -q "MJPG" <<<"$formats" || return 1
+
+  local resolution
+  for resolution in 1280x720 640x480 1920x1080; do
+    if grep -q "$resolution" <<<"$formats"; then
+      CAM_WIDTH=${resolution%x*}
+      CAM_HEIGHT=${resolution#*x}
+      return 0
+    fi
+  done
+  return 1
+}
+
+monitors_logical() {
+  hyprctl monitors -j | jq -r '
+    .[] | .transform as $t |
+    [ .name, .x, .y,
+      (if $t == 1 or $t == 3 then (.height / .scale | floor) else (.width / .scale | floor) end),
+      (if $t == 1 or $t == 3 then (.width / .scale | floor) else (.height / .scale | floor) end)
+    ] | @tsv'
+}
+
+rects_overlap() {
+  local ax=$1 ay=$2 aw=$3 ah=$4 bx=$5 by=$6 bw=$7 bh=$8
+  ((ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah))
+}
+
+# The 8:9 portrait presets from default/hypr/apps/webcam-overlay.lua, scaled from the
+# host monitor's height so the self-view is the same share of a 1080p and a 6K display.
+preset_size() {
+  local monitor_height=$1
+  case $SIZE in
+  small)
+    PRESET_W=$((monitor_height * 4 / 25))
+    PRESET_H=$((monitor_height * 9 / 50))
+    ;;
+  large)
+    PRESET_W=$((monitor_height * 3 / 10))
+    PRESET_H=$((monitor_height * 27 / 80))
+    ;;
+  *)
+    PRESET_W=$((monitor_height * 2 / 9))
+    PRESET_H=$((monitor_height / 4))
+    ;;
+  esac
+}
+
+# Finds a spot for the self-view that the capture cannot see. Leaves it in PARK_X/PARK_Y
+# (plus PRESET_W/PRESET_H) and returns 1 when there is nowhere to put it -- there is no
+# software trick that hides a window from gsr, so "nowhere" means no self-view rather
+# than a self-view in the recording.
+find_park_spot() {
+  local ex_w=0 ex_h=0 ex_x=0 ex_y=0
+  if [[ $OUTSIDE =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]]; then
+    ex_w=${BASH_REMATCH[1]}
+    ex_h=${BASH_REMATCH[2]}
+    ex_x=${BASH_REMATCH[3]}
+    ex_y=${BASH_REMATCH[4]}
+  else
+    return 1
+  fi
+
+  local mx my mw mh
+
+  # A gap on the captured monitor first: the user is looking at that screen, and a
+  # self-view on a display they are not facing is not a self-view.
+  while IFS=$'\t' read -r _ mx my mw mh; do
+    rects_overlap "$ex_x" "$ex_y" "$ex_w" "$ex_h" "$mx" "$my" "$mw" "$mh" || continue
+    preset_size "$mh"
+
+    local right_edge=$((ex_x + ex_w)) bottom_edge=$((ex_y + ex_h))
+    if ((mx + mw - right_edge >= PRESET_W + 2 * MARGIN)); then
+      PARK_X=$((mx + mw - PRESET_W - MARGIN))
+      PARK_Y=$((my + mh - PRESET_H - MARGIN))
+      return 0
+    fi
+    if ((ex_x - mx >= PRESET_W + 2 * MARGIN)); then
+      PARK_X=$((mx + MARGIN))
+      PARK_Y=$((my + mh - PRESET_H - MARGIN))
+      return 0
+    fi
+    if ((my + mh - bottom_edge >= PRESET_H + 2 * MARGIN)); then
+      PARK_X=$((mx + mw - PRESET_W - MARGIN))
+      PARK_Y=$((my + mh - PRESET_H - MARGIN))
+      return 0
+    fi
+    if ((ex_y - my >= PRESET_H + 2 * MARGIN)); then
+      PARK_X=$((mx + mw - PRESET_W - MARGIN))
+      PARK_Y=$((my + MARGIN))
+      return 0
+    fi
+  done < <(monitors_logical)
+
+  # Otherwise any monitor the capture does not cover at all.
+  while IFS=$'\t' read -r _ mx my mw mh; do
+    rects_overlap "$ex_x" "$ex_y" "$ex_w" "$ex_h" "$mx" "$my" "$mw" "$mh" && continue
+    preset_size "$mh"
+    PARK_X=$((mx + mw - PRESET_W - MARGIN))
+    PARK_Y=$((my + mh - PRESET_H - MARGIN))
+    return 0
+  done < <(monitors_logical)
+
+  return 1
+}
+
+start_preview() {
+  find_park_spot || return 1
+
+  rm -f "$FIFO"
+  mkfifo "$FIFO" || return 1
+  return 0
+}
+
+# mpv relays the FIFO through cat, and the whole pipeline is its own session so a single
+# kill on the process group takes down both halves.
+launch_preview() {
+  setsid bash -c '
+    echo $$ >"$3"
+    cat "$1" | mpv --demuxer-lavf-format=mpjpeg \
+      --profile=low-latency --untimed --no-cache --cache=no \
+      --title=WebcamOverlay --wayland-app-id="WebcamOverlay-$2" \
+      --script-opts='"$SELF_VIEW_MARKER"' \
+      --no-border --no-audio --no-osc --osd-level=0 --really-quiet fd://0
+  ' _ "$FIFO" "$SIZE" "$PREVIEW_PID_FILE" &>/dev/null &
+
+  local waited=0
+  while ((waited < 60)) && ! hyprctl clients -j | jq -e 'any(.[]; .title == "WebcamOverlay")' >/dev/null 2>&1; do
+    sleep 0.05
+    ((waited++))
+  done
+
+  local address
+  address=$(hyprctl clients -j | jq -r 'first(.[] | select(.title == "WebcamOverlay") | .address) // empty')
+  [[ -n $address ]] || return 1
+
+  local window="address:$address"
+  hypr_dispatch \
+    "hl.dsp.window.resize({ window = \"$window\", x = $PRESET_W, y = $PRESET_H })" \
+    resizewindowpixel "exact $PRESET_W $PRESET_H,$window"
+  hypr_dispatch \
+    "hl.dsp.window.move({ window = \"$window\", x = $PARK_X, y = $PARK_Y })" \
+    movewindowpixel "exact $PARK_X $PARK_Y,$window"
+}
+
+start_camera() {
+  local bundle=$1
+  [[ -d $bundle/media ]] || {
+    echo "not a recording bundle: $bundle" >&2
+    return 1
+  }
+
+  stop_camera
+
+  resolve_device || {
+    echo "no webcam devices found" >&2
+    return 1
+  }
+  resolve_capture_format || {
+    echo "$DEVICE offers no usable MJPEG mode" >&2
+    return 1
+  }
+
+  local preview_branch=()
+  if [[ $SELF_VIEW == "yes" ]]; then
+    if start_preview; then
+      # Only wired up when something will read it: ffmpeg's fifo muxer blocks on opening
+      # the FIFO for write until a reader appears, so an unread branch would hang the
+      # output thread and stall the graceful shutdown at stop.
+      preview_branch=(
+        -map 0:v -c:v copy
+        -f fifo -fifo_format mpjpeg -queue_size 30 -drop_pkts_on_overflow 1
+        -attempt_recovery 1 -recover_any_error 1 -max_recovery_attempts 100 -recovery_wait_time 1
+        "$FIFO"
+      )
+    else
+      echo "no room outside the capture for a self-view; recording the camera blind" >&2
+    fi
+  fi
+
+  : >"$LOG_FILE"
+
+  # `echo $$` before exec so the pid file holds ffmpeg's own pid whether or not setsid
+  # forked, and SIGINT to that pid at stop writes a complete moov atom.
+  setsid bash -c 'echo $$ >"$1"; shift; exec "$@"' _ "$PID_FILE" \
+    ffmpeg -hide_banner -loglevel warning -y \
+    -vaapi_device /dev/dri/renderD128 \
+    -copyts -f v4l2 -ts abs -input_format mjpeg \
+    -video_size "${CAM_WIDTH}x${CAM_HEIGHT}" -framerate "$FPS" -i "$DEVICE" \
+    -map 0:v -vf format=nv12,hwupload -c:v h264_vaapi -b:v 6M "$bundle/media/cam.mp4" \
+    -map 0:v -c:v copy -f mkvtimestamp_v2 "$bundle/media/cam.tsv" \
+    "${preview_branch[@]}" \
+    >>"$LOG_FILE" 2>&1 &
+
+  # Device open to first frame was 661ms in one measured run, so neither the launcher's
+  # wallclock nor a short fixed sleep can stand in for "the camera is running". A growing
+  # cam.mp4 is the signal: cam.tsv looks empty for the first ~77 seconds because the
+  # timestamp muxer writes through a 32KB AVIO buffer that only flushes when it fills or
+  # the file closes, so waiting on it here declared every short recording a failure.
+  # Ten seconds, not the one the 661ms measurement suggests: a USB camera that was in
+  # use moments ago has been seen to take several seconds to hand over, and declaring
+  # failure there kills a recording that was about to work.
+  local waited=0 size=0 previous=0 running="yes"
+  while ((waited < 200)); do
+    size=$(stat -c %s "$bundle/media/cam.mp4" 2>/dev/null || echo 0)
+    # Two rising samples, not merely a non-empty file: the container header is written
+    # before any frame arrives, so only growth proves the device is delivering.
+    ((previous > 0 && size > previous)) && break
+    previous=$size
+    alive "$(cat "$PID_FILE" 2>/dev/null)" || {
+      running="no"
+      break
+    }
+    sleep 0.05
+    ((waited++))
+  done
+
+  if [[ $running == "no" ]] || ((previous == 0 || size <= previous)); then
+    echo "camera did not start: $(tail -1 "$LOG_FILE" 2>/dev/null) (full log: $LOG_FILE)" >&2
+    stop_camera
+    return 1
+  fi
+
+  [[ ${#preview_branch[@]} -gt 0 ]] && launch_preview
+  return 0
+}
+
+# Every fan-out ffmpeg, whether or not it still has a pid file. Both halves of the match
+# matter: the pattern is specific to this command's own timestamp branch, and the process
+# name check means a shell whose arguments merely mention it is never a target.
+fanout_pids() {
+  local pid
+  for pid in $(pgrep -f "mkvtimestamp_v2 [^ ]*/media/cam\.tsv" 2>/dev/null); do
+    [[ $(ps -o comm= -p "$pid" 2>/dev/null) == "ffmpeg" ]] && echo "$pid"
+  done
+}
+
+stop_preview() {
+  local pid
+  pid=$(cat "$PREVIEW_PID_FILE" 2>/dev/null)
+  alive "$pid" && kill -- "-$pid" 2>/dev/null
+  rm -f "$PREVIEW_PID_FILE"
+
+  for pid in $(pgrep -f "$SELF_VIEW_MARKER" 2>/dev/null); do
+    [[ $(ps -o comm= -p "$pid" 2>/dev/null) == "mpv" ]] && kill "$pid" 2>/dev/null
+  done
+  # -x -f: the whole command line must be exactly this, so no wrapper shell that merely
+  # mentions the FIFO can be caught by it.
+  pkill -x -f "cat $FIFO" 2>/dev/null
+}
+
+stop_camera() {
+  # The preview goes first: a self-view outliving the recorder is a frozen frame of the
+  # user's face on their desktop.
+  stop_preview
+
+  local pid waited=0
+  for pid in $(fanout_pids); do
+    # SIGINT, not SIGTERM: ffmpeg writes the trailer and flushes cam.tsv on the way out,
+    # and a hard kill leaves an mp4 with no moov atom -- unreadable, verified.
+    kill -INT "$pid" 2>/dev/null
+  done
+  while [[ -n $(fanout_pids) ]] && ((waited < 50)); do
+    sleep 0.1
+    ((waited++))
+  done
+  for pid in $(fanout_pids); do
+    kill -9 "$pid" 2>/dev/null
+  done
+
+  rm -f "$PID_FILE" "$FIFO"
+}
+
+# Asked of the processes rather than the pid file, so a fan-out that survived a crashed
+# start still reports as running -- it is holding the V4L2 device either way.
+camera_active() {
+  [[ -n $(fanout_pids) ]]
+}
+
+command -v ffmpeg >/dev/null || {
+  echo "ffmpeg is required" >&2
+  exit 1
+}
+
+ACTION=${1:-}
+shift || true
+
+case $ACTION in
+start)
+  BUNDLE=${1:-}
+  [[ -n $BUNDLE ]] || usage
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+    --device=*) DEVICE="${arg#*=}" ;;
+    --size=*) SIZE="${arg#*=}" ;;
+    --self-view=*) SELF_VIEW="${arg#*=}" ;;
+    --outside=*) OUTSIDE="${arg#*=}" ;;
+    --fps=*) FPS="${arg#*=}" ;;
+    *) usage ;;
+    esac
+  done
+  case $SIZE in
+  small | medium | large) ;;
+  *)
+    echo "Invalid webcam size: $SIZE (expected small, medium, or large)" >&2
+    exit 1
+    ;;
+  esac
+  start_camera "$BUNDLE"
+  ;;
+stop)
+  stop_camera
+  ;;
+status)
+  camera_active
+  ;;
+*)
+  usage
+  ;;
+esac

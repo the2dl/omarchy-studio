@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+
+# omarchy:summary=Send a command to a running gpu-screen-recorder over its IPC socket
+# omarchy:group=capture
+# omarchy:args=<socket> <request> [--data <json>] [--timeout <seconds>]
+# omarchy:examples=omarchy-studio-ipc /run/user/1000/omarchy-studio-gsr.sock stop
+# omarchy:hidden=true
+#
+# Python rather than bash because bash cannot open a unix socket, and socat -- the
+# obvious substitute, and what gsr's own man page suggests -- sends the request and then
+# silently swallows the reply. The reply is the whole point here: `stop` is answered
+# only once the file is finalized (136ms after a 6s recording), so it is the completion
+# signal, and its data field carries the path that was written.
+#
+# Prints the reply's data field on success, exits 1 with the error text on an error
+# reply, 2 when the socket cannot be reached, 3 on timeout.
+
+import json
+import socket
+import sys
+import time
+
+USAGE = "usage: omarchy-studio-ipc <socket> <request> [--data <json>] [--timeout <seconds>]"
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    sock_path, name = argv[0], argv[1]
+    data = None
+    timeout = 15.0
+
+    rest = argv[2:]
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--data" and rest:
+            data = json.loads(rest.pop(0))
+        elif flag == "--timeout" and rest:
+            timeout = float(rest.pop(0))
+        else:
+            print(f"{USAGE}\nunexpected argument: {flag}", file=sys.stderr)
+            return 2
+
+    request = {"id": 1, "name": name}
+    if data is not None:
+        request["data"] = data
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_path)
+    except OSError as e:
+        print(f"cannot reach {sock_path}: {e}", file=sys.stderr)
+        return 2
+
+    started = time.monotonic()
+    try:
+        s.sendall(json.dumps(request).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                print(f"gpu-screen-recorder closed the socket after "
+                      f"{time.monotonic() - started:.2f}s", file=sys.stderr)
+                return 2
+            buf += chunk
+    except socket.timeout:
+        print(f"no reply to {name!r} within {timeout:.1f}s", file=sys.stderr)
+        return 3
+    finally:
+        s.close()
+
+    reply = json.loads(buf.split(b"\n", 1)[0].decode())
+    if reply.get("result") != "ok":
+        print(f"{name}: {reply.get('data', 'error')}", file=sys.stderr)
+        return 1
+    if reply.get("data") is not None:
+        print(reply["data"] if isinstance(reply["data"], str) else json.dumps(reply["data"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

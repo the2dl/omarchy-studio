@@ -1,0 +1,1103 @@
+"""The editor's only route to the model, and the only place placement maths happens.
+
+The QML editor is a pure view. It owns no model state and computes no placement: it
+POSTs an intent in canvas pixels ("the webcam box is now at 1180,760 300x300") and gets
+back the whole resolved state, in which every number came from geometry.py. That is the
+entire reason the preview is trustworthy -- a second implementation of `resolve()` in
+JavaScript would drift, and the drift is invisible until someone diffs rendered frames.
+
+The transport is a loopback HTTP server rather than a file dump because the editor needs
+the round trip live, on every drag frame. Measured from QML: 100 sequential
+XMLHttpRequest round trips in 27ms (0.27ms each), which is two orders of magnitude under
+a 60Hz frame, so there is no reason to cache or batch and no reason to let QML guess.
+
+A token is required on every request. The socket is bound to 127.0.0.1, but any local
+process can reach a loopback port, and this one rewrites the user's project.
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Callable
+
+from .geometry import Canvas, Placement, Rect, Zoom, qml_blur
+from .project import Bundle, Layer, ProjectError
+from .timebase import FrameRange, Timebase, normalize
+
+# The one font file both engines use. Naming a family instead lets fontconfig hand Qt
+# and libavfilter different faces, and the metrics diverge before the glyphs visibly do.
+FONT_FILE = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"
+
+# A zoom track longer than this is a runaway click log, not a project; the preview would
+# ship megabytes of JSON per state refresh for no visible gain.
+_MAX_ZOOM_SAMPLES = 200_000
+
+
+class BridgeError(RuntimeError):
+    pass
+
+
+# --- resolution: geometry.py in, JSON out -----------------------------------
+
+
+def resolve_placement(place: Placement, canvas: Canvas) -> dict:
+    """Explicit x/y/width/height for one QML Item.
+
+    Named `rect` rather than spread into the reply so QML can never accidentally bind a
+    stray `anchors.fill` alongside it: the values arrive as one object that is applied
+    wholesale.
+    """
+    return {"rect": place.to_qml(canvas)}
+
+
+def placement_from_rect(
+    x: float, y: float, w: float, h: float, canvas: Canvas, anchor: str = "top-left"
+) -> Placement:
+    """The inverse of Placement.resolve: canvas pixels back to normalized 0..1.
+
+    QML hands back pixels because that is what a drag produces, and this is the only
+    conversion that exists -- dividing by the canvas in JavaScript would be a second
+    implementation of the same mapping.
+    """
+    clamped = Rect(x, y, w, h).clamped_to(canvas)
+    nx, ny = clamped.x / canvas.width, clamped.y / canvas.height
+    nw, nh = clamped.w / canvas.width, clamped.h / canvas.height
+    if anchor == "center":
+        nx += nw / 2.0
+        ny += nh / 2.0
+    return Placement(nx, ny, nw, nh, anchor)
+
+
+def resolve_zoom(zoom: Zoom, canvas: Canvas) -> dict:
+    """Scale plus the translation that puts the viewport origin at the item's (0,0).
+
+    transformOrigin is carried in the payload and applied in QML rather than assumed,
+    because any other origin makes the translation depend on the item's size -- which is
+    exactly the bug that produces a zoom that scales but never pans.
+    """
+    d = zoom.to_qml(canvas)
+    vp = zoom.viewport(canvas)
+    d["viewport"] = {"x": vp.x, "y": vp.y, "width": vp.w, "height": vp.h}
+    return d
+
+
+def resolve_layer(layer: Layer, canvas: Canvas, bundle: Bundle) -> dict:
+    """One project layer as the properties of one QML Item.
+
+    Unknown types survive the round trip (`project.Layer` keeps them) and are marked
+    unsupported here rather than dropped, so a project written by a newer build shows a
+    placeholder instead of silently losing an annotation.
+    """
+    d: dict[str, Any] = {
+        "id": layer.id,
+        "type": layer.type,
+        "z": layer.z,
+        "opacity": layer.opacity,
+        "fade_frames": layer.fade_frames,
+        "enabled": layer.enabled,
+        "t": layer.t.to_dict() if layer.t else None,
+        "props": dict(layer.props),
+        "supported": layer.type in ("image", "text", "shape", "blur", "pixelate"),
+    }
+    d.update(resolve_placement(layer.placement, canvas))
+    if layer.type == "image":
+        name = layer.props.get("asset", "")
+        path = bundle.assets_dir / name if name else None
+        d["source"] = path.as_uri() if path and path.exists() else ""
+    elif layer.type == "text":
+        # Centre-anchored: left-anchored text drifted ~7% of the string width between
+        # Qt's shaper and libavfilter's drawtext even on the same font file.
+        r = layer.placement.resolve(canvas)
+        d["text"] = {
+            "text": layer.props.get("text", ""),
+            "cx": r.x + r.w / 2.0,
+            "cy": r.y + r.h / 2.0,
+            "pixelSize": int(layer.props.get("font_px", max(16, int(canvas.height * 0.045)))),
+            "color": layer.props.get("color", "#ffffff"),
+            "box_color": layer.props.get("box_color", "#101820"),
+            "box_opacity": float(layer.props.get("box_opacity", 0.85)),
+            "radius": float(layer.props.get("radius", 0.012)) * canvas.width,
+            "font_file": FONT_FILE,
+        }
+    elif layer.type == "shape":
+        d["shape"] = {
+            "color": layer.props.get("color", "#ff3b30"),
+            "radius": float(layer.props.get("radius", 0.008)) * canvas.width,
+        }
+    elif layer.type == "blur":
+        d["blur"] = qml_blur(float(layer.props.get("strength", 0.6)))
+    elif layer.type == "pixelate":
+        # Block size is normalized like every other dimension so a project authored on
+        # the 1080p proxy pixelates identically on the master.
+        d["pixelate"] = {"block": max(2.0, float(layer.props.get("block", 0.012)) * canvas.width)}
+    return d
+
+
+def resolve_backdrop(bundle: Bundle) -> dict:
+    """The inset the screen video sits in when a backdrop is on.
+
+    Padding is normalized like every other dimension, and the inset is resolved through
+    Placement so the preview's rounded corner lands where the export's mask does.
+    """
+    b = bundle.edit.backdrop
+    canvas = bundle.canvas
+    # Padding and corner radius are both measured against the SHORT side, and the inset
+    # is centred -- render._backdrop does `pad = padding * min(W,H)` on both axes, so
+    # resolving the padding per-axis would give a preview with the wrong margins on the
+    # long one.
+    short = min(canvas.width, canvas.height)
+    pad = min(max(b.padding, 0.0), 0.45) * short
+    place = Placement(
+        pad / canvas.width,
+        pad / canvas.height,
+        (canvas.width - 2 * pad) / canvas.width,
+        (canvas.height - 2 * pad) / canvas.height,
+    )
+    d = resolve_placement(place, canvas)
+    r = place.resolve(canvas)
+    d.update(
+        {
+            "enabled": b.enabled,
+            "color": b.color,
+            "gradient": b.gradient,
+            "shadow": b.shadow,
+            "padding": b.padding,
+            "radius": b.corner_radius * short,
+            # The export scales the whole zoomed canvas into the inset; the preview needs
+            # the same two factors rather than deriving them from the rect itself.
+            "content_scale": {
+                "x": r.w / canvas.width,
+                "y": r.h / canvas.height,
+            },
+        }
+    )
+    return d
+
+
+def resolve_webcam(bundle: Bundle) -> dict:
+    """The camera overlay box, plus why the controls may be dead.
+
+    A burned-in recording genuinely cannot have its webcam moved. The editor disables the
+    controls and shows this reason; silently inert controls read as a bug.
+    """
+    cam = bundle.edit.webcam
+    canvas = bundle.canvas
+    place = Placement(cam.x, cam.y, cam.w, cam.h, "top-left")
+    d = resolve_placement(place, canvas)
+    r = place.resolve(canvas)
+    d.update(
+        {
+            "enabled": cam.enabled,
+            "shape": cam.shape,
+            "mirror": cam.mirror,
+            # Only meaningful for `rounded`. A circle is the ellipse inscribed in the
+            # tile -- that is what layers._circle_mask draws -- and the preview builds it
+            # by scaling a round rectangle, not from a radius.
+            "radius": cam.corner_radius * min(r.w, r.h) if cam.shape == "rounded" else 0.0,
+            "corner_radius": cam.corner_radius,
+        }
+    )
+    if bundle.capture.camera_burned_in:
+        d["editable"] = False
+        d["disabled_reason"] = (
+            "This recording was made with the camera burned into the screen pixels, so "
+            "the webcam is part of the video and cannot be moved, resized or removed. "
+            "Record with a separate camera stream to keep it editable."
+        )
+    elif bundle.capture.camera is None:
+        d["editable"] = False
+        d["disabled_reason"] = "This recording has no camera stream."
+    else:
+        d["editable"] = True
+        d["disabled_reason"] = ""
+    return d
+
+
+# --- events ------------------------------------------------------------------
+
+
+def _geom(d: dict, key_w: str = "w", key_h: str = "h") -> tuple[float, float, float, float]:
+    return (
+        float(d.get("x", 0)),
+        float(d.get("y", 0)),
+        float(d.get(key_w, d.get("width", 0))),
+        float(d.get(key_h, d.get("height", 0))),
+    )
+
+
+def click_events(bundle: Bundle) -> list[dict]:
+    """Clicks from events/input.jsonl as frame indices and normalized focal points.
+
+    Two conversions, both of which have bitten someone:
+
+    * `t` is CLOCK_MONOTONIC seconds and the screen stream's anchor is CLOCK_MONOTONIC
+      microseconds of frame 0, so the difference -- plus the compositor-to-capture
+      latency -- is what indexes the frame grid.
+    * event coordinates are LOGICAL compositor pixels and the video is PHYSICAL, so they
+      are offset by the captured region's logical origin and scaled by monitor_scale. On
+      a scale-2 display `-w 1600x900+200+200` yields a 3200x1800 video.
+    """
+    path = bundle.events_dir / "input.jsonl"
+    if not path.exists():
+        return []
+    cap = bundle.capture
+    screen = cap.screen
+    if screen is None:
+        return []
+    tb = Timebase(screen.fps_num, screen.fps_den)
+    anchor_s = (screen.anchor_us or 0) / 1e6
+    lx, ly, _, _ = _geom(cap.logical_geometry)
+    scale = cap.monitor_scale or 1.0
+    cw, ch = screen.width, screen.height
+    out: list[dict] = []
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # a truncated tail is normal if the recorder was killed
+        if rec.get("type") != "click":
+            continue
+        rel = float(rec.get("t", 0.0)) - anchor_s + cap.calibration_c_ms / 1000.0
+        if rel < 0:
+            continue  # clicked before frame 0 existed
+        frame = tb.to_frame(rel)
+        px = (float(rec.get("x", 0)) - lx) * scale
+        py = (float(rec.get("y", 0)) - ly) * scale
+        out.append(
+            {
+                "frame": frame,
+                "button": rec.get("button", "left"),
+                "cx": min(max(px / cw, 0.0), 1.0),
+                "cy": min(max(py / ch, 0.0), 1.0),
+            }
+        )
+    out.sort(key=lambda c: c["frame"])
+    return out
+
+
+def _smootherstep(u: float) -> float:
+    """The same quintic the export's zoom envelope uses. C2 at both ends, so a zoom that
+    starts on a click does not visibly kick."""
+    u = 0.0 if u < 0.0 else 1.0 if u > 1.0 else u
+    return u * u * u * (u * (u * 6.0 - 15.0) + 10.0)
+
+
+@dataclass(frozen=True)
+class ZoomEvent:
+    """One merged zoom gesture on the source timeline."""
+
+    start: int  # frame the ease-in begins
+    hold_end: int  # frame the ease-out begins
+    cx: float
+    cy: float
+
+
+def zoom_events(bundle: Bundle, clicks: list[dict] | None = None) -> list[ZoomEvent]:
+    """Merge the click track into zoom gestures.
+
+    Clicks closer together than merge_gap_frames become ONE gesture at the first click's
+    frame, holding until the last one has had its hold, focussed on their mean. Zooming
+    per click instead pumps the frame on any double-click.
+    """
+    z = bundle.edit.zoom
+    if not z.enabled:
+        return []
+    cl = click_events(bundle) if clicks is None else clicks
+    if not cl:
+        return []
+    groups: list[list[dict]] = [[cl[0]]]
+    for c in cl[1:]:
+        if c["frame"] - groups[-1][-1]["frame"] <= z.merge_gap_frames:
+            groups[-1].append(c)
+        else:
+            groups.append([c])
+    out = []
+    for g in groups:
+        cx = sum(c["cx"] for c in g) / len(g)
+        cy = sum(c["cy"] for c in g) / len(g)
+        out.append(ZoomEvent(g[0]["frame"], g[-1]["frame"] + z.hold_frames, cx, cy))
+    return out
+
+
+def zoom_track(bundle: Bundle) -> dict:
+    """Per-frame resolved zoom, as parallel arrays.
+
+    Sampled rather than described because the alternative is QML re-implementing the
+    easing, which is the one thing that must not diverge from the export. Only frames
+    where the zoom is not identity are emitted; the preview holds identity elsewhere.
+    """
+    canvas = bundle.canvas
+    total = _safe_source_frames(bundle)
+    events = zoom_events(bundle)
+    amount = bundle.edit.zoom.amount
+    ease = max(1, bundle.edit.zoom.ease_frames)
+    frames: list[int] = []
+    scales: list[float] = []
+    xs: list[float] = []
+    ys: list[float] = []
+    for ev in events:
+        first, last = ev.start, ev.hold_end + ease
+        if total:
+            last = min(last, total)
+        for f in range(first, last):
+            if f < ev.start + ease:
+                env = _smootherstep((f - ev.start) / ease)
+            elif f < ev.hold_end:
+                env = 1.0
+            else:
+                env = 1.0 - _smootherstep((f - ev.hold_end) / ease)
+            scale = 1.0 + (amount - 1.0) * env
+            if scale <= 1.0 + 1e-9:
+                continue
+            q = Zoom(scale, ev.cx, ev.cy).to_qml(canvas)
+            if frames and f == frames[-1]:
+                continue  # two gestures overlapping: the earlier one already placed it
+            frames.append(f)
+            scales.append(q["scale"])
+            xs.append(q["x"])
+            ys.append(q["y"])
+            if len(frames) >= _MAX_ZOOM_SAMPLES:
+                break
+        if len(frames) >= _MAX_ZOOM_SAMPLES:
+            break
+    return {"frames": frames, "scale": scales, "x": xs, "y": ys}
+
+
+# --- the state dump ----------------------------------------------------------
+
+
+def _safe_source_frames(bundle: Bundle) -> int:
+    """Frame count, or 0 when the media is unreadable.
+
+    The editor must still open on a bundle whose media is missing -- it is the only place
+    that can tell the user why -- so this degrades instead of raising.
+    """
+    try:
+        return bundle.source_frames()
+    except Exception:
+        return 0
+
+
+def _media_entry(path: Path | None, proxy: Path | None) -> dict | None:
+    """The proxy, or no URL at all.
+
+    Never the master: seeking the 5K master took 517-651ms and half the seeks never
+    delivered a frame, so a preview that silently falls back to it looks broken rather
+    than slow. Until the proxy exists the entry carries an empty url and the editor
+    shows the proxy build instead of loading anything.
+    """
+    if path is None and proxy is None:
+        return None
+    ready = bool(proxy and proxy.exists())
+    if not ready and (path is None or not path.exists()):
+        return None
+    return {
+        "url": proxy.as_uri() if ready and proxy else "",
+        "master": str(path) if path else "",
+        "ready": ready,
+    }
+
+
+def project_state(
+    bundle: Bundle,
+    *,
+    proxy: dict | None = None,
+    export: dict | None = None,
+    include_zoom_track: bool = True,
+) -> dict:
+    """Everything the editor draws, resolved. This is the only shape QML consumes.
+
+    `include_zoom_track` exists because a drag POSTs an intent per frame and the track
+    can run to tens of thousands of samples: re-serializing it 60 times a second would
+    make the drag stutter for a value that only zoom settings and the click log change.
+    Omitting the key means "unchanged", and the editor keeps the copy it has.
+    """
+    canvas = bundle.canvas
+    tb = bundle.timebase
+    total = _safe_source_frames(bundle)
+    screen = bundle.capture.screen
+    camera = bundle.capture.camera
+    ms_per_frame = 1000.0 * tb.fps_den / tb.fps_num
+    layers = sorted(bundle.edit.layers, key=lambda l: l.z)
+    state = {
+        "bundle": str(bundle.root),
+        "name": bundle.root.name,
+        "canvas": {"width": canvas.width, "height": canvas.height},
+        "timebase": {
+            "fps_num": tb.fps_num,
+            "fps_den": tb.fps_den,
+            "fps": tb.fps,
+            # QML converts frames to player milliseconds with this, and never the other
+            # way: every frame index that enters the model is computed by Timebase, so a
+            # rounding difference in JavaScript can only affect what is displayed.
+            "ms_per_frame": ms_per_frame,
+        },
+        "source_frames": total,
+        "duration_ms": total * ms_per_frame,
+        "capture": {
+            "camera_burned_in": bundle.capture.camera_burned_in,
+            "has_camera": camera is not None,
+            "monitor_scale": bundle.capture.monitor_scale,
+            "monitor_name": bundle.capture.monitor_name,
+            "created": bundle.capture.created,
+        },
+        "media": {
+            "screen": _media_entry(
+                bundle.media(Path(screen.path).name) if screen else None,
+                proxy_path(bundle, "screen"),
+            ),
+            "camera": _media_entry(
+                bundle.media(Path(camera.path).name) if camera else None,
+                proxy_path(bundle, "camera"),
+            ),
+            # Signed, and read per recording: the offset between two files is launch
+            # order plus per-pipeline warm-up, not a constant.
+            "camera_offset_ms": bundle.camera_offset_frames() * ms_per_frame,
+        },
+        "edit": bundle.edit.to_dict(),
+        "webcam": resolve_webcam(bundle),
+        "backdrop": resolve_backdrop(bundle),
+        "layers": [resolve_layer(l, canvas, bundle) for l in layers],
+        "clicks": click_events(bundle),
+        "cuts": [c.to_dict() for c in normalize(bundle.edit.cuts)],
+        "font_file": FONT_FILE,
+        "proxy": proxy or {"state": "unknown", "progress": 0.0, "message": ""},
+        "export": export or {"state": "idle", "progress": 0.0, "message": ""},
+    }
+    if include_zoom_track:
+        state["zoom_track"] = zoom_track(bundle)
+    return state
+
+
+# --- intents: every model mutation lives here --------------------------------
+
+
+def _new_id(edit_layers: list[Layer], kind: str) -> str:
+    n = 1
+    used = {l.id for l in edit_layers}
+    while f"{kind}{n}" in used:
+        n += 1
+    return f"{kind}{n}"
+
+
+def _range_from_ms(tb: Timebase, start_ms: Any, end_ms: Any) -> FrameRange | None:
+    """Milliseconds from the UI onto the frame grid.
+
+    Timebase.to_frame is the only sanctioned seconds -> frame path, so every boundary the
+    editor creates is snapped by construction rather than by a later fixup.
+    """
+    if start_ms is None or end_ms is None:
+        return None
+    a = tb.to_frame(max(0.0, float(start_ms)) / 1000.0)
+    b = tb.to_frame(max(0.0, float(end_ms)) / 1000.0)
+    if b <= a:
+        b = a + 1  # a zero-length drag is a click; give it one frame rather than raising
+    return FrameRange(a, b)
+
+
+def apply_op(bundle: Bundle, op: str, args: dict) -> None:
+    """Mutate the in-memory Edit. Nothing here touches the disk; /save does that."""
+    edit = bundle.edit
+    canvas = bundle.canvas
+    tb = bundle.timebase
+
+    def rect_arg() -> Placement:
+        x, y, w, h = _geom(args["rect"], "width", "height")
+        return placement_from_rect(x, y, w, h, canvas, args.get("anchor", "top-left"))
+
+    if op == "set_webcam":
+        if bundle.capture.camera_burned_in:
+            raise BridgeError("the camera is burned into this recording and cannot be edited")
+        cam = edit.webcam
+        if "rect" in args:
+            p = rect_arg()
+            cam.x, cam.y, cam.w, cam.h = p.x, p.y, p.w, p.h
+        for key in ("enabled", "mirror"):
+            if key in args:
+                setattr(cam, key, bool(args[key]))
+        if "shape" in args:
+            if args["shape"] not in ("circle", "rounded", "rect"):
+                raise BridgeError(f"unknown webcam shape {args['shape']!r}")
+            cam.shape = args["shape"]
+        if "corner_radius" in args:
+            cam.corner_radius = float(args["corner_radius"])
+
+    elif op == "set_zoom":
+        z = edit.zoom
+        if "enabled" in args:
+            z.enabled = bool(args["enabled"])
+        if "amount" in args:
+            # Below 1.0 Zoom refuses to construct; clamp here so a slider cannot throw.
+            z.amount = max(1.0, float(args["amount"]))
+        for key, ms in (("hold_frames", "hold_ms"), ("ease_frames", "ease_ms"), ("merge_gap_frames", "merge_gap_ms")):
+            if ms in args:
+                setattr(z, key, max(1, tb.to_frame(float(args[ms]) / 1000.0)))
+
+    elif op == "set_backdrop":
+        b = edit.backdrop
+        for key in ("enabled", "shadow"):
+            if key in args:
+                setattr(b, key, bool(args[key]))
+        for key in ("padding", "corner_radius"):
+            if key in args:
+                setattr(b, key, float(args[key]))
+        if "color" in args:
+            b.color = str(args["color"])
+
+    elif op == "add_image":
+        src = Path(args["path"])
+        if not src.exists():
+            raise BridgeError(f"no such image {src}")
+        name = bundle.add_asset(src)
+        p = rect_arg() if "rect" in args else Placement(0.35, 0.35, 0.3, 0.3)
+        edit.layers.append(
+            Layer(
+                id=_new_id(edit.layers, "image"),
+                type="image",
+                x=p.x, y=p.y, w=p.w, h=p.h, anchor=p.anchor,
+                z=_next_z(edit.layers),
+                props={"asset": name},
+            )
+        )
+
+    elif op in ("add_blur", "add_pixelate", "add_text", "add_shape"):
+        kind = op[4:]
+        p = rect_arg()
+        props: dict[str, Any] = {}
+        if kind == "blur":
+            props["strength"] = float(args.get("strength", 0.6))
+        elif kind == "pixelate":
+            props["block"] = float(args.get("block", 0.012))
+        elif kind == "text":
+            props["text"] = str(args.get("text", "Text"))
+        edit.layers.append(
+            Layer(
+                id=_new_id(edit.layers, kind),
+                type=kind,
+                x=p.x, y=p.y, w=p.w, h=p.h, anchor=p.anchor,
+                z=_next_z(edit.layers),
+                props=props,
+            )
+        )
+
+    elif op == "update_layer":
+        layer = _find_layer(edit.layers, args["id"])
+        if "rect" in args:
+            p = rect_arg()
+            layer.x, layer.y, layer.w, layer.h, layer.anchor = p.x, p.y, p.w, p.h, p.anchor
+        if "opacity" in args:
+            layer.opacity = min(1.0, max(0.0, float(args["opacity"])))
+        if "enabled" in args:
+            layer.enabled = bool(args["enabled"])
+        if "z" in args:
+            layer.z = int(args["z"])
+        if "props" in args:
+            layer.props.update(args["props"])
+        if "start_ms" in args or "end_ms" in args:
+            layer.t = _range_from_ms(tb, args.get("start_ms"), args.get("end_ms"))
+
+    elif op == "delete_layer":
+        edit.layers.remove(_find_layer(edit.layers, args["id"]))
+
+    elif op == "add_cut":
+        r = _range_from_ms(tb, args["start_ms"], args["end_ms"])
+        assert r is not None
+        total = _safe_source_frames(bundle)
+        if total:
+            r = FrameRange(min(r.start, total - 1), min(r.end, total))
+        # Merging on insert is what keeps generated gates small: a layer spanning ~30
+        # separate output intervals approaches ffmpeg's 100-term expression budget.
+        edit.cuts = normalize(edit.cuts + [r])
+
+    elif op == "delete_cut":
+        i = int(args["index"])
+        cuts = normalize(edit.cuts)
+        if not 0 <= i < len(cuts):
+            raise BridgeError(f"no cut at index {i}")
+        del cuts[i]
+        edit.cuts = cuts
+
+    elif op == "set_audio":
+        edit.normalize_audio = bool(args["normalize_audio"])
+
+    elif op == "reset":
+        bundle.reset_edit()
+
+    else:
+        raise BridgeError(f"unknown op {op!r}")
+
+
+def _next_z(layers: list[Layer]) -> int:
+    return (max((l.z for l in layers), default=0) + 1) if layers else 1
+
+
+def _find_layer(layers: list[Layer], layer_id: str) -> Layer:
+    for l in layers:
+        if l.id == layer_id:
+            return l
+    raise BridgeError(f"no layer {layer_id!r}")
+
+
+# --- proxy -------------------------------------------------------------------
+
+# Short GOP, no B-frames: this is what makes every seek land in 15-53ms instead of the
+# master's 517-651ms with half the seeks delivering no frame at all. Used only by the
+# fallback below; omarchy_studio.proxy owns the real one.
+_PROXY_ARGS = [
+    "-vf", "scale='min(1920,iw)':-2:flags=bicubic",
+    "-c:v", "libx264", "-preset", "veryfast", "-b:v", "10M",
+    "-g", "15", "-bf", "0", "-pix_fmt", "yuv420p",
+]
+
+
+def proxy_path(bundle: Bundle, stream: str) -> Path:
+    """Where a stream's preview proxy lives.
+
+    The name is omarchy_studio.proxy's, because that module is the one that generates it
+    and the editor must look for the file that actually gets written.
+    """
+    return bundle.proxy_dir / f"{stream}-proxy.mp4"
+
+
+class ProxyBuilder:
+    """Builds the preview proxies in the background, one stream at a time.
+
+    Delegates to omarchy_studio.proxy.ensure_proxy. The fallback transcode exists because
+    a proxy failure must not take the editor with it: without a proxy there is nothing to
+    play at all, and playing the master instead is not an option -- half its seeks never
+    deliver a frame.
+    """
+
+    def __init__(self, bundle: Bundle) -> None:
+        self.bundle = bundle
+        self.status: dict = {"state": "idle", "progress": 0.0, "message": ""}
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._procs: list[subprocess.Popen] = []
+        self.on_change: Callable[[dict], None] | None = None
+
+    def _set(self, **kw: Any) -> None:
+        with self._lock:
+            self.status.update(kw)
+            snapshot = dict(self.status)
+        if self.on_change:
+            self.on_change(snapshot)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="proxy", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        for p in self._procs:
+            if p.poll() is None:
+                p.terminate()
+
+    def _jobs(self) -> list[str]:
+        out = []
+        for name in ("screen", "camera"):
+            stream = getattr(self.bundle.capture, name, None)
+            if stream is not None and self.bundle.media(Path(stream.path).name).exists():
+                out.append(name)
+        return out
+
+    def _run(self) -> None:
+        jobs = self._jobs()
+        if not jobs:
+            self._set(state="error", progress=0.0, message="this bundle has no media to preview")
+            return
+        problems = []
+        for i, name in enumerate(jobs):
+            self._set(
+                state="building",
+                progress=i / len(jobs),
+                message=f"preview proxy: {name} ({i + 1}/{len(jobs)})",
+            )
+            if proxy_path(self.bundle, name).exists():
+                continue
+            try:
+                if not self._delegate(name):
+                    self._transcode(name, i, len(jobs))
+            except Exception as e:
+                problems.append(f"{name}: {e}")
+                try:
+                    self._transcode(name, i, len(jobs))
+                except Exception as e2:
+                    self._set(state="error", message=f"{name}: {e2}"[:400])
+                    return
+        ready = all(proxy_path(self.bundle, n).exists() for n in jobs)
+        self._set(
+            state="ready" if ready else "error",
+            progress=1.0 if ready else 0.0,
+            # A delegate failure that the fallback covered is still worth surfacing:
+            # the shared module is what the rest of the system uses.
+            message="; ".join(problems)[:400],
+        )
+
+    def _delegate(self, stream: str) -> bool:
+        try:
+            from . import proxy as proxy_mod
+        except ImportError:
+            return False
+        fn = getattr(proxy_mod, "ensure_proxy", None)
+        if fn is None:
+            return False
+        params = inspect.signature(fn).parameters
+        kwargs: dict[str, Any] = {}
+        if "stream" in params:
+            kwargs["stream"] = stream
+        elif stream != "screen":
+            return False  # the module only knows how to proxy the screen
+        if "progress" in params:
+            kwargs["progress"] = lambda frac, msg="": self._set(
+                state="building", progress=float(frac), message=str(msg)
+            )
+        dest = Path(fn(self.bundle, **kwargs))
+        return dest.exists()
+
+    def _transcode(self, stream: str, i: int, n: int) -> None:
+        from .probe import frame_count
+
+        src = self.bundle.media(Path(getattr(self.bundle.capture, stream).path).name)
+        dst = proxy_path(self.bundle, stream)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            total = frame_count(src)
+        except Exception:
+            total = 0
+        tmp = dst.with_name(dst.stem + ".part.mp4")
+        cmd = ["ffmpeg", "-y", "-nostdin", "-i", str(src), *_PROXY_ARGS,
+               "-c:a", "copy", "-progress", "pipe:1", "-loglevel", "error", str(tmp)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self._procs.append(p)
+        assert p.stdout is not None
+        for line in p.stdout:
+            if line.startswith("frame=") and total:
+                done = int(line.split("=", 1)[1] or 0)
+                self._set(
+                    state="building",
+                    progress=(i + min(1.0, done / total)) / n,
+                    message=f"preview proxy: {stream} ({i + 1}/{n})",
+                )
+        p.wait()
+        if p.returncode != 0:
+            err = (p.stderr.read() if p.stderr else "").strip()[-300:]
+            tmp.unlink(missing_ok=True)
+            raise BridgeError(f"proxy transcode failed: {err}")
+        # Replace only on success: a half-written proxy that looks complete would be
+        # reused and the editor would preview a truncated recording.
+        tmp.replace(dst)
+
+
+# --- export ------------------------------------------------------------------
+
+_PROGRESS_RE = re.compile(r"^(frame|total|progress)=(.*)$")
+
+# The renderer runs in a child process rather than a thread. render.render() blocks on
+# an ffmpeg it does not expose, so a thread could not be cancelled and a wedged export
+# would take the editor with it; a child in its own session can be killed as a group,
+# which reaches the ffmpeg underneath.
+_RUNNER = """
+import importlib, sys
+from pathlib import Path
+from omarchy_studio.project import Bundle
+
+mod = importlib.import_module(sys.argv[1])
+bundle = Bundle(Path(sys.argv[2]))
+out = Path(sys.argv[3])
+
+def progress(done, total):
+    print("total=%d" % total, flush=True)
+    print("frame=%d" % done, flush=True)
+
+mod.render(bundle, out, progress=progress)
+print("progress=end", flush=True)
+"""
+
+
+class Exporter:
+    """Runs the renderer and turns its progress callback into a fraction for the UI.
+
+    Anything the child prints that is not a progress line is kept as the status message,
+    so a renderer failure shows up in the window instead of only in a terminal nobody is
+    watching.
+    """
+
+    MODULE = "omarchy_studio.render"
+
+    def __init__(self, bundle: Bundle, repo_root: Path) -> None:
+        self.bundle = bundle
+        self.repo_root = repo_root
+        self.status: dict = {"state": "idle", "progress": 0.0, "message": "", "output": ""}
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+
+    def _set(self, **kw: Any) -> None:
+        with self._lock:
+            self.status.update(kw)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self.status)
+
+    def start(self, output: str | None = None) -> dict:
+        if self._proc and self._proc.poll() is None:
+            raise BridgeError("an export is already running")
+        out = Path(output) if output else self.bundle.root / f"{self.bundle.root.name}.mp4"
+        self._set(state="running", progress=0.0, message="starting renderer", output=str(out))
+        argv = [sys.executable, "-c", _RUNNER, self.MODULE, str(self.bundle.root), str(out)]
+        try:
+            self._proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=_child_env(self.repo_root),
+                cwd=str(self.repo_root),
+                start_new_session=True,
+            )
+        except OSError as e:
+            self._set(state="error", message=str(e))
+            return self.snapshot()
+        threading.Thread(target=self._pump, args=(self._output_frames(),), daemon=True).start()
+        return self.snapshot()
+
+    def _output_frames(self) -> int:
+        """Expected output length, or 0 when the media cannot be probed. A fabricated
+        denominator would show a progress bar that finishes at the wrong moment, which
+        is worse than showing the frame number alone."""
+        try:
+            return max(1, self.bundle.cutmap().output_frames)
+        except Exception:
+            return 0
+
+    def cancel(self) -> None:
+        p = self._proc
+        if p and p.poll() is None:
+            self._set(state="cancelled", message="export cancelled")
+            # The whole session, so the ffmpeg the renderer spawned dies with its parent
+            # instead of running to completion on a file nobody wants.
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                p.terminate()
+
+    def _pump(self, total: int) -> None:
+        p = self._proc
+        assert p is not None and p.stdout is not None
+        for line in p.stdout:
+            line = line.strip()
+            m = _PROGRESS_RE.match(line)
+            if not m:
+                if line:
+                    self._set(message=line[:200])
+                continue
+            key, val = m.group(1), m.group(2)
+            if key == "total" and val.isdigit():
+                # The renderer knows the exact output length from the cut map; prefer it
+                # over the estimate made before the graph was built.
+                total = max(1, int(val))
+            elif key == "frame" and val.isdigit():
+                n = int(val)
+                if total:
+                    self._set(progress=min(1.0, n / total), message=f"frame {n}/{total}")
+                else:
+                    self._set(message=f"frame {n}")
+            elif key == "progress" and val == "end":
+                self._set(progress=1.0)
+        p.wait()
+        err = (p.stderr.read() if p.stderr else "").strip()
+        if self.snapshot()["state"] == "cancelled":
+            return
+        if p.returncode == 0:
+            self._set(state="done", progress=1.0, message=f"wrote {self.snapshot()['output']}")
+        else:
+            tail = [l for l in err.splitlines() if l.strip()][-3:]
+            self._set(state="error", message=" / ".join(tail) or f"renderer exited {p.returncode}")
+
+
+def _child_env(repo_root: Path) -> dict:
+    env = dict(os.environ)
+    lib = str(repo_root / "lib")
+    env["PYTHONPATH"] = lib + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    return env
+
+
+# --- the server --------------------------------------------------------------
+
+
+class Session:
+    """One open project: the bundle, the proxy build and the export, behind one lock.
+
+    Serialized because QML fires state-changing POSTs from drag handlers and a threaded
+    HTTP server would otherwise interleave two mutations of the same Edit.
+    """
+
+    def __init__(self, bundle: Bundle, repo_root: Path) -> None:
+        self.bundle = bundle
+        self.repo_root = repo_root
+        self.token = secrets.token_urlsafe(16)
+        self.lock = threading.RLock()
+        self.proxy = ProxyBuilder(bundle)
+        self.exporter = Exporter(bundle, repo_root)
+        self.dirty = False
+        self.quit_requested = threading.Event()
+
+    # Only these change the zoom track; every other op leaves it out of the reply so a
+    # drag does not re-serialize thousands of samples per second.
+    ZOOM_OPS = frozenset({"set_zoom", "reset"})
+
+    def state(self, *, include_zoom_track: bool = True) -> dict:
+        with self.lock:
+            s = project_state(
+                self.bundle,
+                proxy=dict(self.proxy.status),
+                export=self.exporter.snapshot(),
+                include_zoom_track=include_zoom_track,
+            )
+            s["dirty"] = self.dirty
+            return s
+
+    def op(self, name: str, args: dict) -> dict:
+        with self.lock:
+            apply_op(self.bundle, name, args)
+            self.dirty = True
+            return self.state(include_zoom_track=name in self.ZOOM_OPS)
+
+    def save(self) -> dict:
+        with self.lock:
+            self.bundle.save_edit()
+            self.dirty = False
+            return self.state()
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "omarchy-studio-bridge/1"
+
+    @property
+    def session(self) -> Session:
+        return self.server.session  # type: ignore[attr-defined]
+
+    def log_message(self, *args: Any) -> None:
+        pass  # the default logs every drag frame to stderr
+
+    def _authorized(self) -> bool:
+        tok = self.headers.get("X-Studio-Token", "")
+        if not tok and "?" in self.path:
+            tok = self.path.split("?", 1)[1].partition("token=")[2].partition("&")[0]
+        return secrets.compare_digest(tok, self.session.token)
+
+    def _send(self, obj: Any, code: int = 200) -> None:
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass  # QML abandoned an in-flight request; the next one carries the state
+
+    def _route(self) -> str:
+        return self.path.split("?", 1)[0].rstrip("/") or "/"
+
+    def do_GET(self) -> None:
+        if not self._authorized():
+            return self._send({"error": "bad token"}, 403)
+        r = self._route()
+        try:
+            if r in ("/", "/state"):
+                return self._send(self.session.state())
+            if r == "/export":
+                return self._send(self.session.exporter.snapshot())
+            if r == "/proxy":
+                return self._send(dict(self.session.proxy.status))
+        except Exception as e:
+            return self._send({"error": f"{type(e).__name__}: {e}"}, 500)
+        self._send({"error": "not found"}, 404)
+
+    def do_POST(self) -> None:
+        if not self._authorized():
+            return self._send({"error": "bad token"}, 403)
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError as e:
+            return self._send({"error": f"bad JSON: {e}"}, 400)
+        r = self._route()
+        try:
+            if r == "/op":
+                return self._send(self.session.op(body["op"], body.get("args", {})))
+            if r == "/save":
+                return self._send(self.session.save())
+            if r == "/export":
+                self.session.exporter.start(body.get("output"))
+                return self._send(self.session.exporter.snapshot())
+            if r == "/export/cancel":
+                self.session.exporter.cancel()
+                return self._send(self.session.exporter.snapshot())
+            if r == "/quit":
+                self.session.quit_requested.set()
+                return self._send({"ok": True})
+        except (BridgeError, ProjectError, KeyError, ValueError) as e:
+            # A rejected intent is normal (a cut past the end, a burned-in webcam); the
+            # editor shows the message and keeps the state it already has.
+            return self._send({"error": str(e), "state": self.session.state()}, 400)
+        except Exception as e:
+            return self._send({"error": f"{type(e).__name__}: {e}"}, 500)
+        self._send({"error": "not found"}, 404)
+
+
+def serve(session: Session, port: int = 0) -> ThreadingHTTPServer:
+    """Bind and start. Loopback only -- this endpoint rewrites the user's project."""
+    srv = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    srv.session = session  # type: ignore[attr-defined]
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, name="bridge", daemon=True).start()
+    return srv
+
+
+# --- CLI ---------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Resolve a bundle for the QML editor.")
+    ap.add_argument("bundle")
+    ap.add_argument("--serve", action="store_true", help="run the loopback bridge")
+    ap.add_argument("--port", type=int, default=0)
+    a = ap.parse_args(argv)
+    bundle = Bundle(Path(a.bundle))
+    repo_root = Path(__file__).resolve().parents[2]
+    if not a.serve:
+        print(json.dumps(project_state(bundle), indent=2))
+        return 0
+    session = Session(bundle, repo_root)
+    srv = serve(session, a.port)
+    print(json.dumps({"port": srv.server_port, "token": session.token}), flush=True)
+    session.proxy.start()
+    try:
+        while not session.quit_requested.wait(0.25):
+            pass
+    except KeyboardInterrupt:
+        pass
+    srv.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

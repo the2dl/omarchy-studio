@@ -228,6 +228,15 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
     tail = "format=yuv420p"
     if for_proxy and canvas.width > 1920:
         tail = "scale=1920:-2:flags=bicubic," + tail
+    elif not for_proxy:
+        # The export size, last thing before the encoder, so every stage above it -- the
+        # zoom especially -- composes at the master's full resolution and only the
+        # finished frame is resampled. lanczos rather than bicubic: this is the one
+        # downscale a viewer actually sees, and it is where text either stays crisp or
+        # does not.
+        out_h = export_height(bundle.edit.export_preset, canvas)
+        if out_h is not None:
+            tail = f"scale=-2:{out_h}:flags=lanczos," + tail
     g.add(f"{cur}{tail}[vout]")
 
     maps = ["-map", "[vout]"]
@@ -536,6 +545,25 @@ def _backdrop(
     # and the timebase. The other way round produced a 208-second file from a 6.9 s clip.
     g.add("[bg][content]overlay=x=0:y=0:shortest=1:format=auto[composited]")
     return "[composited]"
+
+
+# Heights for the names in project.EXPORT_PRESETS. `native` has no entry: it is the
+# absence of a downscale.
+EXPORT_HEIGHTS = {"1080p": 1080, "1440p": 1440, "4k": 2160}
+
+
+def export_height(preset: str, canvas: Canvas) -> int | None:
+    """The height to scale the finished frame to, or None to leave it at the canvas.
+
+    Never UPSCALES. A preset is a ceiling, not a target: asking for 1440p from a 1080p
+    capture has to give 1080p, because inventing pixels costs render time and file size
+    to make the picture no better. An unknown name is native for the same reason
+    Edit.from_dict falls back -- a bad string must not stop an export.
+    """
+    want = EXPORT_HEIGHTS.get(preset)
+    if want is None or want >= canvas.height:
+        return None
+    return want
 
 
 def _output_args(total_frames: int, has_audio: bool, *, for_proxy: bool) -> list[str]:

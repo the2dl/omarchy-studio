@@ -330,6 +330,22 @@ class BackdropSettings:
             self.background = backgrounds.CUSTOM
 
 
+# The export sizes, named by intent. Heights, because that is how the names read; the
+# width follows the canvas aspect. `native` is the capture's own grid.
+#
+# Capture now runs at the panel's native resolution (capture.capture_size), which for a
+# 5K panel means the master is 5120x2880 -- right for capture, wrong as a default for
+# EXPORT: h264 above 4096 is refused by a lot of players and upload targets, and the
+# encode is punishing. So the size is chosen here instead, and the master is never
+# touched. This is also why capturing native pays off even when exporting smaller: the
+# auto-zoom CROPS INTO the master, so a 1.8x zoom on a 5120-wide capture still has real
+# pixels where a 2560-wide one would be upscaling.
+EXPORT_PRESETS = ("1080p", "1440p", "4k", "native")
+# 1440p on this panel is exactly the logical desktop size, so text lands on the pixel
+# grid a viewer actually sees, it plays everywhere, and it renders in reasonable time.
+DEFAULT_EXPORT_PRESET = "1440p"
+
+
 @dataclass
 class Edit:
     """Everything the editor writes. Deleting this file resets to defaults."""
@@ -343,6 +359,12 @@ class Edit:
     cursor: CursorSettings = field(default_factory=CursorSettings)
     normalize_audio: bool = True
     trim_head_frames: int = 0
+    # Named by intent, resolved against the canvas at render time -- see
+    # render.EXPORT_HEIGHTS. Lives here rather than as a flag-only option so the editor
+    # and the CLI cannot disagree about what "export this" means, and so the choice
+    # survives closing the editor. Capture keeps every pixel; this is where the size is
+    # actually decided.
+    export_preset: str = DEFAULT_EXPORT_PRESET
 
     def to_dict(self) -> dict:
         return {
@@ -355,6 +377,7 @@ class Edit:
             "cursor": asdict(self.cursor),
             "normalize_audio": self.normalize_audio,
             "trim_head_frames": self.trim_head_frames,
+            "export_preset": self.export_preset,
         }
 
     @classmethod
@@ -374,6 +397,13 @@ class Edit:
             cursor=CursorSettings.from_dict(d.get("cursor", {})),
             normalize_audio=bool(d.get("normalize_audio", True)),
             trim_head_frames=int(d.get("trim_head_frames", 0)),
+            # An unknown name (an older bundle, a hand-edited file) falls back rather
+            # than raising: a bad preset must not make a recording unopenable.
+            export_preset=(
+                str(d.get("export_preset"))
+                if str(d.get("export_preset")) in EXPORT_PRESETS
+                else DEFAULT_EXPORT_PRESET
+            ),
         )
 
 

@@ -35,6 +35,7 @@ from . import cursor as _cursor_mod
 from . import events as _events
 from . import layers as _layers
 from . import zoom as _zoom
+from . import project as project_mod
 from .geometry import (DEFAULT_REDACT, Canvas, Placement, Rect, Zoom,
                        pixelate_block_px, qml_blur)
 from .project import (Bundle, CursorSettings, Edit, Layer, ProjectError,
@@ -511,6 +512,10 @@ def project_state(
         "bundle": str(bundle.root),
         "name": bundle.root.name,
         "canvas": {"width": canvas.width, "height": canvas.height},
+        # The export size lives in edit.json, so the pane reads it from state like every
+        # other setting rather than holding a copy that could drift from the file the
+        # renderer actually reads.
+        "export_preset": bundle.edit.export_preset,
         "timebase": {
             "fps_num": tb.fps_num,
             "fps_den": tb.fps_den,
@@ -821,6 +826,12 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             raise BridgeError(f"no cut at index {i}")
         del cuts[i]
         edit.cuts = cuts
+
+    elif op == "set_export":
+        want = str(args["export_preset"])
+        if want not in project_mod.EXPORT_PRESETS:
+            raise BridgeError(f"unknown export preset {want!r}")
+        edit.export_preset = want
 
     elif op == "set_audio":
         edit.normalize_audio = bool(args["normalize_audio"])

@@ -40,7 +40,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 
-from omarchy_studio import backgrounds, render  # noqa: E402
+from omarchy_studio import backgrounds, project, render  # noqa: E402
 from omarchy_studio.project import Bundle, ProjectError  # noqa: E402
 from omarchy_studio.render import RenderError  # noqa: E402
 from omarchy_studio.timebase import FrameRange, Timebase, TimebaseError, normalize  # noqa: E402
@@ -246,6 +246,9 @@ def apply_options(bundle: Bundle, args: argparse.Namespace) -> list[str]:
         cam.shape = args.webcam_shape
         applied.append(f"webcam.shape={cam.shape}")
 
+    if args.export is not None:
+        edit.export_preset = args.export
+        applied.append(f"export={args.export}")
     if args.zoom is not None:
         edit.zoom.enabled = args.zoom == "on"
         applied.append(f"zoom={args.zoom}")
@@ -344,6 +347,7 @@ def edit_summary(bundle: Bundle) -> dict:
         "backdrop": asdict(edit.backdrop),
         "layers": [{"id": l.id, "type": l.type, "enabled": l.enabled} for l in edit.layers],
         "normalize_audio": edit.normalize_audio,
+        "export_preset": edit.export_preset,
         "trim_head_frames": edit.trim_head_frames,
     }
 
@@ -420,6 +424,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--webcam-shape", metavar="SHAPE", help="circle|rounded|rect")
     ap.add_argument("--no-webcam", action="store_true", help="leave the camera out")
 
+    ap.add_argument("--export", metavar="SIZE", choices=project.EXPORT_PRESETS,
+                    help="export size: " + "|".join(project.EXPORT_PRESETS)
+                         + f" (default {project.DEFAULT_EXPORT_PRESET}; the capture is"
+                           " always kept at full resolution)")
     ap.add_argument("--zoom", choices=("on", "off"), help="auto-zoom from the click track")
     ap.add_argument("--zoom-amount", type=float, metavar="F", help="magnification, >= 1.0")
     ap.add_argument("--zoom-hold", type=float, metavar="SECONDS",

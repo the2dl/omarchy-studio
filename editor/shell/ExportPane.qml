@@ -5,8 +5,11 @@
 // What the mock shows and this pane does not draw, and why (the shared rule: dead
 // chrome reads as broken, so a control with no behaviour is left out):
 //   - MOV / GIF / WebM chips: render.py writes H.264 MP4 only, so MP4 is the one chip.
-//   - resolution / frame-rate dropdowns: the renderer exports at the master's own
-//     resolution and timebase, no override exists. The real values are shown as facts.
+//   - frame-rate dropdown: the renderer exports at the master's own timebase, no
+//     override exists, so it is shown as a fact.
+// Resolution used to be in that list. It is a real control now: capture runs at the
+// panel's native grid, so exporting at the master's size would mean a 5120x2880 h264 --
+// refused by many players, and a punishing encode. The size is chosen here instead.
 //   - quality slider + size estimate: CRF 20 is fixed in render._output_args and
 //     nothing measures a size ahead of the encode; the fixed setting is stated instead.
 // The report names the bridge/render additions that would make each of these live.
@@ -23,6 +26,22 @@ Item {
     readonly property var st: Bridge.state
     readonly property var ex: Bridge.exportStatus
     readonly property bool running: ex.state === "running"
+
+    // Labels and values, one list apart -- see the Segmented below.
+    readonly property var presetValues: ["1080p", "1440p", "4k", "native"]
+
+    // The height each preset resolves to, mirroring render.export_height: a preset is a
+    // CEILING, so anything at or above the canvas leaves it alone.
+    function resolvedLabel() {
+        if (!st.canvas)
+            return ""
+        var heights = { "1080p": 1080, "1440p": 1440, "4k": 2160 }
+        var want = heights[st.export_preset || "1440p"]
+        if (want === undefined || want >= st.canvas.height)
+            return "master size — " + st.canvas.width + "×" + st.canvas.height
+        var w = Math.round(st.canvas.width * want / st.canvas.height / 2) * 2
+        return w + "×" + want + "  from  " + st.canvas.width + "×" + st.canvas.height
+    }
 
     // "" means the renderer's own default: <bundle>/<name>.mp4.
     property string output: ""
@@ -153,34 +172,45 @@ Item {
                 }
             }
 
-            // -- resolution / frame rate, two-up -------------------------------
-            // Value tiles, not selects: the export always matches the master, so
-            // these are statements of fact and draw no chevron promising a menu.
+            // -- resolution -----------------------------------------------------
+            C.Caption { text: "resolution" }
+
+            C.Segmented {
+                width: parent.width
+                model: ["1080p", "1440p", "4K", "Native"]
+                // Bound to state, never assigned locally, so a rejected change snaps
+                // back -- same rule as the webcam shape chips. Labels and values are
+                // one list apart and must stay the same length.
+                currentIndex: Math.max(0, root.presetValues.indexOf(st.export_preset || "1440p"))
+                onActivated: function (i) {
+                    Bridge.op("set_export", { export_preset: root.presetValues[i] })
+                }
+            }
+
+            // What the chosen preset actually resolves to against THIS capture, because
+            // a preset is a ceiling: "1440p" on a 1080p recording exports 1080p, and a
+            // control that silently disagreed with the file would be worse than no
+            // control. Native is named rather than sized so it stays true if the
+            // capture size ever changes under it.
+            Text {
+                width: parent.width
+                text: root.resolvedLabel()
+                color: Theme.text5
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsHint
+            }
+
+            Item { width: 1; height: 4 }
+
+            // -- frame rate -----------------------------------------------------
+            // A value tile, not a select: the export always matches the master's
+            // timebase, so this is a statement of fact and draws no chevron.
             Row {
                 width: parent.width
                 spacing: 13
 
                 Column {
-                    width: (parent.width - 13) / 2
-                    spacing: 7
-                    C.Caption { text: "resolution" }
-                    Rectangle {
-                        width: parent.width
-                        height: 32
-                        radius: Theme.radiusRow - 1
-                        color: Theme.fillSubtle
-                        Text {
-                            x: 12
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: st.canvas ? st.canvas.width + "×" + st.canvas.height : ""
-                            color: Theme.text2
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fsRow
-                        }
-                    }
-                }
-                Column {
-                    width: (parent.width - 13) / 2
+                    width: parent.width
                     spacing: 7
                     C.Caption { text: "frame rate" }
                     Rectangle {

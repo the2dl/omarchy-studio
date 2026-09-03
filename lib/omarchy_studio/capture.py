@@ -193,13 +193,30 @@ _WARMUP_PROBE_SECONDS = 2.5
 # warm-up is 210-228 ms, so 1.5 s is about five times the worst case seen. Past it we
 # clamp and move on rather than deciding the whole take is a fade-in.
 _WARMUP_MAX_SECONDS = 1.5
-# The ramp is over once the frame reaches this fraction of the settled level. Not
-# tighter: the settled level is not a constant, because auto-exposure keeps hunting --
-# the same file drifts 106.6 -> 104.4 across its first four seconds -- so a 0.98 would
-# chase that wobble and trim live content. 0.95 lands on frame 9 of the file above,
-# where the ramp is already within 5% and the fade is no longer visible in a bubble a
-# seventh of the frame wide.
-_WARMUP_SETTLED_FRACTION = 0.95
+# The ramp is a RATE, not a level, and it ends where the rise stops -- the knee.
+#
+# A level test was tried first (the ramp is over once the frame reaches 0.95 of the
+# settled median) and it is wrong on any camera whose auto-exposure hunts UPWARD. The
+# settled reference is taken from past the clamp, but on such a camera that window is
+# still climbing, so the reference lands above live footage and -- because the scan
+# takes the LAST frame under the floor, to survive a non-monotonic ramp -- it swallows
+# the entire drift. Measured on the 2026-09-03 18:36 capture: the ramp is over by frame
+# 9 (1.2 -> 108.3), but the drift reaches 125 by frame 75, putting the 0.95 floor at
+# 118.8 and returning 39 instead of 8. Those thirty phantom frames are held by the
+# editor and the export alike, which is what made the bubble stutter.
+#
+# The knee is relative to the ramp's own peak rate, not absolute: an iris opening moves
+# tens of luma per frame, a lamp being switched on over four seconds moves under two,
+# and an absolute threshold cannot call both. A fraction of the fastest frame separates
+# them and keeps the four-second fade on the clamp path where it belongs.
+_WARMUP_KNEE_FRACTION = 0.15
+# ...with a floor, so a stream that only ever creeps cannot produce a knee so small that
+# its own noise satisfies it.
+_WARMUP_KNEE_MIN_DELTA = 0.5
+# Frames that must all sit under the knee before the ramp is called over. One is not
+# enough: a real ramp stalls for a frame (frames 2 and 3 of the 09-02 capture both sit
+# at 13.7 before it moves again) and a single stalled frame must not end it early.
+_WARMUP_KNEE_RUN = 3
 # ...and nothing is a warm-up unless the head actually started DARK relative to where it
 # ended. This is the gate that protects the dark room: the bug's signature is 0.9
 # against 106, a ratio of 0.009, while a merely dim room begins within a few percent of
@@ -264,15 +281,26 @@ def measure_warmup_frames(path: Path, fps: float) -> int:
     if ys[0] >= _WARMUP_DARK_FRACTION * settled:
         return 0
 
-    floor = _WARMUP_SETTLED_FRACTION * settled
-    # The LAST frame below the floor, not the first at or above it: the ramp is not
-    # monotonic (frames 2 and 3 of the 09-02 capture both sit at 13.7 before it moves
-    # again), and a single frame that overshoots must not end the warm-up early.
-    warmup = 0
-    for i in range(clamp):
-        if ys[i] < floor:
-            warmup = i + 1
-    return warmup
+    deltas = [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
+    knee = max(_WARMUP_KNEE_MIN_DELTA,
+               _WARMUP_KNEE_FRACTION * max(abs(d) for d in deltas[:clamp]))
+
+    # Wait for the rise to actually START before looking for where it stops. The first
+    # frames of a v4l2 stream are commonly identical black -- a delta of zero that would
+    # otherwise read as "already settled" and return 0 on the very files this exists for.
+    rise = next((i for i, d in enumerate(deltas[:clamp]) if d >= knee), None)
+    if rise is None:
+        return 0
+
+    # The knee index IS the count of frames to drop: deltas[i] is the step from frame i
+    # to frame i+1, so the first i whose step (and the next few) is under the knee makes
+    # frame i the first settled one, and frames 0..i-1 the warm-up.
+    for i in range(rise, min(clamp, len(deltas) - _WARMUP_KNEE_RUN + 1)):
+        if all(abs(d) < knee for d in deltas[i:i + _WARMUP_KNEE_RUN]):
+            return i
+    # Still rising when the clamp ran out: not an iris, so hold the clamp rather than
+    # believing a warm-up that long.
+    return clamp
 
 
 # --- manifest ---------------------------------------------------------------

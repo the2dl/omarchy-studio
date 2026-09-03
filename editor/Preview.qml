@@ -156,7 +156,9 @@ Item {
             cameraPlayer.pause()
         } else {
             screenPlayer.play()
-            if (hasCamera)
+            // Not into the held span -- see the drift Timer below. The timer starts the
+            // camera the moment the screen clock reaches offsetMs + warmupMs.
+            if (hasCamera && cameraSync.cameraExistsAt(screenPlayer.position))
                 cameraPlayer.play()
         }
     }
@@ -772,12 +774,31 @@ Item {
 
     // Two players are frame-exact after a seek but drift over long playback, so the
     // camera is nudged back whenever it is more than one frame out.
+    //
+    // The nudge must not run while the camera is being HELD. For the first
+    // `offsetMs + warmupMs` of the screen clock cameraMsFor() returns a constant -- the
+    // camera does not exist yet, then it is a sensor waking up -- and nudging a PLAYING
+    // player back onto a constant is not a hold, it is a loop: the bubble ran forward
+    // 250ms, got yanked back, ran forward again, about nine times over the 2.2s clamp
+    // of the 2026-09-03 18:36 capture. It read as a few seconds of the same arm
+    // movement on repeat before the picture went normal.
+    //
+    // The export holds this span as one still frame (trim then tpad start_mode=clone),
+    // so the preview holds it the same way: paused on that frame, started only once the
+    // clock has passed it.
     Timer {
         interval: 250
         repeat: true
         running: root.playing && root.hasCamera
         onTriggered: {
-            var want = cameraSync.cameraMsFor(screenPlayer.position)
+            var pos = screenPlayer.position
+            var want = cameraSync.cameraMsFor(pos)
+            var held = !cameraSync.cameraExistsAt(pos)
+            if (held && cameraPlayer.playbackState === MediaPlayer.PlayingState)
+                cameraPlayer.pause()
+            else if (!held && root.playing
+                     && cameraPlayer.playbackState !== MediaPlayer.PlayingState)
+                cameraPlayer.play()
             if (Math.abs(cameraPlayer.position - want) > root.msPerFrame)
                 cameraPlayer.setPosition(want)
         }

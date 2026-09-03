@@ -35,8 +35,9 @@ THE THREE-PART MAPPING. A click's position in the finished video needs all of:
 
       Deliberately not `monitor_scale`. Multiplying logical coordinates by the scale
       assumes the video is the physical size of the region, and it often is not:
-      capture.capture_size caps the encode at 4096 (h264's limit), so a 5120x2880
-      display records at 2560x1440 and every click landed at twice its coordinate --
+      the video is whatever capture.capture_size and --resolution settled on, which
+      is not the physical size whenever either applied -- and every click landed at
+      twice its coordinate back when a 5120x2880 display was halved to 2560x1440 --
       cx of 1.85 for a click 92% of the way across the screen. The zoom then framed a
       point off the canvas entirely. The captured rectangle and the video's own size
       already carry everything needed, and neither can disagree with itself.

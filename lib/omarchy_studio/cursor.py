@@ -9,8 +9,9 @@ FOUR THINGS DECIDE WHETHER THIS LOOKS RIGHT, AND THREE OF THEM ARE INVISIBLE WHE
 
 (a) THE COORDINATE MAPPING. Cursor samples are LOGICAL compositor pixels, absolute
     across the whole desktop. The video is neither logical pixels nor physical desktop
-    pixels: `capture.capture_size` caps the encode at 4096 (h264's limit), so a 5120x2880
-    display records at 2560x1440. A sample is therefore placed by NORMALIZING it against
+    pixels: `capture.capture_size` caps the encode at the codec's ceiling, so a 5120x2880
+    display records at 5120x2880 with hevc, while a capped or `--resolution` capture
+    comes out at something else entirely. A sample is therefore placed by NORMALIZING it against
     the logical rectangle that was captured and multiplying by the video's own size --
     exactly what `events.map_clicks` does for clicks, and deliberately NOT
     `* monitor_scale`, which put every click at twice its coordinate the one time this

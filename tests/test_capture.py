@@ -60,13 +60,24 @@ def test_capture_size_is_native_when_already_under_the_cap():
     assert capture.capture_size({"width": 3200, "height": 1800}) is None
 
 
-def test_capture_size_halves_a_5k_display():
-    # 5120x2880 is this machine's panel; h264 VAAPI hard-fails above 4096.
-    assert capture.capture_size({"width": 5120, "height": 2880}) == (2560, 1440)
+def test_a_5k_display_is_captured_natively():
+    """5120x2880 is this machine's panel, and it used to be halved to 2560x1440.
+
+    Halving cost three quarters of the pixels to stay inside h264's 4096 ceiling. The
+    ceiling is real -- h264_vaapi FAILS at 5120x2880 on this hardware -- but it is a
+    property of the codec, not of the capture, so the codec moves instead of the size.
+    """
+    assert capture.capture_size({"width": 5120, "height": 2880}) is None
+    assert capture.capture_codec({"width": 5120, "height": 2880}) == "hevc"
+
+
+def test_a_display_h264_can_take_is_left_on_auto():
+    assert capture.capture_codec({"width": 3840, "height": 2160}) == "auto"
+    assert capture.capture_codec({"width": 4096, "height": 4096}) == "auto"
 
 
 def test_capture_size_result_is_always_within_the_cap_and_even():
-    for w, h in ((5120, 2880), (7680, 4320), (10000, 1000), (4097, 4097)):
+    for w, h in ((16384, 4320), (10000, 1000), (8193, 8193)):
         size = capture.capture_size({"width": w, "height": h})
         assert size is not None
         assert size[0] <= capture.MAX_CAPTURE_DIM and size[1] <= capture.MAX_CAPTURE_DIM
@@ -274,7 +285,8 @@ def test_begin_cli_prints_assignments_the_shell_can_eval(tmp_path, capsys):
     out = _eval_assignments(capsys.readouterr().out)
     assert out["BUNDLE"] == str(tmp_path / "rec")
     assert out["PHYSICAL"] == "5120x2880+0+0"
-    assert out["CAPTURE_SIZE"] == "2560x1440"
+    assert out["CAPTURE_SIZE"] == "0x0"  # native; the codec is what moves
+    assert out["CAPTURE_CODEC"] == "hevc"
 
 
 def test_begin_cli_quotes_paths_because_xdg_videos_dir_may_have_spaces(tmp_path, capsys):

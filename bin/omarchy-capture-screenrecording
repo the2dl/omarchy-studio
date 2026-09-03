@@ -559,7 +559,7 @@ start_screenrecording() {
     return 1
   }
 
-  local CAPTURE_SIZE=""
+  local CAPTURE_SIZE="" CAPTURE_CODEC=""
   eval "$begin_output"
   [[ -n $BUNDLE && -n $CAPTURE_SIZE ]] || return 1
 
@@ -609,8 +609,17 @@ start_screenrecording() {
   trail "start: $target backend=$capture_backend self-view=$self_view_mode bundle=$BUNDLE"
   protect_overlays_from_capture "$capture_backend" "$LOGICAL_GEOMETRY"
   : >"$GSR_STDERR"
+  # -k: named, not auto. capture.capture_codec picks the codec that can encode the
+  # panel's native grid, because `auto` would pick h264 on a display h264 cannot take
+  # and the size would have to be halved to suit it.
+  #
+  # -cr full: gsr defaults to LIMITED range, which squeezes a desktop's 0-255 into
+  # 16-235. Measured on the 2026-09-03 18:36 capture, which was tagged color_range=tv
+  # with its luma sitting in 17-242: black backgrounds lifted off zero and white text
+  # pulled off 255, i.e. every take shipped with its contrast quietly reduced. A desktop
+  # is full-range source and there is no reason to record it as broadcast video.
   gpu-screen-recorder "${capture_args[@]}" \
-    -k auto -f "$capture_fps" -fm cfr -fallback-cpu-encoding yes \
+    -k "${CAPTURE_CODEC:-auto}" -cr full -f "$capture_fps" -fm cfr -fallback-cpu-encoding yes \
     -cursor "$CURSOR_CAPTURE" \
     -write-first-frame-ts yes \
     -ipc "$IPC_SOCKET" "${verbose_args[@]}" \

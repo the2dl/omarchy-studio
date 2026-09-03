@@ -38,12 +38,24 @@ from .project import Bundle, Capture, Stream
 
 _GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$")
 
-# h264 VAAPI hard-fails above 4096x4096 on this hardware, and gsr's `-k auto` may pick
-# hevc on a large display, so the cap cannot be conditioned on the codec -- an export
-# that assumed h264 would be the thing that broke. Halving (rather than fitting to a
-# nominal 4K box) keeps the video an exact integer division of the physical grid, so the
-# logical -> video mapping stays one clean ratio.
-MAX_CAPTURE_DIM = 4096
+# Capture is the one stage whose fidelity cannot be recovered later, so it runs at the
+# panel's native grid and the codec is chosen to allow that -- rather than the reverse,
+# which is what this used to do.
+#
+# It used to cap at h264's 4096 and HALVE past it, so a 5120x2880 panel recorded at
+# 2560x1440: a quarter of the pixels, and the reason desktop text came out soft. The cap
+# could not be conditioned on the codec because `-k auto` might pick either one, and an
+# export that assumed h264 would break. That reasoning had the dependency backwards --
+# nothing downstream assumes h264 (render, proxy and thumbnails all ENCODE x264 and
+# decode whatever they are given), so the fix is to stop leaving `-k` to chance and name
+# the codec that matches the size being asked for.
+#
+# Probed on this machine's Radeon: h264_vaapi encodes 4096x2304 and FAILS at 5120x2880;
+# hevc_vaapi encodes 5120x2880. Native also keeps the mapping cleaner than a nominal 4K
+# box would -- logical 2560x1440 to a 5120x2880 video is exactly 2x, where fitting to
+# 4096 would have been a fractional 1.6x.
+H264_MAX_DIM = 4096
+MAX_CAPTURE_DIM = 8192
 
 
 class CaptureError(RuntimeError):
@@ -84,6 +96,16 @@ def to_physical(logical: dict, scale: float) -> dict:
         "width": int(round(logical["width"] * scale)),
         "height": int(round(logical["height"] * scale)),
     }
+
+
+def capture_codec(physical: dict) -> str:
+    """The `-k` argument for gsr: the codec that can actually encode this grid.
+
+    Named rather than left to `-k auto`, which decides from the hardware and the
+    container and would silently pick h264 on a panel h264 cannot encode.
+    """
+    w, h = int(physical["width"]), int(physical["height"])
+    return "hevc" if w > H264_MAX_DIM or h > H264_MAX_DIM else "auto"
 
 
 def capture_size(physical: dict, max_dim: int = MAX_CAPTURE_DIM) -> tuple[int, int] | None:
@@ -566,6 +588,9 @@ def main(argv: list[str] | None = None) -> int:
             # gsr reads 0x0 as "native"; keeping the sentinel here means the script never
             # has to branch on whether a cap applied.
             "CAPTURE_SIZE": f"{size[0]}x{size[1]}" if size else "0x0",
+            # Paired with the size: a grid past h264's ceiling is only capturable at all
+            # because the codec was named to match it.
+            "CAPTURE_CODEC": capture_codec(physical),
         }
         for key, value in emit.items():
             print(f"{key}={shlex.quote(value)}")

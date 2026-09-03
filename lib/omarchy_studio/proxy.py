@@ -28,21 +28,28 @@ from .project import Bundle, ProjectError
 # Measured: this is the setting that makes seeks land, so it is also the setting that
 # must invalidate a proxy when it changes.
 GOP = 15
-PROXY_WIDTH = 1920
+# The editor canvas shows the recording at its LOGICAL size, so a proxy this wide is
+# 1:1 at 100% zoom and the editor stops being a worse picture than the thing it is
+# editing. At 1920 against a 2560-logical desktop it was showing a third downscale --
+# master already below the panel, proxy below the master -- and reading as "the recorder
+# is bad" when most of the softness was the preview.
+PROXY_WIDTH = 2560
 # CRF, not a bitrate target. A fixed 10M made the proxy TEN TIMES LARGER than the
 # master it stands in for -- 174MB against 18MB for a 2:13 desktop capture -- because a
 # constant bitrate spends its whole budget on a mostly-static screen that gsr had already
 # compressed to about 1 Mbit/s. At ~5GB per hour of recording that is a worse problem
 # than the slow seeking it was solving.
 #
-# CRF 30 is deliberately low quality: nobody grades colour on a scrub proxy, and the
-# export always reads the master. The short GOP is what makes seeks land, and it is kept
-# -- it costs compression, but against a quality target rather than a bitrate floor it
-# costs a fraction of what it did.
+# CRF 30 was chosen as "nobody grades colour on a scrub proxy", which is true of colour
+# and false of SHARPNESS: the proxy is what you judge a take by, and at 30 it visibly
+# mushed text that is crisp in the master. 23 is a quality target, not a bitrate floor,
+# so a mostly-static desktop still costs little -- the blow-up this comment warns about
+# came from a fixed 10M bitrate spending its whole budget on a static screen, which is a
+# different failure and not one CRF has.
 _VIDEO_ARGS = [
     "-c:v", "libx264",
     "-preset", "veryfast",
-    "-crf", "30",
+    "-crf", "23",
     "-maxrate", "6M",
     "-bufsize", "12M",
     "-g", str(GOP),

@@ -90,10 +90,15 @@ def test_a_camera_proxy_is_not_upscaled(bundle):
 
 @needs_ffmpeg
 def test_a_wide_master_is_brought_down_to_the_proxy_width(tmp_path):
+    """A native 5K capture is 3840-and-up; the proxy brings it to the logical width.
+
+    2560 wide was this fixture's master until the proxy width caught up with it, at
+    which point it stopped exercising the downscale at all.
+    """
     root = tmp_path / "wide"
-    synthetic.make_bundle(root, seconds=1.0, width=2560, height=1440, camera=False)
+    synthetic.make_bundle(root, seconds=1.0, width=3840, height=2160, camera=False)
     p = proxy.ensure_proxy(Bundle(root))
-    assert probe.dimensions(p) == (proxy.PROXY_WIDTH, 1080)
+    assert probe.dimensions(p) == (proxy.PROXY_WIDTH, 1440)
 
 
 @needs_ffmpeg

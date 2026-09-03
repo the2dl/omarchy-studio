@@ -1,0 +1,5 @@
+# A directory qmldir, like editor/'s and controls/' -- NO `module` line, or the
+# implicit same-directory import stops resolving and every type fails to load with a
+# window that never appears.
+LiveDot 1.0 LiveDot.qml
+MicBars 1.0 MicBars.qml

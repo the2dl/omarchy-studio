@@ -167,7 +167,8 @@ def test_finalize_probes_the_media_rather_than_trusting_the_flags(tmp_path):
         "monotonic_microsec realtime_microsec\n5000000 1788368890000000\n"
     )
 
-    finalized = capture.finalize(bundle.root)
+    finalized, fault = capture.finalize(bundle.root)
+    assert fault == ""
     screen = finalized.capture.screen
     assert (screen.width, screen.height) == (640, 360)
     assert screen.timebase.fps == 60
@@ -193,7 +194,8 @@ def test_finalize_puts_the_camera_on_the_screens_clock(tmp_path):
     # The camera's first frame is 200ms of realtime after the screen's.
     bundle.media("cam.tsv").write_text("# timecode format v2\n1788368890200\n")
 
-    finalized = capture.finalize(bundle.root, camera="media/cam.mp4")
+    finalized, fault = capture.finalize(bundle.root, camera="media/cam.mp4")
+    assert fault == ""
     assert finalized.capture.camera.anchor_us == 5_200_000
     # 200ms at the screen's 60fps.
     assert finalized.camera_offset_frames() == 12
@@ -223,6 +225,32 @@ def test_finalize_refuses_a_bundle_whose_media_is_missing(tmp_path):
     )
     with pytest.raises(capture.CaptureError):
         capture.finalize(bundle.root)
+
+
+@pytest.mark.skipif(FFMPEG is None, reason="ffmpeg is required to build a probe target")
+def test_an_unreadable_camera_costs_the_camera_and_nothing_else(tmp_path):
+    """The screen recording must survive a camera that did not close cleanly.
+
+    A truncated cam.mp4 -- no moov atom, which is what a hard-killed ffmpeg leaves --
+    used to raise straight out of ffprobe and abandon capture.json entirely, so a good
+    screen recording came back as an unopenable bundle. Reproduced from
+    ~/Videos/screenrecording-2026-09-02_19-10-25.
+    """
+    bundle = capture.begin(
+        tmp_path / "rec",
+        logical_geometry=capture.parse_geometry("1920x1080+0+0"),
+        monitor_name="DP-1",
+    )
+    _synthetic_video(bundle.media("screen.mp4"), 0.5, "640x360", 60)
+    # Header bytes and no trailer: exactly the shape ffmpeg leaves behind on a hard exit.
+    bundle.media("cam.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 4096)
+    bundle.media("cam.tsv").write_text("")
+
+    finalized, fault = capture.finalize(bundle.root, camera="media/cam.mp4")
+    assert fault, "a truncated camera must be reported, not silently dropped"
+    assert finalized.capture.camera is None
+    assert finalized.capture.screen.width == 640      # the screen still finalized
+    project.Bundle(bundle.root)                        # and the bundle still opens
 
 
 # --- the CLI the bash scripts call -------------------------------------------
@@ -273,3 +301,121 @@ def test_capture_json_is_the_only_thing_begin_writes(tmp_path):
     capture.begin(root, logical_geometry=capture.parse_geometry("800x600+0+0"))
     assert sorted(p.name for p in root.iterdir()) == ["assets", "capture.json", "events", "media"]
     assert json.loads((root / "capture.json").read_text())["version"] == project.CAPTURE_VERSION
+
+
+# --- the self-view's placement ------------------------------------------------
+#
+# The setup bar drags the bubble on a monitor-sized sheet and reports an absolute
+# logical rect; begin() is the only place that knows the capture rectangle to divide
+# it by. Before this the placement was discarded entirely and the editor opened every
+# recording at WebcamSettings' 0.72/0.70 defaults.
+
+
+def test_a_full_display_capture_normalizes_the_placement_against_the_display():
+    placement = capture.camera_placement(
+        {"x": 1843, "y": 1008, "width": 563, "height": 563},
+        {"x": 0, "y": 0, "width": 2560, "height": 1440},
+    )
+    assert placement["x"] == pytest.approx(0.72, abs=0.001)
+    assert placement["w"] == pytest.approx(0.22, abs=0.001)
+    # 1008/1440 is 0.70 -- WebcamSettings' own default -- and a box 563px tall from
+    # there hangs 131px off the bottom of a 1440 screen. Everything stays inside the
+    # frame, which is also what the sheet shows: SelfView clamps to the same rule, so
+    # the placement the user sees is the placement that lands.
+    assert placement["y"] == pytest.approx(1.0 - placement["h"], abs=0.001)
+    assert placement["y"] + placement["h"] <= 1.0
+
+
+def test_a_region_capture_normalizes_against_the_region_not_the_display():
+    """The bubble is placed on the sheet but composited inside the RECORDING.
+
+    A rect 100px inside a region that starts at 400,300 is 100px inside the video --
+    normalizing against the monitor instead would put it somewhere else entirely.
+    """
+    placement = capture.camera_placement(
+        {"x": 500, "y": 400, "width": 200, "height": 200},
+        {"x": 400, "y": 300, "width": 800, "height": 600},
+    )
+    assert placement["x"] == pytest.approx(0.125)   # (500-400)/800
+    assert placement["y"] == pytest.approx(0.1667, abs=0.001)
+    assert placement["w"] == pytest.approx(0.25)
+    assert placement["h"] == pytest.approx(0.3333, abs=0.001)
+
+
+def test_a_placement_outside_the_capture_is_clamped_rather_than_refused():
+    placement = capture.camera_placement(
+        {"x": 5000, "y": 5000, "width": 200, "height": 200},
+        {"x": 0, "y": 0, "width": 800, "height": 600},
+    )
+    assert 0.0 <= placement["x"] <= 1.0 - placement["w"]
+    assert 0.0 <= placement["y"] <= 1.0 - placement["h"]
+
+
+def test_the_bar_and_the_edit_agree_on_every_shape_name():
+    # They did not: the bar said "corner" for the edit's "rounded" and "squircle" for
+    # its "squircle", and the editor panel offered a third naming again -- so a shape
+    # chosen before recording was not the shape the editor showed afterwards. One
+    # vocabulary now, and this is the seam where a second one would reappear.
+    rect = {"x": 0, "y": 0, "width": 100, "height": 100}
+    logical = {"x": 0, "y": 0, "width": 800, "height": 600}
+    for shape in ("circle", "rounded", "rect"):
+        assert capture.camera_placement(rect, logical, shape)["shape"] == shape
+    # A bar that somehow sends something else seeds a circle rather than a broken edit.
+    assert capture.camera_placement(rect, logical, "nonsense")["shape"] == "circle"
+
+
+def test_begin_seeds_the_edit_with_the_placement(tmp_path):
+    bundle = capture.begin(
+        tmp_path / "rec",
+        logical_geometry=capture.parse_geometry("2560x1440+0+0"),
+        monitor_name="DP-1",
+        monitor_scale=2.0,
+        camera_rect={"x": 1843, "y": 1008, "width": 563, "height": 563},
+        camera_shape="rounded",
+    )
+    # Written to disk, not just held in memory: finalize reloads the bundle later and
+    # would otherwise overwrite the placement with the defaults.
+    reloaded = project.Bundle(bundle.root)
+    assert reloaded.edit.webcam.x == pytest.approx(0.72, abs=0.001)
+    assert reloaded.edit.webcam.shape == "rounded"
+
+
+def test_begin_without_a_placement_leaves_the_defaults_alone(tmp_path):
+    bundle = capture.begin(
+        tmp_path / "rec",
+        logical_geometry=capture.parse_geometry("2560x1440+0+0"),
+    )
+    assert not bundle.edit_path.exists()   # nothing written where nothing was chosen
+    assert bundle.edit.webcam.x == project.WebcamSettings().x
+
+
+def test_every_bar_shape_maps_to_a_shape_the_export_can_draw():
+    """The bar and the model use different words for one of these, and a mapping that
+    silently fell through to "circle" would ship a squircle that records as a circle."""
+    from omarchy_studio import layers, setup_sources
+
+    rect = {"x": 0, "y": 0, "width": 100, "height": 100}
+    logical = {"x": 0, "y": 0, "width": 800, "height": 600}
+    for mode in setup_sources.CAMERA_MODES:
+        if mode == "off":
+            continue
+        shape = capture.camera_placement(rect, logical, mode)["shape"]
+        assert shape in ("circle", "squircle", "rounded", "rect")
+        # and the export must actually have a branch for it
+        chain = layers.compile_layer(
+            project.Layer(id="w", type="webcam", w=0.2, h=0.2,
+                          props={"shape": shape}),
+            __import__("omarchy_studio.geometry", fromlist=["Canvas"]).Canvas(1920, 1080),
+            __import__("omarchy_studio.timebase", fromlist=["CutMap"]).CutMap([], 100),
+            __import__("omarchy_studio.timebase", fromlist=["Timebase"]).Timebase(60, 1),
+            _camera_registry(),
+        ).filter_chain
+        assert "alphamerge" in chain or shape == "rect"
+
+
+def _camera_registry():
+    from omarchy_studio.layers import InputRegistry
+
+    reg = InputRegistry()
+    reg.bind("camera", "[cam]")
+    return reg

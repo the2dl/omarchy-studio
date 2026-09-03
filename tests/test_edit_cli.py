@@ -257,6 +257,29 @@ def test_backdrop_gradient_reaches_the_settings(bundle):
     assert bundle.edit.backdrop.gradient is None
 
 
+def test_naming_a_colour_releases_a_selected_ground(bundle):
+    """A catalogue swatch outranks the raw colour pair, so setting a colour here without
+    releasing the swatch changed nothing anyone could see -- the flag looked ignored
+    while the ground picked in the editor kept winning."""
+    from omarchy_studio import backgrounds
+
+    bundle.edit.backdrop.background = "moss"
+    cli.apply_options(bundle, _args(backdrop="color:#101010"))
+    assert bundle.edit.backdrop.background == backgrounds.CUSTOM
+    assert backgrounds.resolve(bundle.edit.backdrop, bundle.canvas).colors[0] == "#101010"
+
+
+def test_turning_the_backdrop_off_leaves_the_chosen_ground_alone(bundle):
+    """`--backdrop=off` names no colour, so it is not a choice of ground -- turning the
+    plate back on should return the one that was there rather than a default."""
+    from omarchy_studio import backgrounds
+
+    bundle.edit.backdrop.background = "moss"
+    cli.apply_options(bundle, _args(backdrop="off"))
+    assert bundle.edit.backdrop.enabled is False
+    assert bundle.edit.backdrop.background == "moss"
+
+
 # --- discovery --------------------------------------------------------------
 
 

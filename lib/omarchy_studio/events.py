@@ -28,9 +28,18 @@ THE THREE-PART MAPPING. A click's position in the finished video needs all of:
       latency, measured at 36-45ms on this machine. The compositor stamps the click
       when it processes the button; the pixels showing its effect reach the encoder
       that much later, so the offset is ADDED.
-  (c) the scale conversion -- events carry LOGICAL compositor coordinates and the video
-      is PHYSICAL pixels. On a scale-2 display `-w 1600x900+200+200` yields a 3200x1800
-      video, so a click at logical (1000, 650) is physical (1600, 900).
+  (c) the capture rectangle -- events carry LOGICAL compositor coordinates, so a click
+      is placed by NORMALIZING it against the logical rectangle that was captured. A
+      click at logical (1000, 650) inside `-w 1600x900+200+200` is 0.5, 0.5 of the way
+      across it, whatever resolution the video turned out to be.
+
+      Deliberately not `monitor_scale`. Multiplying logical coordinates by the scale
+      assumes the video is the physical size of the region, and it often is not:
+      capture.capture_size caps the encode at 4096 (h264's limit), so a 5120x2880
+      display records at 2560x1440 and every click landed at twice its coordinate --
+      cx of 1.85 for a click 92% of the way across the screen. The zoom then framed a
+      point off the canvas entirely. The captured rectangle and the video's own size
+      already carry everything needed, and neither can disagree with itself.
 
 Any one of the three missing misplaces every zoom, and it misplaces them plausibly --
 a zoom that is 40ms late or half a screen off still looks like a zoom, so nothing
@@ -434,8 +443,8 @@ class MappedClick:
     """A click placed on the video: which frame, and where in the frame."""
 
     frame: int  # source-timeline frame index
-    px: float  # PHYSICAL video pixels, relative to the capture region
-    py: float
+    px: float  # VIDEO pixels, relative to the capture region -- not physical desktop
+    py: float  # pixels, which are the same thing only when no encode cap applied
     cx: float  # normalized 0..1 across the canvas, which is what Zoom wants
     cy: float
     button: str
@@ -461,7 +470,7 @@ def map_clicks(
 ) -> list[MappedClick]:
     """Place clicks on the video timeline and canvas.
 
-    Applies the anchor, the calibration offset and the scale conversion together,
+    Applies the anchor, the calibration offset and the capture rectangle together,
     because applying two of the three is worse than applying none: the result still
     looks like plausible zoom targets, so nothing downstream flags it.
 
@@ -478,26 +487,29 @@ def map_clicks(
             "video's frame 0 is unknown without it, so every frame index would be off "
             "by however long the recorder took to start."
         )
-    scale = float(capture.monitor_scale)
-    if scale <= 0:
-        raise EventsError(f"capture.monitor_scale is {scale}; events cannot be scaled")
-
-    origin_x, origin_y, _, _ = capture_region(capture)
+    origin_x, origin_y, region_w, region_h = capture_region(capture)
+    if region_w <= 0 or region_h <= 0:
+        raise EventsError(
+            "capture.logical_geometry carries no size, so a click cannot be placed "
+            "against the captured region. Every zoom would frame the wrong point."
+        )
     latency_us = round(capture.calibration_c_ms * 1000.0)
 
     out: list[MappedClick] = []
     for c in clicks:
         t_rel_us = c.t_us - screen.anchor_us + latency_us
         frame = tb.to_frame(t_rel_us / 1e6) if t_rel_us > 0 else 0
-        px = (c.x - origin_x) * scale
-        py = (c.y - origin_y) * scale
+        # Both spaces are logical, so this is a pure ratio -- monitor_scale cancels out
+        # of it and cannot be applied wrongly. See (c) in the module docstring.
+        cx = (c.x - origin_x) / region_w
+        cy = (c.y - origin_y) / region_h
         out.append(
             MappedClick(
                 frame=frame,
-                px=px,
-                py=py,
-                cx=px / screen.width,
-                cy=py / screen.height,
+                px=cx * screen.width,
+                py=cy * screen.height,
+                cx=cx,
+                cy=cy,
                 button=c.button,
             )
         )

@@ -23,6 +23,7 @@ import QtQuick
 import QtQuick.Controls.Basic
 import QtMultimedia
 import QtQuick.Effects
+import "controls" as C
 
 Item {
     id: root
@@ -47,10 +48,25 @@ Item {
     readonly property string masterUrl:
         screenMedia && screenMedia.master ? "file://" + screenMedia.master : ""
     readonly property real cameraOffsetMs: st.media ? st.media.camera_offset_ms : 0
+    // The sign lives in CameraSync.qml, next to the reasoning for it.
+    readonly property real cameraWarmupMs: st.media && st.media.camera_warmup_ms
+                                          ? st.media.camera_warmup_ms : 0
+    CameraSync {
+        id: cameraSync
+        offsetMs: root.cameraOffsetMs
+        warmupMs: root.cameraWarmupMs
+    }
 
     property string tool: "select"
     property string selectedId: ""
     property bool webcamSelected: false
+
+    // Preview mode (spec §1d "Preview"): the export's frame and nothing else. Chrome
+    // -- rings, handles, chips, the redaction marker, the zoom scrim, the rubber band
+    // -- hides, and chrome-dependent input goes inert. Selection state is KEPT, only
+    // undrawn, so leaving the mode restores exactly what was selected. Playback and
+    // scrubbing stay live: timing is the main thing this mode exists to check.
+    property bool previewMode: false
 
     // Scrubbing has to work before the proxy exists, so the frame falls back to a local
     // value when there is nothing to play.
@@ -129,7 +145,7 @@ Item {
         else
             pendingSeekMs = ms
         if (hasCamera && cameraPlayer.seekable)
-            cameraPlayer.setPosition(ms + cameraOffsetMs)
+            cameraPlayer.setPosition(cameraSync.cameraMsFor(ms))
     }
 
     function togglePlay() {
@@ -253,6 +269,55 @@ Item {
         blurMax: 64
     }
 
+    // Picking a redaction or text tool arms a rubber band and changes nothing you can
+    // see, so the rail read as three buttons that do nothing. They always worked; there
+    // was simply no way to find out that the canvas was now waiting for a drag.
+    Rectangle {
+        id: toolHint
+        z: 60
+        visible: root.tool !== "select" && !root.previewMode
+        x: canvasPanel.x + (canvasPanel.width - width) / 2
+        y: canvasPanel.y + 14
+        width: hintRow.width + 22
+        height: 30
+        radius: 15
+        color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.14)
+        border.width: 1
+        border.color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.45)
+        opacity: visible ? 1 : 0
+        Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
+
+        Row {
+            id: hintRow
+            anchors.centerIn: parent
+            spacing: 8
+            Text {
+                text: "\uf05b"   // nf-fa-crosshairs
+                color: Theme.accent
+                font.family: Theme.fontFamily
+                font.pixelSize: 13
+                anchors.verticalCenter: parent.verticalCenter
+            }
+            Text {
+                text: root.tool === "blur" ? "Drag a box over what to blur"
+                      : root.tool === "pixelate" ? "Drag a box over what to pixelate"
+                      : root.tool === "text" ? "Drag a box where the text should sit"
+                      : "Drag a box on the recording"
+                color: Theme.text2
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsRow
+                anchors.verticalCenter: parent.verticalCenter
+            }
+            Text {
+                text: "Esc to cancel"
+                color: Theme.text5
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsCaption
+                anchors.verticalCenter: parent.verticalCenter
+            }
+        }
+    }
+
     Item {
         id: viewport
         x: canvasPanel.x + (canvasPanel.width - width) / 2
@@ -309,7 +374,24 @@ Item {
                     width: content.width
                     height: content.height
                     visible: root.st.backdrop ? root.st.backdrop.enabled : false
+                    // The resolved colour, which for a gradient ground is its first
+                    // stop -- so a canvas that cannot draw the gradient still shows a
+                    // member of it rather than a stale default.
                     color: root.st.backdrop ? root.st.backdrop.color : "#1b1d24"
+                    clip: true
+
+                    readonly property var ground: root.st.backdrop ? root.st.backdrop.ground : null
+                    readonly property bool isGradient: ground && ground.kind !== "solid"
+                                                       && ground.colors && ground.colors.length > 1
+
+                    // Painted from the export's OWN gradient line, handed over by
+                    // resolve_backdrop in canvas pixels -- see controls/GradientFill.qml.
+                    C.GradientFill {
+                        visible: backdrop.isGradient
+                        anchors.fill: parent
+                        colors: backdrop.isGradient ? backdrop.ground.colors : []
+                        line: backdrop.isGradient ? backdrop.ground.line : null
+                    }
                 }
 
                 // The inset the screen sits in when a backdrop is on. The export
@@ -385,17 +467,23 @@ Item {
                 id: layerRepeater
                 model: root.st.layers || []
                 LayerItem {
+                    id: item
                     spec: modelData
                     frame: root.frame
                     contentSource: content
                     selected: root.selectedId === modelData.id
-                    interactive: root.tool === "select"
+                    interactive: root.tool === "select" && !root.previewMode
+                    previewMode: root.previewMode
                     onClicked: {
                         root.selectedId = modelData.id
                         root.webcamSelected = false
                     }
                     onMoved: function (r) {
-                        Bridge.op("update_layer", { id: modelData.id, rect: r })
+                        // The callback is what releases the item's local position: until
+                        // the reply lands, the model still holds the OLD rect, and
+                        // showing that for a frame is the "double bounce".
+                        Bridge.op("update_layer", { id: modelData.id, rect: r },
+                                  function () { if (item) item.commitDone() })
                     }
                 }
             }
@@ -403,13 +491,17 @@ Item {
             WebcamOverlay {
                 id: webcam
                 cam: root.st.webcam || ({})
+                // Undo the stage's fit so the handles are a constant size on screen.
+                uiScale: root.fit > 0 ? 1 / root.fit : 1
                 selected: root.webcamSelected
+                previewMode: root.previewMode
                 onClicked: {
                     root.webcamSelected = true
                     root.selectedId = ""
                 }
                 onMoved: function (r) {
-                    Bridge.op("set_webcam", { rect: r })
+                    Bridge.op("set_webcam", { rect: r },
+                              function () { webcam.commitDone() })
                 }
             }
 
@@ -421,8 +513,9 @@ Item {
                 x: 0; y: 0
                 width: stage.width
                 height: stage.height
-                enabled: root.tool !== "select"
+                enabled: root.tool !== "select" && !root.previewMode
                 z: 50
+                cursorShape: Qt.CrossCursor
                 property real ax: 0
                 property real ay: 0
                 property rect band: Qt.rect(0, 0, 0, 0)
@@ -463,7 +556,9 @@ Item {
                 width: stage.width
                 height: stage.height
                 z: -1
-                enabled: root.tool === "select"
+                // Off in preview mode: with rings hidden, changing the selection is an
+                // invisible state change the user cannot see happen.
+                enabled: root.tool === "select" && !root.previewMode
                 onClicked: {
                     root.selectedId = ""
                     root.webcamSelected = false
@@ -475,6 +570,7 @@ Item {
                 x: 0; y: 0
                 width: stage.width
                 height: stage.height
+                enabled: !root.previewMode   // dropping an image is an edit
                 onDropped: function (drop) {
                     if (!drop.hasUrls)
                         return
@@ -496,8 +592,12 @@ Item {
         // transform: at identity it sits where the source region is (the mock's state),
         // and once the playhead is inside the event it grows to fill the viewport,
         // which is exactly what "you are now looking at this region" should read as.
+        // Nulled in preview mode, which takes the scrim, the hairline rect and the
+        // label chip down in one place -- the zoom itself still applies (it is content,
+        // resolved by the bridge), only the "you are editing this region" dressing goes.
         readonly property var selSeg:
-            root.selectedZoomIndex >= 0 && root.selectedZoomIndex < root.zoomSegments.length
+            !root.previewMode
+            && root.selectedZoomIndex >= 0 && root.selectedZoomIndex < root.zoomSegments.length
             ? root.zoomSegments[root.selectedZoomIndex] : null
         readonly property real segX: selSeg ? root.fit * (root.zoomNow.scale * (-selSeg.x / selSeg.scale) + root.zoomNow.x) : 0
         readonly property real segY: selSeg ? root.fit * (root.zoomNow.scale * (-selSeg.y / selSeg.scale) + root.zoomNow.y) : 0
@@ -677,7 +777,7 @@ Item {
         repeat: true
         running: root.playing && root.hasCamera
         onTriggered: {
-            var want = screenPlayer.position + root.cameraOffsetMs
+            var want = cameraSync.cameraMsFor(screenPlayer.position)
             if (Math.abs(cameraPlayer.position - want) > root.msPerFrame)
                 cameraPlayer.setPosition(want)
         }

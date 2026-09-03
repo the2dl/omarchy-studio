@@ -40,7 +40,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 
-from omarchy_studio import render  # noqa: E402
+from omarchy_studio import backgrounds, render  # noqa: E402
 from omarchy_studio.project import Bundle, ProjectError  # noqa: E402
 from omarchy_studio.render import RenderError  # noqa: E402
 from omarchy_studio.timebase import FrameRange, Timebase, TimebaseError, normalize  # noqa: E402
@@ -261,6 +261,13 @@ def apply_options(bundle: Bundle, args: argparse.Namespace) -> list[str]:
     if args.backdrop is not None:
         enabled, color, gradient = parse_backdrop(args.backdrop)
         edit.backdrop.enabled = enabled
+        if color or gradient is not None:
+            # A named ground from the catalogue outranks the raw colour pair when one is
+            # selected, so setting a colour here without releasing that selection did
+            # nothing visible: the swatch chosen in the editor kept winning and the flag
+            # looked ignored. Same rule the bridge follows -- naming a colour IS choosing
+            # custom.
+            edit.backdrop.background = backgrounds.CUSTOM
         if color:
             edit.backdrop.color = color
         if gradient is not None:

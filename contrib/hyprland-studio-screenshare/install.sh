@@ -1,0 +1,47 @@
+#!/bin/bash
+# Install (or update) the plugin through hyprpm.
+#
+# hyprpm only takes a git repo with hyprpm.toml at its root, and this directory is a
+# subdirectory of the omarchy-studio checkout. So the plugin is staged into a small git
+# repo of its own under ~/.local/share and hyprpm is pointed at that. Re-running after
+# editing the source commits the changes there and runs `hyprpm update`.
+#
+# This does NOT load the plugin into the running compositor. That is `hyprpm reload`,
+# left to you on purpose: hyprpm builds against STOCK headers, and while the locally
+# patched Hyprland package is still installed the version gate cannot tell the two
+# apart (same commit hash). Do the first load from a session you can afford to lose,
+# or after going back to the stock package.
+set -euo pipefail
+
+SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+STAGE=${OMARCHY_STUDIO_HYPRPM_STAGE:-"$HOME/.local/share/omarchy-studio/hyprpm/omarchy-studio-screenshare"}
+NAME=omarchy-studio-screenshare
+
+mkdir -p "$STAGE"
+rsync -a --delete --exclude build --exclude .git --exclude test "$SRC/" "$STAGE/"
+
+cd "$STAGE"
+if [[ ! -d .git ]]; then
+  git init -q -b main
+  git -c user.name=omarchy-studio -c user.email=omarchy-studio@localhost add -A
+  git -c user.name=omarchy-studio -c user.email=omarchy-studio@localhost commit -q -m "omarchy-studio-screenshare"
+elif ! git diff --quiet || [[ -n $(git status --porcelain) ]]; then
+  git -c user.name=omarchy-studio -c user.email=omarchy-studio@localhost add -A
+  git -c user.name=omarchy-studio -c user.email=omarchy-studio@localhost commit -q -m "update $(date -Is)"
+fi
+
+# NEVER `hyprpm update` here: it updates EVERY registered repository, and a foreign
+# plugin whose upstream no longer builds for this Hyprland gets unloaded from the live
+# session as collateral (this happened with hyprexpo). Re-register only our repo.
+if hyprpm list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -q "Repository omarchy-studio "; then
+  echo "== hyprpm remove omarchy-studio (re-adding from $STAGE)"
+  hyprpm remove omarchy-studio </dev/null
+fi
+echo "== hyprpm add $STAGE"
+hyprpm add "$STAGE" </dev/null
+
+hyprpm enable "$NAME" </dev/null
+echo
+echo "Installed and enabled. Not loaded into the running compositor -- when ready:"
+echo "    hyprpm reload"
+echo "Then confirm with: hyprctl -j plugin list | jq '.[].name'"

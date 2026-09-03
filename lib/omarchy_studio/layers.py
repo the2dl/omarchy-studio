@@ -49,7 +49,7 @@ from .timebase import CutMap, FrameRange, Timebase
 # before anybody notices the glyphs did.
 DEFAULT_FONTFILE = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"
 
-_OVERLAY_TYPES = frozenset({"image", "text", "shape", "webcam"})
+_OVERLAY_TYPES = frozenset({"image", "text", "caption", "shape", "webcam"})
 _REDACT_TYPES = frozenset({"blur", "pixelate"})
 # `zoom` is a crop on the base video, not an overlay; the zoom compiler owns it and
 # silently skipping it here keeps a normal project from emitting a warning per zoom.
@@ -256,6 +256,8 @@ def _compile_overlay(
         chains, tile = _tile_image(layer, name, rect, cutmap, tb, inputs, not ramp)
     elif layer.type == "text":
         chains, tile = _tile_text(layer, name, rect, cutmap, tb, not ramp)
+    elif layer.type == "caption":
+        chains, tile = _tile_caption(layer, name, rect, cutmap, tb, not ramp)
     elif layer.type == "shape":
         chains, tile = _tile_shape(layer, name, rect, cutmap, tb, not ramp)
     else:
@@ -360,6 +362,23 @@ def _tile_text(
     return chains, f"[{name}_s]"
 
 
+def _tile_caption(
+    layer: Layer, name: str, rect: Rect, cutmap: CutMap, tb: Timebase, static: bool
+) -> tuple[list[str], str]:
+    """A transcript's worth of timed strings on one tile. See `captions`.
+
+    `static` is accepted to match every other tile producer and then ignored, which is
+    the one thing worth saying here: a caption tile gates each segment on the frame
+    index, so a one-frame source would draw whichever segment covers frame 0 and let
+    overlay's eof_action=repeat hold it across the entire video.
+    """
+    # Deferred, not at module scope: `captions` borrows this module's tile helpers, and
+    # importing it back from the top of the file would be a cycle.
+    from .captions import caption_tile
+
+    return caption_tile(layer, name, rect, cutmap, tb)
+
+
 def _tile_shape(
     layer: Layer, name: str, rect: Rect, cutmap: CutMap, tb: Timebase, static: bool
 ) -> tuple[list[str], str]:
@@ -399,8 +418,11 @@ def _tile_webcam(
     ]
     if shape == "rect":
         return chains, f"[{name}_c]"
-    radius = radius_px(layer.props.get("corner_radius", 0.12), rect)
-    mask = _circle_mask(w, h) if shape == "circle" else _rounded_rect_mask(w, h, radius)
+    # `rounded` is the superellipse, not a rectangle with a big radius -- see
+    # _squircle_mask for why those are not the same shape. The shallow rounded rectangle
+    # the webcam used to offer under this name is gone; `corner_radius` survives on the
+    # model for the backdrop, which still wants a real radius.
+    mask = _circle_mask(w, h) if shape == "circle" else _squircle_mask(w, h)
     chains.append(
         f"color=c=black:s={w}x{h}:r=1:d=1,format=gray,geq=lum='{mask}'[{name}_m]"
     )
@@ -549,3 +571,30 @@ def _circle_mask(w: int, h: int) -> str:
         f"clip(255*({r:.4f}-hypot((X-{rx:.4f}+0.5)*{r / rx:.6f},"
         f"(Y-{ry:.4f}+0.5)*{r / ry:.6f})+0.5),0,255)"
     )
+
+
+# The Lamé exponent. 2 is exactly an ellipse and 4 is the classic squircle; past about
+# 6 the flats grow long enough that it reads as a rounded rectangle again, which is a
+# shape the product already has. 4 is the one people mean by the word.
+SQUIRCLE_N = 4.0
+
+
+def _squircle_mask(w: int, h: int, n: float = SQUIRCLE_N) -> str:
+    """A superellipse inscribed in the tile: |x/a|^n + |y/b|^n = 1.
+
+    Not a rounded rectangle with a big radius. A rounded rect is three primitives --
+    straight, arc, straight -- and the curvature jumps at both joins; a superellipse has
+    one continuously varying curvature, which is the whole visual point of the shape.
+
+    Antialiased the same way as the other masks, from the n-norm distance: `t` is 1 on
+    the outline and scales linearly across it near the edge, so `r*(1-t)` is a signed
+    distance in pixels accurate enough for the ~1px of softening the tile needs. At
+    n=2 this reduces algebraically to _circle_mask, which is the cheapest proof it is
+    right.
+    """
+    a, b = w / 2.0, h / 2.0
+    r = min(a, b)
+    ax = f"(abs(X-{a:.4f}+0.5)/{a:.4f})"
+    ay = f"(abs(Y-{b:.4f}+0.5)/{b:.4f})"
+    t = f"pow(pow({ax},{n:.1f})+pow({ay},{n:.1f}),{1.0 / n:.6f})"
+    return f"clip(255*({r:.4f}*(1-{t})+0.5),0,255)"

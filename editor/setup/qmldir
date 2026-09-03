@@ -3,3 +3,7 @@
 # no symptom but a window that never appears.
 MonitorOverlay 1.0 MonitorOverlay.qml
 MicMeter 1.0 MicMeter.qml
+DeviceChip 1.0 DeviceChip.qml
+SetupBar 1.0 SetupBar.qml
+SelfView 1.0 SelfView.qml
+PrompterProxy 1.0 PrompterProxy.qml

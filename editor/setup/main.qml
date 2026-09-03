@@ -19,21 +19,13 @@ import "../controls" as C
 ApplicationWindow {
     id: win
 
-    // The pill sizes itself from its row; ~70px tall per the shipping product's
-    // bar. Fixed min=max keeps Hyprland treating it as a floating fixed panel.
-    // min/max bind to barW, not to `width` itself -- that binding loops through
-    // the compositor's clamp and Qt gives up, collapsing the window to nothing.
-    readonly property int barW: Math.ceil(barRow.implicitWidth) + 36
-    width: barW
-    height: 70
-    minimumWidth: barW
-    maximumWidth: barW
-    minimumHeight: 70
-    maximumHeight: 70
-    visible: !counting && !picking
-    title: "omarchy-setup-bar"     // the launcher's positioning key; not user-visible
-    flags: Qt.FramelessWindowHint
-    color: "transparent"
+    // Never shown. The bar is drawn inside the sheet (see SetupBar.qml), so this
+    // window exists only to own the state, the bridge and the shortcuts -- one
+    // object every sheet can reach. A second mapped window is exactly what made the
+    // bar unclickable, so there is deliberately only one kind of window now.
+    visible: false
+    width: 1
+    height: 1
 
     // --- bridge plumbing (the same shape as editor/Bridge.qml, minus the model) ---
 
@@ -41,6 +33,19 @@ ApplicationWindow {
     property string token: ""
     property int selftestMs: 0
     property int countdown: 3
+    // --probe-input: report each control's screen rect once, then every pointer
+    // position this window receives. tests/input_audit.py warps the cursor over
+    // each rect and checks the report arrives, which is how "can this control be
+    // clicked at all" is answered without injecting a click. Off by default -- it
+    // logs on every mouse move.
+    property bool probeInput: false
+    // --open-picker mic|camera: open a device list at startup. A verification hook
+    // like --mode, not UX -- it is the only way to put the panel on screen for a
+    // test that cannot click.
+    property string openPickerArg: ""
+    // --camera-shape circle|corner: bring the self-view up at startup. Same class of
+    // hook as --mode: a way to photograph a state that otherwise needs a click.
+    property string cameraShapeArg: ""
 
     function arg(name, fallback) {
         var a = Qt.application.arguments
@@ -82,31 +87,164 @@ ApplicationWindow {
     property int countLeft: 0
     property bool surfacesGone: false         // last pre-capture teardown fired
 
-    readonly property var modeNames: ["Display", "Window", "Area", "Camera"]
-    readonly property var cameraModes: ["off", "circle", "corner"]
-    readonly property string cameraDevice:
-        sources.cameras.length > 0
-            ? (sel !== null && sel.kind === "camera" ? sel.device : sources.cameras[0].device)
-            : ""
-    readonly property bool cameraTarget: sel !== null && sel.kind === "camera"
+    // Camera is NOT a mode. It was one, and picking it built a camera:/dev/videoN
+    // target that the recorder rejects outright ("camera-only recording is not
+    // supported by this recorder yet") -- a dead end you could only leave by
+    // picking another mode. The camera belongs where it actually acts: an overlay
+    // on a screen recording, picked by device in the camera section below.
+    readonly property var modeNames: ["Display", "Window", "Area"]
+    readonly property var cameraModes: ["off", "circle", "rounded", "rect"]
+
+    // The teleprompter runs as its own process (bin/omarchy-teleprompter) because it has
+    // to outlive these surfaces -- they are destroyed the moment Record is pressed and
+    // the script has to still be on screen after that. The bar only asks for it.
+    property bool prompterOn: false
+    // Where the prompter's window is, so the sheet can draw a drag proxy over it. Polled
+    // rather than pushed: it changes when the user drags it or when one is raised, and a
+    // 700ms poll is cheaper than a notification channel for a rect nobody watches closely.
+    property var prompterRect: ({ running: false })
+    function refreshPrompterRect() {
+        send("GET", "/prompter", null, function (r, ok) {
+            if (ok && r)
+                prompterRect = r
+        })
+    }
+    function movePrompter(x, y) {
+        send("POST", "/prompter", { move: { x: x, y: y } }, function (r, ok) {
+            if (ok && r)
+                prompterRect = r
+        })
+    }
+    Timer {
+        interval: 700
+        repeat: true
+        running: true
+        triggeredOnStart: true
+        onTriggered: win.refreshPrompterRect()
+    }
+
+    function setPrompter(on) {
+        prompterOn = on
+        send("POST", "/prompter", { on: on }, function (reply, ok) {
+            // The launcher answers with what actually happened -- a prompter that could
+            // not start, or one this compositor cannot keep out of the recording, must
+            // not leave the toggle lit as if it had worked.
+            if (!ok || !reply || reply.on !== on)
+                prompterOn = !!(reply && reply.on)
+            refreshPrompterRect()
+        })
+    }
+
+    // Which device list is open on the overlay: "" | "mic" | "camera". The panel is
+    // drawn there, not here, because this window is 70px tall (see DeviceChip).
+    property string pickerOpen: ""
+    // Left edge of the open chip in MONITOR coordinates, so the overlay can anchor
+    // the panel under it. A Wayland client is not told where it sits, so this is
+    // rebuilt from the same centring the launcher used to place the bar.
+    property real pickerAnchor: 0
+
+    // Chosen devices. Empty means "whatever the system default is", which is what
+    // every run did before the pickers existed.
+    property string micDevice: ""
+    property string cameraDevice: ""
+
+    // Where the self-view was left, in absolute logical desktop pixels. Written by the
+    // SelfView on the sheet the capture is on (SelfView.report), read by record(). Null
+    // until one reports, which is the "no camera" case and means the editor keeps
+    // WebcamSettings' defaults.
+    property var cameraRect: null
+
+    readonly property var micEntry: entryFor(sources.mics, micDevice, "name")
+    readonly property var cameraEntry: entryFor(sources.cameras, cameraDevice, "device")
+
+    function entryFor(list, key, field) {
+        if (!list || list.length === 0)
+            return null
+        for (var i = 0; i < list.length; ++i)
+            if (list[i][field] === key)
+                return list[i]
+        return list[0]        // nothing picked yet, or the device vanished
+    }
+
+    function togglePicker(kind, item) {
+        if (pickerOpen === kind) {
+            pickerOpen = ""
+            return
+        }
+        // Ask before showing: the heartbeat is up to two seconds stale, and the one
+        // moment the user cares about the list being right is when they open it.
+        refreshSources()
+        // Sheet-local: the chip and the panel now live in the same window.
+        pickerAnchor = item.mapToItem(null, 0, 0).x
+        pickerOpen = kind
+    }
+
+    function pickMic(name) {
+        micDevice = name
+        pickerOpen = ""
+        // Retarget the meter: a level from the old device would answer "is THIS mic
+        // working?" with another mic's signal.
+        send("POST", "/mic-device", { device: name }, null)
+    }
+
+    // The lists are re-fetched on a timer (see the rescan Timer below), so this has to
+    // tell a real change from the heartbeat. Reassigning `sources` rebuilds every
+    // Repeater bound to it, which would drop the hover ring off a card the moment the
+    // user aimed at it; comparing the serialized payload keeps the UI still until
+    // something actually appeared or went away. Cheap: the payload is small, flat, and
+    // built in a fixed key order by the same function every time.
+    property string sourcesFingerprint: ""
+    property bool sourcesLoaded: false
 
     function refreshSources() {
         send("GET", "/sources", null, function (s, ok) {
             if (!ok)
                 return
+            var fp = JSON.stringify(s)
+            if (fp === sourcesFingerprint)
+                return
+            var first = !sourcesLoaded
+            sourcesFingerprint = fp
+            sourcesLoaded = true
             sources = s
+            // A camera unplugged while the bar is up leaves the shape armed with no
+            // device to fill it, and /done refuses that config -- Start would then do
+            // nothing at all, silently, because the rejection is deliberately dropped
+            // (`if (!ok) return`, record()). Fall back to Off; the chip next to it
+            // already reads "no camera", so the state stays legible.
+            if (cameraMode > 0 && (!s.cameras || s.cameras.length === 0))
+                cameraMode = 0
             // Sources arrive after the first setMode ran (the fetch is async), so
             // an empty selection is re-derived here: one display auto-selects
             // (the shipping product ships that as a fix), camera mode takes the
             // first device. viaClick=false, so this can never surprise-launch
-            // the area picker.
+            // the area picker. Re-derived on later passes too, which is how a
+            // display or camera that appears late becomes selectable.
             if (sel === null)
                 setMode(mode, false)
+            // First pass only, both of them: probeReady is a one-shot handshake for
+            // the input audit, and a selftest that re-pinned its window every rescan
+            // would photograph a moving target.
+            if (first && (probeInput || openPickerArg !== ""))
+                probeDump.restart()      // rects are only real once laid out
             // Selftests cannot hover or click; give them the first window so the
             // picked state (ring, chip, Start) is photographable.
-            if (selftestMs > 0 && mode === 1 && sel === null && s.windows.length > 0)
+            if (first && selftestMs > 0 && mode === 1 && sel === null && s.windows.length > 0)
                 sel = s.windows[0]
         })
+    }
+
+    // Hot-plug. A camera or a USB/Bluetooth mic connected AFTER this bar opened used to
+    // be invisible for the life of the process -- the chip read "no camera" and the
+    // shape control sat disabled beside it, because enumeration happened once, before
+    // qml6 even spawned. Paused while the Area picker owns the screen (every window of
+    // ours is unmapped) and once the countdown starts (the lists stop mattering, and
+    // nothing should be spawning subprocesses into the take).
+    Timer {
+        interval: 2000
+        repeat: true
+        running: !win.counting && !win.picking && !win.surfacesGone
+        onTriggered: win.refreshSources()
     }
 
     function monitorSel(m) {
@@ -130,12 +268,6 @@ ApplicationWindow {
             // walking modes with the keyboard would read as a crash.
             if (viaClick && area === null && !picking)
                 pickArea()
-        } else {
-            sel = sources.cameras.length > 0
-                ? { kind: "camera", name: sources.cameras[0].name,
-                    device: sources.cameras[0].device,
-                    target: "camera:" + sources.cameras[0].device }
-                : null
         }
     }
 
@@ -165,15 +297,25 @@ ApplicationWindow {
         })
     }
 
+    // Every sheet's self-view, so record() can release the camera before capture opens
+    // it. A binding on `counting` would do it too, but capture starts inside the
+    // countdown and "probably evaluated in time" is not a thing to bet a take on.
+    signal releaseCameras()
+
     function record() {
         if (sel === null || counting)
             return
+        releaseCameras()
         send("POST", "/done", {
             target: sel.target,
             mic: micOn,
+            mic_device: micEntry !== null ? micEntry.name : null,
             desktop_audio: desktopAudio,
-            camera: cameraTarget ? "off" : cameraModes[cameraMode],
-            camera_device: cameraDevice !== "" ? cameraDevice : null
+            camera: cameraModes[cameraMode],
+            camera_device: cameraEntry !== null ? cameraEntry.device : null,
+            // Carried so the editor opens the camera where it was placed rather than
+            // at the defaults. Null is legal and means "use the defaults".
+            camera_rect: cameraMode > 0 ? cameraRect : null
         }, function (r, ok) {
             if (!ok)
                 return          // rejected config; everything stays up
@@ -204,6 +346,16 @@ ApplicationWindow {
         send("POST", "/cancel", {}, function () { Qt.quit() })
     }
 
+    // The sheets watch this: it fires once layout has settled, which is when a
+    // control's rect is real and the picker can be opened on a named chip.
+    signal probeReady()
+
+    Timer {
+        id: probeDump
+        interval: 400
+        onTriggered: win.probeReady()
+    }
+
     Timer { id: tick; interval: 1000; repeat: true
             onTriggered: win.countLeft = Math.max(1, win.countLeft - 1) }
     Timer { id: teardown; onTriggered: win.surfacesGone = true }
@@ -212,36 +364,31 @@ ApplicationWindow {
     // This bar is the recording entry point -- hotkey in, Enter out -- so the whole
     // flow must work without a mouse. Application-scoped: focus may sit on any of
     // our windows (the overlays take clicks) and the keys must land regardless.
-    Shortcut { context: Qt.ApplicationShortcut; sequence: "Escape"; onActivated: win.cancel() }
+    Shortcut {
+        context: Qt.ApplicationShortcut
+        sequence: "Escape"
+        onActivated: if (win.pickerOpen !== "") win.pickerOpen = ""; else win.cancel()
+    }
     Shortcut { context: Qt.ApplicationShortcut; sequence: "Return"; onActivated: win.record() }
     Shortcut { context: Qt.ApplicationShortcut; sequence: "Tab"
-               onActivated: win.setMode((win.mode + 1) % 4, false) }
+               onActivated: win.setMode((win.mode + 1) % 3, false) }
     Shortcut { context: Qt.ApplicationShortcut; sequence: "Backtab"
-               onActivated: win.setMode((win.mode + 3) % 4, false) }
+               onActivated: win.setMode((win.mode + 2) % 3, false) }
     Shortcut { context: Qt.ApplicationShortcut; sequence: "Right"; onActivated: win.cycleSource(1) }
     Shortcut { context: Qt.ApplicationShortcut; sequence: "Left"; onActivated: win.cycleSource(-1) }
 
     function cycleSource(step) {
         var list = mode === 0 ? sources.monitors
                  : mode === 1 ? sources.windows
-                 : mode === 2 ? (area !== null ? [area] : [])
-                 : sources.cameras
+                 : (area !== null ? [area] : [])
         if (list.length === 0)
             return
         var current = -1
-        for (var i = 0; i < list.length; ++i) {
-            var t = mode === 3 ? "camera:" + list[i].device : list[i].target
-            if (sel !== null && sel.target === t)
+        for (var i = 0; i < list.length; ++i)
+            if (sel !== null && sel.target === list[i].target)
                 current = i
-        }
         var next = list[(current + step + list.length) % list.length]
-        if (mode === 0)
-            sel = monitorSel(next)
-        else if (mode === 3)
-            sel = { kind: "camera", name: next.name, device: next.device,
-                    target: "camera:" + next.device }
-        else
-            sel = next
+        sel = mode === 0 ? monitorSel(next) : next
     }
 
     Timer {   // the "is my mic actually working" check; 8 polls/s is plenty
@@ -270,6 +417,11 @@ ApplicationWindow {
         port = parseInt(arg("--port", "0"))
         token = arg("--token", "")
         selftestMs = parseInt(arg("--selftest", "0"))
+        probeInput = arg("--probe-input", "") !== ""
+        openPickerArg = arg("--open-picker", "")
+        cameraShapeArg = arg("--camera-shape", "")
+        if (cameraShapeArg !== "")
+            cameraMode = Math.max(1, cameraModes.indexOf(cameraShapeArg))
         selftestRecordMs = parseInt(arg("--selftest-record", "0"))
         countdown = parseInt(arg("--countdown", "3"))
         send("GET", "/theme", null, function (t, ok) { if (ok) Theme.load(t) })
@@ -284,109 +436,5 @@ ApplicationWindow {
     Instantiator {
         model: win.sources.monitors
         delegate: MonitorOverlay { app: win; mon: modelData; monIndex: index }
-    }
-
-    // --- the bar -----------------------------------------------------------------
-
-    Rectangle {
-        anchors.fill: parent
-        radius: Theme.radiusPanel
-        // bg-float without its blur would bleed the desktop into the controls
-        // (verified in a grab of the earlier modal); solid bg is the honest form.
-        color: Theme.bg
-
-        RowLayout {
-            id: barRow
-            anchors.centerIn: parent
-            spacing: 14
-
-            Row {   // mode chips (register of the mock's tabs: 7x13 padding chips)
-                spacing: 4
-                Repeater {
-                    model: win.modeNames
-                    delegate: Rectangle {
-                        required property int index
-                        required property var modelData
-                        width: modeLabel.implicitWidth + 26
-                        height: 27
-                        radius: Theme.radiusRow
-                        color: index === win.mode ? Theme.fillHover : "transparent"
-                        Behavior on color { ColorAnimation { duration: Theme.durFast } }
-                        Text {
-                            id: modeLabel
-                            anchors.centerIn: parent
-                            text: modelData
-                            color: index === win.mode ? Theme.text : Theme.text4
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fsRow
-                            Behavior on color { ColorAnimation { duration: Theme.durFast } }
-                        }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: win.setMode(parent.index, true)
-                        }
-                    }
-                }
-            }
-
-            Rectangle { width: 1; height: 26; color: Theme.hairline }
-
-            Text {   // mic glyph doubles as the state light
-                text: "\uf130"
-                color: win.micOn && win.sources.mic !== null ? Theme.accent : Theme.text4
-                font.family: Theme.fontFamily
-                font.pixelSize: 17
-            }
-            MicMeter {
-                Layout.preferredWidth: 130
-                level: win.micLevel
-                active: win.micOn && win.sources.mic !== null
-            }
-            Text {
-                text: win.sources.mic === null ? "no mic"
-                      : win.micOn ? (Math.round(Math.max(-60, win.micDb)) + " dB")
-                      : "muted"
-                color: Theme.text5
-                font.family: Theme.fontFamily
-                font.pixelSize: Theme.fsHint
-                Layout.preferredWidth: 44
-                horizontalAlignment: Text.AlignRight
-            }
-            C.Toggle {
-                checked: win.micOn
-                enabled: win.sources.mic !== null
-                onToggled: function (v) { win.micOn = v }
-            }
-
-            Rectangle { width: 1; height: 26; color: Theme.hairline }
-
-            Text {   // system audio
-                text: "\uf028"
-                color: win.desktopAudio ? Theme.accent : Theme.text4
-                font.family: Theme.fontFamily
-                font.pixelSize: 16
-            }
-            C.Toggle {
-                checked: win.desktopAudio
-                onToggled: function (v) { win.desktopAudio = v }
-            }
-
-            Rectangle { width: 1; height: 26; color: Theme.hairline }
-
-            Text {   // camera overlay shape
-                text: "\uf03d"
-                color: !win.cameraTarget && win.cameraMode > 0 ? Theme.accent : Theme.text4
-                font.family: Theme.fontFamily
-                font.pixelSize: 16
-            }
-            C.Segmented {
-                Layout.preferredWidth: 186
-                model: ["Off", "Circle", "Corner"]
-                currentIndex: win.cameraTarget ? 0 : win.cameraMode
-                enabled: win.sources.cameras.length > 0 && !win.cameraTarget
-                onActivated: function (i) { win.cameraMode = i }
-            }
-        }
     }
 }

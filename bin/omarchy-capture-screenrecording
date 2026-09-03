@@ -2,7 +2,7 @@
 
 # omarchy:summary=Start or stop screen recording
 # omarchy:group=capture
-# omarchy:args=[--fullscreen] [--with-desktop-audio] [--with-microphone-audio] [--with-webcam] [--burn-in] [--webcam-device=<device>] [--webcam-size=<small|medium|large>] [--resolution=<size>] [--stop-recording]
+# omarchy:args=[--fullscreen] [--with-desktop-audio] [--with-microphone-audio] [--with-webcam] [--burn-in] [--webcam-device=<device>] [--webcam-size=<small|medium|large>] [--resolution=<size>] [--framerate=<fps>] [--stop-recording]
 # omarchy:examples=omarchy screenrecord | omarchy capture screenrecording --with-webcam
 # omarchy:aliases=omarchy screenrecord
 #
@@ -20,14 +20,29 @@
 # Env: OMARCHY_SCREENRECORD_DEBUG=true appends gpu-screen-recorder's stderr to
 # /tmp/omarchy-screenrecord.log.
 #
-# OMARCHY_SCREENRECORD_USE_PORTAL is gone. The portal backend never reports which
-# rectangle of which monitor it handed over, and capture.json cannot be written without
-# it: every cursor sample is a logical coordinate that has to be mapped into the video,
-# and guessing the origin puts the zoom focal point somewhere else entirely. HDR and
-# external-GPU captures need the portal to publish its geometry before they can come
-# back.
+# Backends. KMS (-w <monitor>) is the default: it reads the scanout below the
+# compositor, so it is cheap and a clean 60fps -- and it sees everything, a self-view
+# included. The portal (-w portal) is used for exactly one thing: a self-view that has to
+# sit INSIDE the captured monitor. Hyprland's no_screen_share rule keeps that window out
+# of portal frames (absent, not a black box, with the local screenshare-exclude patch),
+# and nothing keeps it out of KMS frames. The portal never says which rectangle of which
+# monitor it handed over, so its geometry is recovered from gsr's own
+# "pipewire:    Size: WxH" line (-v yes) and accepted only when it matches exactly one
+# monitor, which has to be the one we asked for -- capture.json cannot be written on a
+# guess. Cost, measured on DP-1 at 5120x2880: the portal delivers ~55fps and the CFR
+# master repeats 15-50% of its frames depending on GPU load, where KMS repeats none.
+#
+# Env: OMARCHY_SCREENRECORD_SELF_VIEW_EXCLUDE=no keeps the old behaviour (no self-view
+# rather than the portal).
 
 set -uo pipefail
+# The stop path prints the finished file's path on stdout, and it also takes down the
+# recording HUD -- which, when the HUD is what asked for the stop, is the process reading
+# that stdout. Losing the reader must not lose the rest of the stop: without this, `echo
+# "$master"` took SIGPIPE and the script died before opening the editor, so a take that
+# recorded and finalized perfectly just never appeared. Defence in depth; the HUD also
+# no longer holds a pipe on us.
+trap "" PIPE
 
 STUDIO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 PATH="$STUDIO_ROOT/bin:$PATH"
@@ -42,11 +57,20 @@ fi
 
 DESKTOP_AUDIO="false"
 MICROPHONE_AUDIO="false"
+MICROPHONE_DEVICE=""
 WEBCAM="false"
 BURN_IN="false"
 WEBCAM_DEVICE=""
 WEBCAM_SIZE="medium"
+# The self-view's shape, in the one vocabulary the bar, the model, the editor and the
+# live preview all share. The setup bar overrides it; the flag-driven path has no shape
+# control and takes the model's own default.
+WEBCAM_SHAPE="circle"
 RESOLUTION=""
+# 60 everywhere the KMS backend is used, which is everything except an excluded
+# self-view. --framerate=N pins it and stops the portal path from stepping down.
+FRAMERATE=60
+FRAMERATE_EXPLICIT=""
 FULLSCREEN="false"
 STOP_RECORDING="false"
 # The setup bar is the default way in. --no-setup drops straight to the legacy slurp
@@ -54,6 +78,7 @@ STOP_RECORDING="false"
 SETUP="true"
 SETUP_COUNTDOWN=""
 COUNTDOWN_SECONDS=0
+COUNTDOWN_UNTIL_US=0
 # True when a person asked for the stop, as opposed to the recorder ending some other
 # way. Only a deliberate stop opens the editor unprompted.
 STOPPED_DELIBERATELY="false"
@@ -62,9 +87,40 @@ SCRIPT_ARGS="$*"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 RECORDING_FILE="/tmp/omarchy-screenrecord-filename"
 BUNDLE_FILE="$RUNTIME_DIR/omarchy-studio-bundle"
+# The stop is a SECOND invocation of this script -- the hotkey just runs it again --
+# so nothing start_screenrecording put in a shell variable is visible to it. That is
+# why the countdown deadline is written to a file: COUNTDOWN_SECONDS was read at stop
+# time from a variable that is always still 0 there, so --trim-head-seconds was in
+# practice never passed and every setup-bar recording kept its countdown frames.
+COUNTDOWN_FILE="$RUNTIME_DIR/omarchy-studio-countdown-until-us"
 IPC_SOCKET="$RUNTIME_DIR/omarchy-studio-gsr.sock"
 REGION_FILE="$RUNTIME_DIR/omarchy-screenrecord-region"
 LOG_FILE=$([[ ${OMARCHY_SCREENRECORD_DEBUG:-false} == "true" ]] && echo "/tmp/omarchy-screenrecord.log" || echo "/dev/null")
+# A one-line-per-event breadcrumb trail, always on, separate from the verbose debug log.
+# It exists because "I pressed Record and nothing happened" was unanswerable: the
+# verbose log is opt-in and defaults to /dev/null, so a failed recording left no trace
+# anywhere -- no bundle, no log, no notification. This costs a few bytes per run and is
+# the difference between diagnosing that and guessing at it.
+TRAIL_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-studio/recorder.log"
+trail() {
+  mkdir -p "$(dirname "$TRAIL_FILE")" 2>/dev/null
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$TRAIL_FILE" 2>/dev/null
+  # Keep it small enough to never need managing; 400 lines is months of recordings.
+  if [[ $(wc -l <"$TRAIL_FILE" 2>/dev/null || echo 0) -gt 400 ]]; then
+    tail -200 "$TRAIL_FILE" >"$TRAIL_FILE.tmp" 2>/dev/null && mv "$TRAIL_FILE.tmp" "$TRAIL_FILE"
+  fi
+}
+# gsr's stderr, always kept for the current recording: the portal backend's geometry is
+# read out of it, so it cannot go to /dev/null the way the debug log can.
+GSR_STDERR="${XDG_RUNTIME_DIR:-/tmp}/omarchy-studio-gsr.err"
+# Where gsr keeps the portal's restore token. The share picker appears once per monitor;
+# afterwards the token (persisted by xdg-desktop-portal, survives reboots while an output
+# of that name exists) skips it.
+PORTAL_TOKEN_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gpu-screen-recorder/restore_token"
+HUD_PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-studio-hud.pid"
+# Only set when the setup bar's Script toggle raised the prompter, so a prompter the
+# user started themselves is never taken away from them.
+PROMPTER_OWNED_FILE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-studio-teleprompter.owned-by-recording"
 
 # The one place cursor capture is decided. gsr burns the cursor into the frame and
 # magnifies it softly under zoom; the fix is a synthetic cursor rendered from the event
@@ -79,6 +135,13 @@ studio_capture() {
   PYTHONPATH="$STUDIO_ROOT/lib${PYTHONPATH:+:$PYTHONPATH}" "$STUDIO_PYTHON" -m omarchy_studio.capture "$@"
 }
 
+# CLOCK_MONOTONIC microseconds -- the same clock gsr stamps its first frame with, which
+# is what makes the two comparable at finalize. Not /proc/uptime: that is BOOTTIME and
+# includes suspend, so the two would disagree by however long the machine slept.
+monotonic_us() {
+  "$STUDIO_PYTHON" -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000)'
+}
+
 for arg in "$@"; do
   case "$arg" in
   --with-desktop-audio) DESKTOP_AUDIO="true" ;;
@@ -88,6 +151,10 @@ for arg in "$@"; do
   --webcam-device=*) WEBCAM_DEVICE="${arg#*=}" ;;
   --webcam-size=*) WEBCAM_SIZE="${arg#*=}" ;;
   --resolution=*) RESOLUTION="${arg#*=}" ;;
+  --framerate=*)
+    FRAMERATE="${arg#*=}"
+    FRAMERATE_EXPLICIT="yes"
+    ;;
   --fullscreen) FULLSCREEN="true" ;;
   --no-setup) SETUP="false" ;;
   --countdown=*) SETUP_COUNTDOWN="${arg#*=}" ;;
@@ -219,13 +286,149 @@ resolve_target_geometry() {
   [[ -n ${MONITOR_NAME:-} && -n ${MONITOR_SCALE:-} && -n ${LOGICAL_GEOMETRY:-} ]]
 }
 
-# A self-view can only be shown where the capture cannot see it. gsr has no exclusion
-# flag and Hyprland has no hide-from-capture rule -- verified, there is no software
-# trick -- so a fullscreen capture on the only monitor gets no self-view at all.
+# Move a window clear of the capture rectangle, or say it cannot be done.
+#
+# WHY THIS EXISTS. `no_screen_share` only hides a window from the compositor's own
+# screencopy/portal path. gpu-screen-recorder's KMS backend reads the DRM scanout BELOW
+# the compositor, so on a KMS capture the rule does nothing at all -- verified by finding
+# the teleprompter AND the recording HUD burned into a window recording, both of them
+# carrying the rule and both plainly in the frames. A region capture at least leaves
+# screen beside it, and putting the overlay there is the only way it stays off the take.
+#
+# Logical pixels throughout, which is what the hl.dsp dispatches take.
+park_window_outside() {
+  local title=$1 rect=$2
+  [[ $rect =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]] || return 1
+  local rw=${BASH_REMATCH[1]} rh=${BASH_REMATCH[2]} rx=${BASH_REMATCH[3]} ry=${BASH_REMATCH[4]}
+
+  local win
+  win=$(hyprctl clients -j | jq -r --arg t "$title" \
+    'first(.[] | select(.title == $t) | "\(.address) \(.size[0]) \(.size[1])") // empty')
+  [[ -n $win ]] || return 1
+  local address ww wh
+  read -r address ww wh <<<"$win"
+
+  # The monitor the capture sits on; the window has to stay somewhere visible.
+  local mon
+  mon=$(hyprctl monitors -j | jq -r --arg n "$MONITOR_NAME" \
+    'first(.[] | select(.name == $n) | "\(.x) \(.y) \((.width / .scale) | floor) \((.height / .scale) | floor)") // empty')
+  [[ -n $mon ]] || return 1
+  local mx my mw mh
+  read -r mx my mw mh <<<"$mon"
+
+  local margin=16 nx="" ny=""
+  # Below the capture first, then above, then right, then left: the bottom is where a
+  # prompter is least in the way of what is being demonstrated.
+  if ((my + mh - (ry + rh) >= wh + margin)); then
+    nx=$((rx + (rw - ww) / 2)); ny=$((ry + rh + margin))
+  elif ((ry - my >= wh + margin)); then
+    nx=$((rx + (rw - ww) / 2)); ny=$((ry - wh - margin))
+  elif ((mx + mw - (rx + rw) >= ww + margin)); then
+    nx=$((rx + rw + margin)); ny=$((ry + (rh - wh) / 2))
+  elif ((rx - mx >= ww + margin)); then
+    nx=$((rx - ww - margin)); ny=$((ry + (rh - wh) / 2))
+  else
+    return 1
+  fi
+  ((nx < mx)) && nx=$mx
+  ((nx + ww > mx + mw)) && nx=$((mx + mw - ww))
+
+  hyprctl dispatch "hl.dsp.window.move({ x = $nx, y = $ny, window = \"address:$address\" })" >/dev/null 2>&1 ||
+    hyprctl dispatch movewindowpixel "exact $nx $ny,address:$address" >/dev/null 2>&1
+  return 0
+}
+
+# Everything that must not be in the take, once the backend is known. On the portal
+# backend with the screenshare-exclude patch the compositor keeps these out for us and
+# they can stay where the user put them; on KMS nothing can, so they are moved or the
+# user is told they will be recorded.
+protect_overlays_from_capture() {
+  local backend=$1 rect=$2
+  [[ $backend == "kms" ]] || return 0
+
+  local title stuck=()
+  for title in "omarchy-studio-teleprompter"; do
+    hyprctl clients -j | jq -e --arg t "$title" 'any(.[]; .title == $t)' >/dev/null 2>&1 || continue
+    if park_window_outside "$title" "$rect"; then
+      trail "overlay: moved $title clear of the capture (KMS cannot hide it)"
+    else
+      stuck+=("$title")
+      trail "overlay: $title WILL BE RECORDED -- no room beside a KMS capture"
+    fi
+  done
+
+  if ((${#stuck[@]})); then
+    omarchy-notification-send -u critical -t 6000 "The teleprompter will be in this recording" \
+      "This capture reads below the compositor, so it cannot be hidden, and there is no room beside the capture to move it."
+  fi
+}
+
+# A self-view parked outside the capture: a region leaves room beside it, and a second
+# monitor is always outside a monitor capture. KMS records as usual.
 self_view_possible() {
   local target=$1
   [[ $target == region:* ]] && return 0
   (($(hyprctl monitors -j | jq 'length') > 1))
+}
+
+# The compositor can only keep a self-view out of the recording if something teaches it
+# to leave no_screen_share windows OUT of portal frames rather than paint black boxes
+# over them. Today that is the plugin in contrib/hyprland-studio-screenshare; it used to
+# be an out-of-tree patch to Hyprland itself, whose config option is still accepted so a
+# machine that has not been migrated keeps working. Stock Hyprland with neither answers
+# no, and the fullscreen single-monitor case falls back to "no self-view" as before.
+# Kept in lockstep with lib/omarchy_studio/compositor.py, which answers this for the HUD
+# and the teleprompter.
+self_view_exclusion_available() {
+  [[ ${OMARCHY_SCREENRECORD_SELF_VIEW_EXCLUDE:-yes} != "no" ]] || return 1
+  hyprctl -j plugin list 2>/dev/null | jq -e '.[] | select(.name == "omarchy-studio-screenshare")' >/dev/null 2>&1 && return 0
+  [[ $(hyprctl getoption render:screenshare_exclude_windows 2>/dev/null | head -1) == "bool: true" ]]
+}
+
+# park    -- a spot outside the capture exists; KMS backend.
+# exclude -- no such spot, but the compositor can hide the window from the portal, so it
+#            sits inside the capture; portal backend (whole monitor only: a region that
+#            leaves no room is not a thing, --match-monitor turns a full one into monitor:*).
+# off     -- neither; the camera is still recorded, there is just no live preview.
+self_view_mode() {
+  local target=$1
+  [[ $WEBCAM == "true" && $BURN_IN != "true" ]] || {
+    echo off
+    return
+  }
+  if self_view_possible "$target"; then
+    echo park
+    return
+  fi
+  if [[ $target == monitor:* ]] && self_view_exclusion_available; then
+    echo exclude
+    return
+  fi
+  echo off
+}
+
+# The portal reports its buffer size before the first frame. It is accepted only when
+# exactly one monitor has that physical size and it is the monitor we asked for: two
+# identical monitors, or a picker choice that differs from the token, would otherwise
+# put every cursor sample on the wrong screen. (Rotated outputs: untested -- the buffer
+# may come transformed; a mismatch here refuses the recording rather than guessing.)
+portal_geometry_matches() {
+  local wanted=$1 size="" waited=0
+  while ((waited < 100)); do
+    size=$(sed -n 's/^gsr info: pipewire:[[:space:]]*Size: \([0-9]*x[0-9]*\).*/\1/p' "$GSR_STDERR" 2>/dev/null | tail -1)
+    [[ -n $size ]] && break
+    sleep 0.1
+    ((waited++))
+  done
+  [[ -n $size ]] || {
+    echo "portal: gsr never reported a pipewire buffer size" >>"$LOG_FILE"
+    return 1
+  }
+  local matches
+  matches=$(hyprctl monitors -j | jq -r --argjson w "${size%x*}" --argjson h "${size#*x}" \
+    '[.[] | select(.width == $w and .height == $h) | .name] | join(" ")')
+  echo "portal: buffer $size, monitors of that size: ${matches:-none}, wanted: $wanted" >>"$LOG_FILE"
+  [[ $matches == "$wanted" ]]
 }
 
 # --- recording ---------------------------------------------------------------
@@ -252,6 +455,7 @@ start_screenrecording() {
 
   local target
   COUNTDOWN_SECONDS=0
+  COUNTDOWN_UNTIL_US=0
   if [[ $FULLSCREEN == "true" ]]; then
     target="monitor:$(omarchy-hyprland-monitor-focused)"
   elif [[ $SETUP == "true" ]] && command -v omarchy-capture-setup >/dev/null; then
@@ -262,8 +466,34 @@ start_screenrecording() {
     # seconds, and making the user watch that after they already committed is the thing
     # the countdown exists to hide.
     local setup_json
-    setup_json=$(omarchy-capture-setup ${SETUP_COUNTDOWN:+--countdown "$SETUP_COUNTDOWN"}) || return 1
-    [[ -n $setup_json ]] || return 1
+    # OMARCHY_SETUP_ARGS is a test hook of the same class as the setup's own
+    # --selftest-record: this handoff is the one part of the recording flow that cannot
+    # be exercised without a person pressing Record, and it is also the place where a
+    # failure is SILENT -- a non-zero setup returns from here with no notification at
+    # all, which reads to the user as a recording that simply never happened.
+    # shellcheck disable=SC2086
+    trail "setup: opening the picker"
+    setup_json=$(omarchy-capture-setup ${SETUP_COUNTDOWN:+--countdown "$SETUP_COUNTDOWN"} ${OMARCHY_SETUP_ARGS:-}) || {
+      # Exit 1 is the documented "cancelled" answer, so this is usually the user pressing
+      # Escape and must stay quiet. It is ALSO what a crashed picker looks like, which is
+      # why it goes in the trail either way.
+      trail "setup: exited non-zero (cancelled, or it crashed); nothing was recorded"
+      return 1
+    }
+    [[ -n $setup_json ]] || {
+      # Distinct from the above and never normal: the picker exited 0 and said nothing,
+      # which no code path is supposed to produce. Silence here was read as "Record did
+      # nothing", so it gets a notification of its own.
+      trail "setup: exited 0 but printed no configuration; nothing was recorded"
+      omarchy-notification-send -u critical -t 5000 "Screen recording did not start" \
+        "The setup picker returned nothing. See $TRAIL_FILE"
+      return 1
+    }
+    # Sampled the instant the contract line lands, which is the instant Record was
+    # pressed: the countdown runs from here, and every setup surface is guaranteed gone
+    # by the time it expires.
+    local setup_done_us
+    setup_done_us=$(monotonic_us)
 
     local setup_vars
     setup_vars=$(studio_capture setup --json "$setup_json") || {
@@ -275,9 +505,11 @@ start_screenrecording() {
 
     # The bar owns these choices now, so they override whatever the flags said.
     [[ $SETUP_MIC == "true" ]] && MICROPHONE_AUDIO="true" || MICROPHONE_AUDIO="false"
+    [[ -n $SETUP_MIC_DEVICE ]] && MICROPHONE_DEVICE="$SETUP_MIC_DEVICE"
     [[ $SETUP_DESKTOP_AUDIO == "true" ]] && DESKTOP_AUDIO="true" || DESKTOP_AUDIO="false"
     if [[ $SETUP_CAMERA != "off" ]]; then
       WEBCAM="true"
+      WEBCAM_SHAPE="$SETUP_CAMERA"
       [[ -n $SETUP_CAMERA_DEVICE ]] && WEBCAM_DEVICE="$SETUP_CAMERA_DEVICE"
     else
       WEBCAM="false"
@@ -288,9 +520,12 @@ start_screenrecording() {
     # early on purpose) and simply not kept: trim_head_frames is already handled as a
     # leading cut by render.py, so events, layers and zoom all remap through the same
     # CutMap and nothing has to know this was a countdown rather than an edit.
-    # Seconds, not frames: the real fps is not known until finalize probes the file,
-    # and multiplying by an assumed 60 here would silently mistrim every 30fps capture.
+    # A monotonic DEADLINE, not a duration: finalize compares it against gsr's
+    # first-frame anchor, so however long capture took to produce that frame the trim
+    # is still exactly the frames that could have contained a setup surface -- and zero
+    # when the first frame arrived after the countdown had already ended.
     COUNTDOWN_SECONDS="$SETUP_COUNTDOWN_S"
+    COUNTDOWN_UNTIL_US=$((setup_done_us + SETUP_COUNTDOWN_S * 1000000))
   else
     target=$(select_capture_target) || return 1
   fi
@@ -303,13 +538,23 @@ start_screenrecording() {
   local burned_in_flag=()
   [[ $WEBCAM == "true" && $BURN_IN == "true" ]] && burned_in_flag=(--burn-in)
 
+  # Where the user left the self-view on the setup sheet. Seeds edit.json's webcam
+  # placement so the camera opens in the editor exactly where it was placed, instead of
+  # snapping back to the 0.72/0.70 defaults and making the placement look ignored.
+  local camera_placement_args=()
+  if [[ $WEBCAM == "true" && $BURN_IN != "true" && -n ${SETUP_CAMERA_RECT:-} ]]; then
+    camera_placement_args=(--camera-rect "$SETUP_CAMERA_RECT"
+                           --camera-shape "${SETUP_CAMERA:-circle}")
+  fi
+
   local begin_output
   begin_output=$(studio_capture begin \
     --root "$OUTPUT_DIR/screenrecording-$(date +'%Y-%m-%d_%H-%M-%S')" \
     --logical "$LOGICAL_GEOMETRY" \
     --monitor "$MONITOR_NAME" \
     --scale "$MONITOR_SCALE" \
-    "${burned_in_flag[@]}") || {
+    "${burned_in_flag[@]}" "${camera_placement_args[@]}") || {
+    trail "begin: FAILED to create the bundle"
     omarchy-notification-send -u critical -t 3000 "Screen recording error" "Could not create the recording bundle"
     return 1
   }
@@ -318,8 +563,30 @@ start_screenrecording() {
   eval "$begin_output"
   [[ -n $BUNDLE && -n $CAPTURE_SIZE ]] || return 1
 
+  local self_view_mode
+  self_view_mode=$(self_view_mode "$target")
+
   # gsr's -region flag is deprecated in 6.0.1; region geometry goes straight to -w.
   local capture_args=(-w "${target#*:}" -s "${RESOLUTION:-$CAPTURE_SIZE}")
+  local capture_backend="kms" verbose_args=()
+  local capture_fps="$FRAMERATE"
+  if [[ $self_view_mode == "exclude" ]]; then
+    capture_backend="portal"
+    mkdir -p "$(dirname "$PORTAL_TOKEN_FILE")"
+    capture_args=(-w portal -restore-portal-session yes -portal-session-token-filepath "$PORTAL_TOKEN_FILE"
+                  -s "${RESOLUTION:-$CAPTURE_SIZE}")
+    verbose_args=(-v yes) # the "pipewire:    Size:" line portal_geometry_matches reads
+    # 30, not 60, and this is a quality decision rather than a concession. Measured on
+    # DP-1 at 5120x2880: a 60fps CFR master off the portal keeps only 50-83% of its
+    # frames distinct depending on GPU load (KMS keeps 96-100%), so a third of what it
+    # calls motion is duplicate frames -- which is what judder IS. At 30 the same path
+    # keeps 98%. An honest 30 beats a 60 that is lying about half its frames.
+    #
+    # the reference design records 60 and does not face this: macOS excludes windows on the
+    # same fast capture path, so it pays nothing for the self-view. The trade-off is
+    # ours, not theirs, and copying their NUMBER would not copy their RESULT.
+    [[ -z $FRAMERATE_EXPLICIT ]] && capture_fps=30
+  fi
 
   [[ $WEBCAM == "true" && $BURN_IN == "true" ]] && start_webcam_overlay "$target"
 
@@ -329,40 +596,58 @@ start_screenrecording() {
   if [[ $MICROPHONE_AUDIO == "true" ]]; then
     # Merge audio tracks into one - separate tracks only play one at a time in most players
     [[ -n $audio_devices ]] && audio_devices+="|"
-    audio_devices+="default_input"
+    # The picked source by name, or default_input when nothing was picked -- gsr
+    # takes a PulseAudio source name in the same slot either way.
+    audio_devices+="${MICROPHONE_DEVICE:-default_input}"
   fi
   [[ -n $audio_devices ]] && audio_args+=(-a "$audio_devices" -ac aac)
 
   local master="$BUNDLE/media/screen.mp4"
   rm -f "$IPC_SOCKET"
 
-  echo "===== $(date '+%F %T') args: $SCRIPT_ARGS target: $target bundle: $BUNDLE =====" >>"$LOG_FILE"
+  echo "===== $(date '+%F %T') args: $SCRIPT_ARGS target: $target bundle: $BUNDLE backend: $capture_backend self-view: $self_view_mode =====" >>"$LOG_FILE"
+  trail "start: $target backend=$capture_backend self-view=$self_view_mode bundle=$BUNDLE"
+  protect_overlays_from_capture "$capture_backend" "$LOGICAL_GEOMETRY"
+  : >"$GSR_STDERR"
   gpu-screen-recorder "${capture_args[@]}" \
-    -k auto -f 60 -fm cfr -fallback-cpu-encoding yes \
+    -k auto -f "$capture_fps" -fm cfr -fallback-cpu-encoding yes \
     -cursor "$CURSOR_CAPTURE" \
     -write-first-frame-ts yes \
-    -ipc "$IPC_SOCKET" \
-    -o "$master" "${audio_args[@]}" 2>>"$LOG_FILE" &
+    -ipc "$IPC_SOCKET" "${verbose_args[@]}" \
+    -o "$master" "${audio_args[@]}" 2> >(tee -a "$GSR_STDERR" >>"$LOG_FILE") &
   GSR_PID=$!
 
+  # On the portal backend this wait also covers the share picker the first time round.
   while kill -0 $GSR_PID 2>/dev/null && [[ ! -f $master ]]; do
     sleep 0.2
   done
   kill -0 $GSR_PID 2>/dev/null || return 1
 
+  if [[ $capture_backend == "portal" ]] && ! portal_geometry_matches "$MONITOR_NAME"; then
+    kill -INT "$GSR_PID" 2>/dev/null
+    omarchy-notification-send -u critical -t 4000 "Screen recording error" \
+      "The portal did not hand over $MONITOR_NAME (see $GSR_STDERR)"
+    return 1
+  fi
+
   # The camera is a separate stream so the editor can move, resize or remove it. Its
   # offset against the screen is measured per recording from the two anchors: launch
   # order plus per-pipeline warm-up (KMS 128-137ms, V4L2 210-228ms) is not a constant.
   if [[ $WEBCAM == "true" && $BURN_IN != "true" ]]; then
-    local camera_args=(--size="$WEBCAM_SIZE" --outside="$LOGICAL_GEOMETRY")
+    local camera_args=(--size="$WEBCAM_SIZE" --shape="$WEBCAM_SHAPE"
+                       --outside="$LOGICAL_GEOMETRY")
     [[ -n $WEBCAM_DEVICE ]] && camera_args+=(--device="$WEBCAM_DEVICE")
-    if self_view_possible "$target"; then
-      camera_args+=(--self-view=yes)
+    case $self_view_mode in
+    park) camera_args+=(--self-view=yes) ;;
+    exclude) camera_args+=(--self-view=yes --exclude=yes) ;; # inside the capture, hidden by the compositor
+    *) camera_args+=(--self-view=no) ;;
+    esac
+    if omarchy-capture-camera start "$BUNDLE" "${camera_args[@]}"; then
+      trail "camera: started ($self_view_mode self-view)"
     else
-      camera_args+=(--self-view=no)
-    fi
-    omarchy-capture-camera start "$BUNDLE" "${camera_args[@]}" ||
+      trail "camera: FAILED to start; the screen recording continues without it"
       omarchy-notification-send -u critical -t 3000 "Webcam not recorded" "The screen recording is running without it"
+    fi
   fi
 
   # Built by another part of the system; a missing event daemon costs auto-zoom and the
@@ -376,7 +661,37 @@ start_screenrecording() {
 
   echo "$BUNDLE" >"$BUNDLE_FILE"
   echo "$master" >"$RECORDING_FILE"
+  # Written even when it is 0, so a stale deadline from a previous run can never be
+  # read by a recording that had no countdown at all.
+  echo "$COUNTDOWN_UNTIL_US" >"$COUNTDOWN_FILE"
   RECORDING_LAUNCHED="true"
+
+  # The on-screen controls (spec 1c). Detached, because it has to outlive this script
+  # exactly as the recording does, and because its Stop button re-enters this same
+  # script -- a HUD in this process group would be taken down by its own stop.
+  # It declines to start where the compositor cannot keep it out of the capture, which
+  # is the right answer: a Stop button burned into every frame is a re-shoot.
+  setsid omarchy-recording-hud --socket "$IPC_SOCKET" --bundle "$BUNDLE" \
+    --mic-device "${MICROPHONE_DEVICE:-}" \
+    ${capture_backend:+--backend "$capture_backend"} \
+    ${LOGICAL_GEOMETRY:+--capture-rect "$LOGICAL_GEOMETRY"} \
+    ${MONITOR_NAME:+--monitor "$MONITOR_NAME"} >>"$LOG_FILE" 2>&1 </dev/null &
+
+  # Nothing watched gsr once it was backgrounded and this script returned, so if it
+  # died -- crash, kill, a stop that missed it -- the camera ffmpeg and the event
+  # daemon kept running. The camera holds /dev/video0, so the symptom is a webcam
+  # light that stays on long after the recording ended, with cam.mp4 growing to
+  # gigabytes beside a screen.mp4 that stopped minutes ago. Observed: a 77MB cam.mp4
+  # still growing next to a 1.1MB screen.mp4 two minutes stale.
+  #
+  # Detached on purpose: it has to outlive this script, which returns immediately.
+  # Both stops are idempotent, so racing the normal stop path costs nothing.
+  setsid bash -c '
+    while kill -0 '"$GSR_PID"' 2>/dev/null; do sleep 1; done
+    omarchy-capture-camera stop >/dev/null 2>&1
+    command -v omarchy-capture-input-events >/dev/null &&
+      omarchy-capture-input-events stop >/dev/null 2>&1
+  ' >/dev/null 2>&1 < /dev/null &
   toggle_screenrecording_indicator
 
   # Run from a terminal this backgrounds a recorder and returns, which on its own is
@@ -387,9 +702,39 @@ start_screenrecording() {
     local what="${target#monitor:}"
     [[ $target == region:* ]] && what="region ${target#region:}"
     echo "Recording $what -> $BUNDLE"
+    [[ $capture_backend == "portal" ]] && echo "  backend: portal (self-view inside the capture, kept out of it by the compositor)"
     [[ $WEBCAM == "true" && $BURN_IN != "true" ]] && echo "  camera: media/cam.mp4, separate stream (movable in the editor)"
     echo "  stop:   Alt+PrintScreen, the bar indicator, or run this command again"
   fi
+}
+
+# The prompter that came WITH this recording goes with it. One the user raised for
+# themselves stays: they are the only one who knows whether they are done reading.
+stop_owned_teleprompter() {
+  local pid
+  pid=$(cat "$PROMPTER_OWNED_FILE" 2>/dev/null) || return 0
+  [[ -n $pid ]] || return 0
+  # The pid is CHECKED before it is signalled. This marker can outlive the process that
+  # wrote it -- a setup killed outright leaves it behind -- and pids get reused, so a
+  # stale marker is a loaded gun pointed at whatever process inherits that number.
+  # Observed: cancelling the picker left the file holding a dead pid.
+  if [[ -r /proc/$pid/cmdline ]] &&
+    tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null | grep -q "omarchy-teleprompter"; then
+    kill "$pid" 2>/dev/null
+    trail "teleprompter: closed (it was raised by this recording)"
+  else
+    trail "teleprompter: stale ownership marker for pid $pid; left alone"
+  fi
+  rm -f "$PROMPTER_OWNED_FILE"
+  return 0
+}
+
+stop_recording_hud() {
+  local pid
+  pid=$(cat "$HUD_PID_FILE" 2>/dev/null) || return 0
+  [[ -n $pid ]] && kill "$pid" 2>/dev/null
+  rm -f "$HUD_PID_FILE"
+  return 0
 }
 
 stop_screenrecording() {
@@ -423,6 +768,10 @@ stop_screenrecording() {
   done
 
   omarchy-capture-camera stop
+  # After gsr is down, not before: the HUD's own Stop runs this script, so taking it
+  # away first would kill the thing that is still waiting for the file to finalize.
+  stop_recording_hud
+  stop_owned_teleprompter
   command -v omarchy-capture-input-events >/dev/null &&
     omarchy-capture-input-events stop >/dev/null 2>&1
   toggle_screenrecording_indicator
@@ -441,18 +790,32 @@ stop_screenrecording() {
   if [[ -n $bundle && -d $bundle ]]; then
     local camera_args=()
     [[ -f $bundle/media/cam.mp4 ]] && camera_args=(--camera media/cam.mp4)
-    local trim_args=()
-    ((COUNTDOWN_SECONDS > 0)) && trim_args=(--trim-head-seconds "$COUNTDOWN_SECONDS")
-    if ! studio_capture finalize --root "$bundle" "${camera_args[@]}" "${trim_args[@]}" >>"$LOG_FILE" 2>&1; then
+    local trim_args=() countdown_until_us
+    countdown_until_us=$(cat "$COUNTDOWN_FILE" 2>/dev/null)
+    [[ ${countdown_until_us:-0} =~ ^[0-9]+$ ]] && ((countdown_until_us > 0)) &&
+      trim_args=(--trim-until-monotonic-us "$countdown_until_us")
+    # stdout is inspected rather than discarded: finalize now distinguishes "the
+    # manifest failed" (fatal, the bundle will not open) from "the camera track did not
+    # survive" (the screen recording is fine and editable, minus the camera), and those
+    # two deserve different things said to the user.
+    local finalize_out
+    if finalize_out=$(studio_capture finalize --root "$bundle" "${camera_args[@]}" "${trim_args[@]}" 2>>"$LOG_FILE"); then
+      echo "$finalize_out" >>"$LOG_FILE"
+      if [[ $finalize_out == *CAMERA_UNREADABLE=* ]]; then
+        omarchy-notification-send -u critical -t 5000 "Webcam track was lost" \
+          "The screen recording is fine and will open in the editor; only the camera is missing."
+      fi
+    else
       omarchy-notification-send -u critical -t 5000 "Screen recording error" \
         "The media was saved but capture.json could not be completed: $bundle"
     fi
     master="$bundle/media/screen.mp4"
   fi
 
+  trail "stopped: $master"
   echo "$master"
   announce_recording "$master"
-  rm -f "$RECORDING_FILE" "$BUNDLE_FILE"
+  rm -f "$RECORDING_FILE" "$BUNDLE_FILE" "$COUNTDOWN_FILE"
 }
 
 announce_recording() {
@@ -476,12 +839,14 @@ announce_recording() {
   local bundle_dir=""
   [[ $master == */media/screen.mp4 ]] && bundle_dir="${master%/media/screen.mp4}"
 
+  trail "announce: bundle=${bundle_dir:-none} deliberate=$STOPPED_DELIBERATELY editor=$(command -v omarchy-studio >/dev/null && echo yes || echo no)"
   if [[ -n $bundle_dir && $STOPPED_DELIBERATELY == "true" ]] && command -v omarchy-studio >/dev/null; then
     omarchy-notification-send "Screen recording saved" "Opening the editor" \
       -t 4000 --image "${preview:-$master}"
     # setsid so the editor outlives the shell that stopped the recording -- otherwise
     # closing the terminal takes the window with it.
     setsid omarchy-studio "$bundle_dir" >/dev/null 2>&1 &
+    trail "announce: launched the editor (pid $!)"
   elif [[ -n $bundle_dir ]] && command -v omarchy-studio >/dev/null; then
     omarchy-notification-send "Screen recording saved" "Click to edit" \
       -t 10000 --image "${preview:-$master}" \

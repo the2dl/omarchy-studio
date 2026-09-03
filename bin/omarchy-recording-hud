@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""The recording HUD: a floating pill that can stop the take you are in.
+
+# omarchy:summary=Floating recording controls: elapsed, mic level, pause, discard, stop
+# omarchy:group=capture
+# omarchy:args=[--socket <gsr.sock>] [--bundle <dir>] [--mic-device <name>] [--elapsed-from <monotonic-seconds>]
+# omarchy:hidden=true
+
+WHY. A recording could previously only be stopped from the terminal that started it, a
+global hotkey, or the bar indicator. The terminal is the one you cannot see -- whatever
+you are demonstrating is on top of it -- and it is worse than invisible: the launcher
+returns while gsr keeps running, and the shell it returned to is left with its
+foreground process group pointing at a pgid that no longer exists, so it stops accepting
+input at all. The recorder needed an on-screen stop button more than it needed anything
+else on the HUD.
+
+IT MUST NOT BE IN THE RECORDING, and unlike the teleprompter that is not negotiable: a
+prompter in the corner of a take is embarrassing, a Stop button burned into every frame
+is a re-shoot. So the exclusion is checked rather than assumed, and a compositor that
+cannot do it gets no HUD at all -- there is no --anyway here.
+
+Launch pattern shared with bin/omarchy-capture-setup and bin/omarchy-teleprompter, each
+note a past debugging session: /usr/bin/qml6 by absolute path (plain `qml` is Qt 5.15
+and dies silently), QT_ASSUME_STDERR_HAS_CONSOLE=1 (or QML warnings vanish into the
+journal), and a tokened loopback bridge.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+from omarchy_studio import compositor  # noqa: E402
+from omarchy_studio.micmeter import MicMeter  # noqa: E402
+from omarchy_studio.qmlbridge import theme_tokens  # noqa: E402
+
+QML6 = "/usr/bin/qml6"
+HUD_QML = REPO / "editor" / "hud" / "main.qml"
+WINDOW_TITLE = "omarchy-studio-recording-hud"
+
+# Spec §1c: bottom centre, 26px from the edge.
+EDGE_GAP = 26
+
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+PID_FILE = RUNTIME_DIR / "omarchy-studio-hud.pid"
+
+
+def hypr(*args: str) -> str:
+    try:
+        return subprocess.run(["hyprctl", *args], capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+
+def exclusion_available() -> bool:
+    return compositor.self_view_exclusion_available()
+
+
+def install_window_rule() -> None:
+    """Applied before qml6 spawns so it lands at map time.
+
+    `no_initial_focus` matters here in a way it does not for the setup sheet: the HUD
+    maps in the middle of a take, and stealing focus would drop the keystrokes of
+    whatever is being demonstrated.
+    """
+    rule = (f'hl.window_rule({{ match = {{ title = "^{WINDOW_TITLE}$" }}, '
+            f'float = true, pin = true, no_screen_share = true, no_dim = true, '
+            f'border_size = 0, no_shadow = true, animation = "none", no_anim = true, '
+            f'no_initial_focus = true }})')
+    subprocess.run(["hyprctl", "eval", rule], capture_output=True)
+
+
+def window() -> dict | None:
+    try:
+        for c in json.loads(hypr("clients", "-j") or "[]"):
+            if c.get("title") == WINDOW_TITLE:
+                return c
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
+def rule_landed(address: str) -> bool:
+    """Asked of getprop, never of `hyprctl clients -j`, which has no noScreenShare field
+    at all and answers null for every window -- the trap that silently disabled the
+    camera self-view for every recording."""
+    return hypr("getprop", f"address:{address}", "no_screen_share") == "true"
+
+
+def notify(title: str, body: str, urgency: str = "normal") -> None:
+    subprocess.run(["omarchy-notification-send", "-u", urgency, "-t", "6000",
+                    title, body], capture_output=True)
+
+
+def parse_rect(spec: str) -> tuple[int, int, int, int] | None:
+    m = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", spec or "")
+    return (int(m[3]), int(m[4]), int(m[1]), int(m[2])) if m else None
+
+
+def place(address: str, w: int, h: int, *, backend: str = "",
+          capture_rect: str = "", monitor: str = "") -> None:
+    """Bottom centre of the monitor (spec 1c) -- unless the capture would record it.
+
+    A KMS capture reads the DRM scanout BELOW the compositor, so `no_screen_share` does
+    nothing to it. The HUD was found burned into a window recording, Stop button and
+    all. On that backend the pill has to be physically outside the captured rectangle,
+    and the spec's placement is only right when the capture cannot see it anyway.
+    """
+    try:
+        mons = json.loads(hypr("monitors", "-j") or "[]")
+    except json.JSONDecodeError:
+        return
+    mon = None
+    if monitor:
+        mon = next((m for m in mons if m.get("name") == monitor), None)
+    if mon is None:
+        mon = next((m for m in mons if m.get("focused")), mons[0] if mons else None)
+    if not mon:
+        return
+    scale = mon.get("scale", 1) or 1
+    mx, my = int(mon["x"]), int(mon["y"])
+    mw, mh = int(mon["width"] / scale), int(mon["height"] / scale)
+    x = mx + (mw - w) // 2
+    y = my + mh - h - EDGE_GAP
+
+    rect = parse_rect(capture_rect) if backend == "kms" else None
+    if rect:
+        rx, ry, rw, rh = rect
+        if my + mh - (ry + rh) >= h + EDGE_GAP:
+            y = ry + rh + EDGE_GAP                    # under the capture
+        elif ry - my >= h + EDGE_GAP:
+            y = ry - h - EDGE_GAP                     # above it
+        else:
+            # Nowhere to put it. The HUD stays anyway -- a recording with no stop button
+            # is worse than one with a pill in the corner -- but this must not be
+            # discovered in the export instead.
+            notify("The recording controls will be in this take",
+                   "This capture cannot hide them and there is no room beside it.",
+                   "critical")
+        x = max(mx, min(x, mx + mw - w))
+        y = max(my, min(y, my + mh - h))
+
+    subprocess.run(["hyprctl", "dispatch",
+                    f"hl.dsp.window.move({{ x = {x}, y = {y}, "
+                    f"window = 'address:{address}' }})"], capture_output=True)
+
+
+class Session:
+    """What the HUD shows and what its buttons do.
+
+    `paused` is tracked here rather than asked of gsr: its IPC answers whether a request
+    was accepted, not what state it left behind, and a HUD whose pause button disagrees
+    with the recorder is worse than one that cannot pause.
+    """
+
+    def __init__(self, socket: str, bundle: str, elapsed_from: float | None) -> None:
+        self.socket = socket
+        self.bundle = bundle
+        self.token = secrets.token_urlsafe(16)
+        self.meter = MicMeter()
+        self.paused = False
+        self.stopping = False
+        self.stopped_at: float | None = None
+        self.finished = threading.Event()
+        # CLOCK_MONOTONIC, so the readout survives a wall-clock adjustment mid-take.
+        self.start = elapsed_from if elapsed_from is not None else time.monotonic()
+
+    @property
+    def elapsed(self) -> float:
+        # FROZEN once Stop is pressed. Winding a take down takes a few seconds -- longer
+        # with a camera, whose ffmpeg has its own trailer to flush -- and a clock still
+        # counting through all of it reads as "it is still recording", which is exactly
+        # what it was reported as. The recording has ended; the number should say so.
+        end = self.stopped_at if self.stopped_at is not None else time.monotonic()
+        return max(0.0, end - self.start)
+
+    def ipc(self, request: str) -> bool:
+        if not self.socket:
+            return False
+        r = subprocess.run([str(REPO / "bin" / "omarchy-studio-ipc"), self.socket, request],
+                           capture_output=True, text=True, timeout=20)
+        return r.returncode == 0
+
+    def stop_recording(self) -> None:
+        # --stop-recording, NOT the bare toggle. The bare command is a toggle, and a
+        # stop takes about three seconds to finalize the file -- so a second press,
+        # which is exactly what a person does when the first appears to have done
+        # nothing, arrived after gsr had exited and STARTED A NEW RECORDING. Observed:
+        # the setup picker reopening full-screen moments after Stop. With this flag the
+        # command can only ever stop; it exits 1 when there is nothing to stop.
+        #
+        # Still the recorder rather than a signal to gsr: that path finalizes the file,
+        # stops the camera and the event daemon, refreshes the indicator and opens the
+        # editor. Signalling gsr directly leaves every one of those undone.
+        # DETACHED, and its output thrown away rather than captured. The recorder's own
+        # stop path kills this HUD partway through -- and this process is the one reading
+        # its stdout. With a pipe, that kill closed the read end, the recorder's next
+        # `echo "$master"` took SIGPIPE, and it died before reaching announce_recording:
+        # the take finished correctly and the editor never opened. Nothing here wants the
+        # output, so nothing should be holding a pipe on it.
+        subprocess.Popen([str(REPO / "bin" / "omarchy-capture-screenrecording"),
+                          "--stop-recording"],
+                         stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        self.finished.set()
+
+    def act(self, name: str) -> dict:
+        if name == "pause":
+            self.paused = self.ipc("pause") or self.paused
+        elif name == "resume":
+            if self.ipc("resume"):
+                self.paused = False
+        elif name == "stop":
+            # Latched: the file takes seconds to finalize and the HUD stays on screen for
+            # all of it. Without this the button reads as broken and gets pressed again.
+            if self.stopping:
+                return self.state()
+            self.stopping = True
+            self.stopped_at = time.monotonic()
+            threading.Thread(target=self.stop_recording, daemon=True).start()
+        elif name == "discard":
+            if self.stopping:
+                return self.state()
+            self.stopping = True
+            self.stopped_at = time.monotonic()
+
+            def go():
+                self.stop_recording()
+                # After the stop, so the bundle being removed is a finished one rather
+                # than a directory gsr still has open.
+                if self.bundle and Path(self.bundle).is_dir():
+                    shutil.rmtree(self.bundle, ignore_errors=True)
+            threading.Thread(target=go, daemon=True).start()
+        return self.state()
+
+    def state(self) -> dict:
+        return {"elapsed": round(self.elapsed, 2), "mic_level": round(self.meter.level, 4),
+                "mic_alive": self.meter.alive, "paused": self.paused,
+                "stopping": self.stopping}
+
+
+def serve(session: Session, port: int = 0) -> ThreadingHTTPServer:
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, obj, status=200):
+            body = json.dumps(obj).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authed(self) -> bool:
+            if self.headers.get("X-Studio-Token") == session.token:
+                return True
+            self._send({"error": "bad token"}, 403)
+            return False
+
+        def do_GET(self):
+            if not self._authed():
+                return
+            if self.path == "/state":
+                return self._send(session.state())
+            if self.path == "/theme":
+                return self._send(theme_tokens())
+            self._send({"error": "not found"}, 404)
+
+        def do_POST(self):
+            if not self._authed():
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except json.JSONDecodeError:
+                return self._send({"error": "bad json"}, 400)
+            if self.path == "/action":
+                return self._send(session.act(str(body.get("action", ""))))
+            self._send({"error": "not found"}, 404)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--socket", default="", help="the running gsr's IPC socket")
+    ap.add_argument("--bundle", default="", help="the bundle, for Discard")
+    ap.add_argument("--mic-device", default="", help="PulseAudio source for the meter")
+    ap.add_argument("--elapsed-from", type=float, default=None,
+                    help="CLOCK_MONOTONIC seconds the take started at")
+    ap.add_argument("--backend", default="",
+                    help="kms or portal; a KMS capture cannot hide this window from itself")
+    ap.add_argument("--capture-rect", default="",
+                    help="WxH+X+Y in logical pixels, to place the pill clear of it")
+    ap.add_argument("--monitor", default="", help="the monitor being captured")
+    a = ap.parse_args(argv)
+
+    # A KMS capture can hide nothing from itself, so refusing there would leave the
+    # recording with no stop button at all -- strictly worse. `place` moves the pill
+    # clear of the captured rectangle instead, and says so when it cannot.
+    if a.backend != "kms" and not exclusion_available():
+        # No --anyway. A Stop button burned into every frame of a take is a re-shoot,
+        # and unlike the prompter there is no use for this window off-camera.
+        print("This compositor cannot keep a window out of a screen recording, so the "
+              "HUD would be recorded. Not starting it.\n"
+              "See contrib/hyprland-screenshare-exclude/README.md.", file=sys.stderr)
+        return 1
+
+    session = Session(a.socket, a.bundle, a.elapsed_from)
+    session.meter.start(a.mic_device)
+    server = serve(session)
+    install_window_rule()
+
+    env = dict(os.environ)
+    env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
+    proc = subprocess.Popen(
+        [QML6, "-I", str(REPO / "editor"), str(HUD_QML), "--",
+         "--port", str(server.server_port), "--token", session.token,
+         "--theme", json.dumps(theme_tokens())],
+        env=env)
+    PID_FILE.write_text(str(os.getpid()))
+
+    def terminate(*_):
+        proc.terminate()
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+
+    def settle():
+        for _ in range(80):
+            c = window()
+            if c:
+                if not rule_landed(c.get("address", "")):
+                    # Nothing is worth a Stop button in the video. Take the window away
+                    # rather than let the take be ruined by it.
+                    print("Hyprland did not apply no_screen_share to the HUD; closing it "
+                          "rather than recording it.", file=sys.stderr)
+                    proc.terminate()
+                    return
+                place(c["address"], int(c["size"][0]), int(c["size"][1]),
+                      backend=a.backend, capture_rect=a.capture_rect,
+                      monitor=a.monitor)
+                return
+            time.sleep(0.1)
+    threading.Thread(target=settle, daemon=True).start()
+
+    try:
+        return proc.wait()
+    finally:
+        PID_FILE.unlink(missing_ok=True)
+        session.meter.stop()
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

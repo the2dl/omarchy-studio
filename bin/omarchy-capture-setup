@@ -35,10 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
-import shutil
-import struct
 import subprocess
 import sys
 import threading
@@ -50,6 +47,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 
 from omarchy_studio import setup_sources  # noqa: E402
+from omarchy_studio.micmeter import MicMeter  # noqa: E402
 from omarchy_studio.qmlbridge import theme_tokens  # noqa: E402
 
 QML6 = "/usr/bin/qml6"
@@ -59,9 +57,30 @@ WEBCAM_LIST = "omarchy-capture-webcam-list"
 
 # Window titles are the join key between QML and Hyprland: rules match them before
 # the windows map, dispatches find their addresses after.
-BAR_TITLE = "omarchy-setup-bar"
-OVERLAY_PREFIX = "omarchy-setup-overlay-"
-BAR_MARGIN_BOTTOM = 26   # the HUD's offset in the mock (spec §1c); same shelf here
+# Renamed from "omarchy-setup-overlay-": a dynamic window rule cannot be removed
+# from a running Hyprland, and a no_focus rule matching the old prefix was installed
+# during development. no_focus turned out to block POINTER input too, not just
+# keyboard -- it made the sheet completely deaf, killing Start recording, the window
+# picker and the device lists. Any session that ever ran that build still carries the
+# rule, so the way out is a title it does not match.
+OVERLAY_PREFIX = "omarchy-setup-sheet-"
+# The teleprompter's window title, as bin/omarchy-teleprompter sets it. The sheet has to
+# find that window to draw a drag proxy over it.
+PROMPTER_TITLE = "omarchy-studio-teleprompter"
+
+# Every window of ours, by title prefix, kept out of the Window tab. The first
+# enumeration runs before qml6 spawns and needs none of this; the re-enumerations
+# added for hot-plug (below) run with the sheets and possibly the prompter mapped,
+# and a card offering "capture the sheet that is covering your screen" is not a
+# choice a user can want.
+OUR_WINDOW_PREFIXES = (OVERLAY_PREFIX, PROMPTER_TITLE)
+
+# How often the source lists are rebuilt while the bar is up. Devices are the reason:
+# plugging a camera or a USB/Bluetooth mic in AFTER the bar opened used to leave the
+# chip reading "no camera" for the life of the process, with the shape control disabled
+# beside it -- the device existed, the UI just never asked again. Two seconds is under
+# the "did it not see it?" threshold and costs four short subprocesses when it fires.
+RESCAN_SECONDS = 2.0
 
 
 def _run_json(cmd: list[str]) -> list:
@@ -80,17 +99,32 @@ def _run_text(cmd: list[str]) -> str:
         return ""
 
 
-def default_mic() -> dict | None:
-    """The default PipeWire source's human name for the bar's mic section. The
-    recorder captures whatever the default source is at record time; the bar is a
-    working-mic check, not a device picker."""
-    name = _run_text(["pactl", "get-default-source"]).strip()
-    if not name:
-        return None
-    for src in _run_json(["pactl", "--format=json", "list", "sources"]):
-        if src.get("name") == name:
-            return {"name": name, "label": src.get("description", name)}
-    return {"name": name, "label": name}
+def video_nodes() -> tuple[str, ...]:
+    """The /dev/videoN nodes that exist right now, sorted.
+
+    A free change-detector for the rescan. `omarchy-capture-webcam-list` costs ~86ms
+    -- it runs `v4l2-ctl --info` once per device -- which is most of an enumeration,
+    and re-paying it every two seconds to learn nothing is the kind of idle burn a
+    pre-record surface should not have. Any camera arriving or leaving moves this set,
+    and nothing else does, so it is an exact gate rather than a heuristic.
+    """
+    try:
+        return tuple(sorted(str(p) for p in Path("/dev").glob("video*")))
+    except OSError:
+        return ()
+
+
+def list_mics() -> list[dict]:
+    """Every real capture source, default first, for the bar's mic picker.
+
+    Default first because that is the one the bar opens on and the one most runs
+    keep; the rest follow in pactl order. An empty list means no mic at all, which
+    the bar shows as "no mic" rather than an empty picker."""
+    default = _run_text(["pactl", "get-default-source"]).strip()
+    found = setup_sources.mics(
+        _run_json(["pactl", "--format=json", "list", "sources"]), default)
+    found.sort(key=lambda m: not m["default"])
+    return found
 
 
 # --- Hyprland plumbing --------------------------------------------------------
@@ -120,20 +154,14 @@ def install_window_rules() -> None:
     common = ('float = true, pin = true, no_dim = true, border_size = 0, '
               'animation = "none", opacity = "1 1"')
     rules = [
-        # The bar draws its own frame; Hyprland's border/rounding would clip it.
-        f'hl.window_rule({{ match = {{ title = "^{BAR_TITLE}$" }}, {common}, '
-        f'rounding = 0 }})',
-        # Overlays are transparent monitor-sized sheets: shadow and rounding on
-        # them would draw a visible halo around the whole screen, and stealing
-        # focus from the bar would break its keyboard handling.
-        # no_focus, not just no_initial_focus: with focus-follows-mouse, moving the
-        # pointer across the sheet handed it focus, Hyprland raised the focused window,
-        # and the bar went back under it -- unrecoverably, because the pointer has to
-        # cross the sheet to reach the bar. Keeping focus on the bar is what makes the
-        # raise below stick. Pointer clicks still reach the sheet; only keyboard focus
-        # is refused, and the bar owns every shortcut anyway.
+        # One rule, because there is now one kind of window. The bar used to be a
+        # second, frameless window beside these sheets, and the two could not be kept
+        # in a workable stacking order: the sheet maps second and covered it, raising
+        # the bar did not survive focus-follows-mouse, and no_focus on the sheet only
+        # traded a dead bar for a deaf sheet. The bar is an item inside the sheet now
+        # (editor/setup/SetupBar.qml), so none of that arises.
         f'hl.window_rule({{ match = {{ title = "^{OVERLAY_PREFIX}.*$" }}, {common}, '
-        f'rounding = 0, no_shadow = true, no_initial_focus = true, no_focus = true }})',
+        f'rounding = 0, no_shadow = true }})',
     ]
     for rule in rules:
         subprocess.run(["hyprctl", "eval", rule], capture_output=True)
@@ -145,10 +173,16 @@ def position_windows(mons: list[dict], focused_name: str) -> None:
     rule because it is per-window arithmetic on enumerated monitors, not an
     expression on whichever monitor the window happens to spawn on."""
     by_name = {m["name"]: m for m in mons}
-    deadline = time.monotonic() + 3.0
+    # The clock starts before qml6 has even launched, and the overlays only exist
+    # once the async /sources fetch lands. Three seconds covered a warm start and
+    # nothing else: overrunning it leaves the bar wherever Hyprland first put it --
+    # mid-screen, unpositioned, and never raised, so every control under the overlay
+    # is dead. Observed on a cold start while auditing. Ten seconds is still a bound
+    # (the loop exits the moment everything is placed), just not one a normal launch
+    # can trip over.
+    deadline = time.monotonic() + 10.0
     placed: set[str] = set()
-    bar_addr = ""
-    want = {BAR_TITLE} | {OVERLAY_PREFIX + m["name"] for m in mons}
+    want = {OVERLAY_PREFIX + m["name"] for m in mons}
     while time.monotonic() < deadline and placed != want:
         for c in _run_json(["hyprctl", "clients", "-j"]):
             title = c.get("title", "")
@@ -157,17 +191,10 @@ def position_windows(mons: list[dict], focused_name: str) -> None:
             addr = c.get("address", "")
             if not addr:
                 continue
-            if title == BAR_TITLE:
-                bar_addr = addr
-                mon = by_name.get(focused_name) or mons[0]
-                w, h = int(c["size"][0]), int(c["size"][1])
-                x = mon["x"] + (mon["width"] - w) // 2
-                y = mon["y"] + mon["height"] - h - BAR_MARGIN_BOTTOM
-            else:
-                mon = by_name.get(title[len(OVERLAY_PREFIX):])
-                if mon is None:
-                    continue
-                x, y = mon["x"], mon["y"]
+            mon = by_name.get(title[len(OVERLAY_PREFIX):])
+            if mon is None:
+                continue
+            x, y = mon["x"], mon["y"]
             hypr_dispatch(
                 f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y} }})',
                 ["movewindowpixel", f"exact {x} {y},address:{addr}"])
@@ -182,71 +209,8 @@ def position_windows(mons: list[dict], focused_name: str) -> None:
     # inside the bar's rect arriving at the overlay's handler. Raising the bar last,
     # once everything has mapped, is what makes its controls clickable at all. The
     # picker remaps the surfaces, so this runs again on every reposition.
-    # Raised repeatedly rather than once: after the area picker the surfaces are
-    # destroyed and remapped, and an overlay whose surface commits after our raise
-    # lands back on top. Re-raising across the settle window costs nothing (the
-    # dispatch is idempotent) and is what keeps the bar clickable on the second and
-    # later visits, not just at launch.
-    for i in range(6):
-        if not bar_addr:
-            break
-        hypr_dispatch(
-            f'hl.dsp.window.bring_to_top({{ window = "address:{bar_addr}" }})',
-            ["alterzorder", f"top,address:{bar_addr}"])
-        if i < 5:
-            time.sleep(0.2)
-
 
 # --- mic level ----------------------------------------------------------------
-
-
-class MicMeter:
-    """RMS off the default source via parec, published as a 0..1 level plus dBFS.
-
-    This feeds the bar's "is my mic actually working" meter, not an analyser: 8kHz
-    mono s16, 100ms windows, fast attack / slow decay. If parec is missing or dies,
-    level stays 0 and the meter rests -- setup must never block on audio plumbing.
-    """
-
-    def __init__(self) -> None:
-        self.level = 0.0
-        self.db = -120.0
-        self.alive = False
-        self._proc: subprocess.Popen | None = None
-
-    def start(self) -> None:
-        if shutil.which("parec") is None:
-            return
-        threading.Thread(target=self._pump, daemon=True).start()
-
-    def _pump(self) -> None:
-        try:
-            self._proc = subprocess.Popen(
-                ["parec", "--raw", "--format=s16le", "--rate=8000", "--channels=1",
-                 "--latency-msec=60"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        except OSError:
-            return
-        self.alive = True
-        assert self._proc.stdout is not None
-        window = 800 * 2  # 100ms of s16 mono at 8kHz
-        while True:
-            buf = self._proc.stdout.read(window)
-            if not buf or len(buf) < window:
-                break
-            samples = struct.unpack(f"<{len(buf) // 2}h", buf)
-            rms = math.sqrt(sum(s * s for s in samples) / len(samples)) / 32768.0
-            # Perceptual-ish mapping: -50dB..0dB onto 0..1, so room tone sits in
-            # the tail and speech reaches the accent segments.
-            db = 20.0 * math.log10(rms) if rms > 0 else -120.0
-            target = max(0.0, min(1.0, (db + 50.0) / 50.0))
-            self.level = target if target > self.level else self.level * 0.72
-            self.db = db
-        self.alive = False
-
-    def stop(self) -> None:
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
 
 
 # --- the bridge ---------------------------------------------------------------
@@ -258,24 +222,150 @@ class SetupSession:
         self.countdown = countdown
         self.token = os.urandom(16).hex()
         self.meter = MicMeter()
-        self.sources: dict = {"monitors": [], "windows": [], "cameras": [], "mic": None}
+        self.sources: dict = {"monitors": [], "windows": [], "cameras": [],
+                              "mics": [], "mic": None}
         self.result: dict | None = None
         self.done = threading.Event()
         self.lock = threading.Lock()
         self.reposition: object | None = None   # set by main() once windows exist
+        self.prompter: subprocess.Popen | None = None
+        # True while pick_area holds the screen; pauses the hot-plug rescan.
+        self.picking = False
+        # The monitor set as of the last enumeration; None until the first one, so
+        # that baseline pass does not read as a display having been plugged in.
+        self._monitor_names: list[str] | None = None
+        # The camera scan and the node set it was taken from; see video_nodes().
+        self._cameras: list[dict] | None = None
+        self._camera_nodes: tuple[str, ...] = ()
+        # Set once the user picks a mic by hand, after which the rescan stops
+        # retargeting the meter for them.
+        self.mic_pinned = False
+
+    def prompter_rect(self) -> dict:
+        """Where the teleprompter is, in logical desktop pixels.
+
+        The sheet needs this because it cannot be dragged directly while the sheet is up:
+        the sheet is monitor-sized and takes the pointer, and raising the prompter above
+        it does not hold -- with focus-follows-mouse the pointer must CROSS the sheet to
+        reach the prompter, which focuses and re-raises the sheet, dropping the prompter
+        back under. Verified with bring_to_top: the sheet stayed focused through it. So
+        the sheet draws a proxy over the prompter and moves the real window instead,
+        which is the same thing it already does for the camera self-view.
+        """
+        try:
+            clients = json.loads(_run_text(["hyprctl", "clients", "-j"]) or "[]")
+        except json.JSONDecodeError:
+            return {"running": False}
+        for c in clients:
+            if c.get("title") == PROMPTER_TITLE:
+                at, size = c.get("at") or [0, 0], c.get("size") or [0, 0]
+                return {"running": True, "address": c.get("address", ""),
+                        "x": at[0], "y": at[1], "width": size[0], "height": size[1]}
+        return {"running": False}
+
+    def move_prompter(self, x: int, y: int) -> dict:
+        rect = self.prompter_rect()
+        if not rect.get("running"):
+            return rect
+        hypr_dispatch(
+            f"hl.dsp.window.move({{ x = {int(x)}, y = {int(y)}, "
+            f"window = 'address:{rect['address']}' }})",
+            ["movewindowpixel", f"exact {int(x)} {int(y)},address:{rect['address']}"])
+        rect["x"], rect["y"] = int(x), int(y)
+        return rect
+
+    def set_prompter(self, on: bool) -> bool:
+        """Raise or drop the teleprompter, and answer with what actually happened.
+
+        Its own process, not a window of this one: these surfaces are destroyed the
+        moment Record is pressed and the script has to still be on screen after that,
+        and start_new_session keeps it alive when this launcher's process group goes.
+        Left to warn for itself about a compositor that cannot hide it from the capture
+        -- that warning is the one thing about the prompter worth interrupting for.
+        """
+        if on and (self.prompter is None or self.prompter.poll() is not None):
+            try:
+                self.prompter = subprocess.Popen(
+                    [str(REPO / "bin" / "omarchy-teleprompter"), "--owned-by-recording"],
+                    start_new_session=True,
+                    # STDOUT MUST NOT BE INHERITED. This process's stdout is the contract
+                    # pipe -- bin/omarchy-capture-screenrecording reads the setup JSON
+                    # with `setup_json=$(omarchy-capture-setup)`, and a command
+                    # substitution ends at EOF, which needs EVERY writer to close. The
+                    # prompter is meant to outlive this process, so an inherited stdout
+                    # holds that pipe open forever: the picker exits, the JSON is printed
+                    # and the recorder still blocks in anon_pipe_read, having never
+                    # started. Observed exactly that way -- the recorder's fd 3 and the
+                    # prompter's fd 1 on the same pipe inode.
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+            except OSError:
+                self.prompter = None
+        elif not on and self.prompter is not None:
+            self.prompter.terminate()
+            self.prompter = None
+        return self.prompter is not None and self.prompter.poll() is None
 
     def enumerate(self) -> None:
+        """Rebuild every source list from the live system.
+
+        Called once before qml6 spawns and then every RESCAN_SECONDS, so a device
+        that appears while the bar is open reaches the UI. Writes under the lock
+        because /sources is served from a different thread.
+        """
+        mics = list_mics()
         mons_raw = _run_json(["hyprctl", "monitors", "-j"])
         clients = _run_json(["hyprctl", "clients", "-j"])
         ws = setup_sources.active_workspace(mons_raw)
-        self.focused = next((m["name"] for m in mons_raw if m.get("focused")), "")
-        self.sources = {
+        focused = next((m["name"] for m in mons_raw if m.get("focused")), "")
+        nodes = video_nodes()
+        if nodes != self._camera_nodes or self._cameras is None:
+            self._camera_nodes = nodes
+            self._cameras = setup_sources.cameras(_run_text([WEBCAM_LIST]))
+        fresh = {
             "monitors": setup_sources.monitors(mons_raw),
-            "windows": setup_sources.windows(clients, ws),
-            "cameras": setup_sources.cameras(_run_text([WEBCAM_LIST])),
-            "mic": default_mic(),
-            "focused": self.focused,
+            "windows": setup_sources.windows(clients, ws, OUR_WINDOW_PREFIXES),
+            "cameras": list(self._cameras),
+            "mics": mics,
+            # Kept alongside `mics` so nothing downstream has to special-case an
+            # empty list to answer "is there a mic at all".
+            "mic": mics[0] if mics else None,
+            "focused": focused,
         }
+        names = [m["name"] for m in fresh["monitors"]]
+        with self.lock:
+            self.focused = focused
+            self.sources = fresh
+        # A display that appears gets a sheet -- the Repeater is bound to this list --
+        # but a sheet nobody moves maps wherever Hyprland decides, which on a second
+        # output means that monitor's picker cards are drawn over the wrong screen.
+        # position_windows polls for the titles it wants, so firing it now is fine even
+        # though the new sheet is still a /sources fetch away from existing. `is not
+        # None` and not a truth test: the FIRST enumeration establishes the baseline
+        # (main() places the sheets itself right after), it does not report a change.
+        changed = self._monitor_names is not None and names != self._monitor_names
+        self._monitor_names = names
+        if changed and self.reposition is not None:
+            threading.Thread(target=self.reposition, daemon=True).start()
+        # A mic that appears late is not just a list entry: the meter was started at
+        # launch and, with no mic to open, parec exited and left it dead. Restart it on
+        # the new default -- but only while the user has not picked a device, because
+        # then the meter is answering a question they asked about a specific mic.
+        if not self.mic_pinned:
+            self.meter.retarget(mics[0]["name"] if mics else "")
+
+    def rescan_forever(self) -> None:
+        """The hot-plug poll. Skipped while the Area picker owns the screen: it has
+        frozen a copy of the desktop with our windows unmapped, and enumerating into
+        that would spend four subprocesses describing a world that is on hold."""
+        while not self.done.wait(RESCAN_SECONDS):
+            if self.picking:
+                continue
+            try:
+                self.enumerate()
+            except Exception:
+                pass    # a transient hyprctl/pactl failure must not end the poll
 
     def pick_area(self) -> dict:
         """Run the existing slurp picker; the QML side has already hidden every
@@ -283,12 +373,16 @@ class SetupSession:
         hyprpicker freezes whatever is on screen the instant it starts, and a
         lingering bar burned into the frozen frame was the reason to close first.
         """
-        time.sleep(0.3)
+        self.picking = True
         try:
-            r = subprocess.run([REGION_PICKER, "smart", "--match-monitor"],
-                               capture_output=True, text=True, timeout=300)
-        except (OSError, subprocess.TimeoutExpired):
-            return {"cancelled": True}
+            time.sleep(0.3)
+            try:
+                r = subprocess.run([REGION_PICKER, "smart", "--match-monitor"],
+                                   capture_output=True, text=True, timeout=300)
+            except (OSError, subprocess.TimeoutExpired):
+                return {"cancelled": True}
+        finally:
+            self.picking = False
         if r.returncode != 0 or not r.stdout.strip():
             return {"cancelled": True}
         try:
@@ -331,6 +425,8 @@ def serve(session: SetupSession, port: int) -> ThreadingHTTPServer:
             if self.path == "/sources":
                 with session.lock:
                     return self._send(session.sources)
+            if self.path == "/prompter":
+                return self._send(session.prompter_rect())
             if self.path == "/mic":
                 return self._send({"level": session.meter.level,
                                    "db": session.meter.db,
@@ -353,6 +449,18 @@ def serve(session: SetupSession, port: int) -> ThreadingHTTPServer:
                 if session.reposition is not None:
                     threading.Thread(target=session.reposition, daemon=True).start()
                 return self._send(reply)
+            if self.path == "/prompter":
+                if "move" in body:
+                    m = body["move"] or {}
+                    return self._send(session.move_prompter(m.get("x", 0), m.get("y", 0)))
+                return self._send({"on": session.set_prompter(bool(body.get("on")))})
+            if self.path == "/mic-device":
+                # The picker retargets the meter so the level answers for the device
+                # about to be recorded, not the one that happened to be default.
+                device = str(body.get("device") or "")
+                session.mic_pinned = True
+                session.meter.retarget(device)
+                return self._send({"ok": True, "device": device})
             if self.path == "/done":
                 try:
                     session.result = setup_sources.config(
@@ -361,6 +469,8 @@ def serve(session: SetupSession, port: int) -> ThreadingHTTPServer:
                         desktop_audio=body.get("desktop_audio", False),
                         camera=body.get("camera", "off"),
                         camera_device=body.get("camera_device"),
+                        mic_device=body.get("mic_device"),
+                        camera_rect=body.get("camera_rect"),
                         countdown=session.countdown,
                     )
                 except ValueError as e:
@@ -392,7 +502,15 @@ def main(argv: list[str] | None = None) -> int:
                          "minus the human")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--mode", type=int, default=0,
-                    help="open on this mode (0-3); a verification hook, not UX")
+                    help="open on this mode (0-2); a verification hook, not UX")
+    ap.add_argument("--open-picker", default="", choices=["", "mic", "camera"],
+                    help="open a device list at startup; a verification hook, not UX")
+    ap.add_argument("--camera-shape", default="",
+                    choices=["", "circle", "rounded", "rect"],
+                    help="open with the self-view showing; a verification hook, not UX")
+    ap.add_argument("--probe-input", action="store_true",
+                    help="report every control's screen rect and every pointer "
+                         "position each window receives, for tests/input_audit.py")
     a = ap.parse_args(argv)
 
     if not Path(QML6).exists():
@@ -404,7 +522,9 @@ def main(argv: list[str] | None = None) -> int:
     if not session.sources["monitors"]:
         print("no monitors reported by hyprctl; is Hyprland running?", file=sys.stderr)
         return 2
-    session.meter.start()
+    # The meter is started by enumerate(), which is also what re-points it when a mic
+    # appears later -- two starters would race over MicMeter's generation counter.
+    threading.Thread(target=session.rescan_forever, daemon=True).start()
     server = serve(session, a.port)
     install_window_rules()
 
@@ -419,6 +539,12 @@ def main(argv: list[str] | None = None) -> int:
         argvq += ["--selftest-record", str(a.selftest_record)]
     if a.mode:
         argvq += ["--mode", str(a.mode)]
+    if a.probe_input:
+        argvq += ["--probe-input", "1"]
+    if a.open_picker:
+        argvq += ["--open-picker", a.open_picker]
+    if a.camera_shape:
+        argvq += ["--camera-shape", a.camera_shape]
     proc = subprocess.Popen(argvq, env=env)
 
     session.reposition = lambda: position_windows(session.sources["monitors"],
@@ -461,7 +587,16 @@ def main(argv: list[str] | None = None) -> int:
             # frame before the consumer starts keeping everything it captures.
             time.sleep(0.4)
             print(json.dumps(session.result), flush=True)
+        # Record was pressed: the RECORDING owns the prompter now, and the recorder's
+        # stop path closes it. Leaving it up is the whole point -- it has to outlive
+        # these surfaces to be readable during the take.
         return 0
+
+    # Cancelled. Nothing owns the prompter, so whoever raised it has to put it back:
+    # a Script toggle that leaves a window on screen after you escape the picker is a
+    # window you then have to go and hunt for, and on a KMS capture it is a window that
+    # will be in the NEXT take.
+    session.set_prompter(False)
     return 1
 
 

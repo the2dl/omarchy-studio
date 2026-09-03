@@ -1,0 +1,267 @@
+diff --git i/src/config/values/ConfigValues.cpp w/src/config/values/ConfigValues.cpp
+index 4954aeb..8777e3c 100644
+--- i/src/config/values/ConfigValues.cpp
++++ w/src/config/values/ConfigValues.cpp
+@@ -577,6 +577,8 @@ std::vector<SP<IValue>> Values::getConfigValues() {
+         MS<Int>("render:use_fp16", "Use experimental internal FP16 buffer.", 2, {.min = 0, .max = 2, .map = OptionMap{{"disable", 0}, {"enable", 1}, {"auto", 2}}}),
+         MS<Int>("render:keep_unmodified_copy", "Keep umodified SDR frame copy for sreensharing.", 2,
+                 {.min = 0, .max = 2, .map = OptionMap{{"disable", 0}, {"enable", 1}, {"auto", 2}}}),
++        MS<Bool>("render:screenshare_exclude_windows", "Leave no_screen_share windows out of screenshares (showing what is behind them) instead of covering them with black boxes.",
++                 true),
+         MS<Int>("render:non_shader_cm_interop", "non_shader_cm interaction with ctm proto (hyprsunset and similar).", 2,
+                 {.min = 0, .max = 2, .map = OptionMap{{"disable", 0}, {"enable", 1}, {"auto", 2}}}),
+         MS<Int>("render:fp16_sdr_tf", "Internal workbuffer transfer function for fp16 in SDR mode", 0, {.min = 0, .max = 1, .map = OptionMap{{"monitor", 0}, {"linear", 1}}}),
+diff --git i/src/desktop/state/Fadeout.hpp w/src/desktop/state/Fadeout.hpp
+index f213ebd..d3101f0 100644
+--- i/src/desktop/state/Fadeout.hpp
++++ w/src/desktop/state/Fadeout.hpp
+@@ -58,6 +58,9 @@ namespace Desktop {
+         virtual float                 alpha() const     = 0;
+         virtual bool                  done() const      = 0;
+         virtual SFadeoutRenderEffects effects() const;
++        virtual bool                  noScreenShare() const {
++            return false;
++        }
+ 
+       protected:
+         IFadeout() = default;
+diff --git i/src/desktop/state/WindowFadeout.cpp w/src/desktop/state/WindowFadeout.cpp
+index 5fe198a..45bb226 100644
+--- i/src/desktop/state/WindowFadeout.cpp
++++ w/src/desktop/state/WindowFadeout.cpp
+@@ -61,6 +61,7 @@ SP<CWindowFadeout> CWindowFadeout::create(PHLWINDOW window, SP<Render::IFramebuf
+     fadeout->m_workspace   = window->m_workspace;
+     fadeout->m_framebuffer = snapshot;
+     fadeout->m_zIndex      = windowZIndex(window);
++    fadeout->m_noScreenShare = window->m_ruleApplicator && window->m_ruleApplicator->noScreenShare().valueOrDefault();
+     fadeout->m_sourcePos   = window->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) - MONITOR->m_position;
+     fadeout->m_sourceSize  = window->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+     const bool OVERFULLSCREEN =
+@@ -151,3 +152,7 @@ SFadeoutRenderEffects CWindowFadeout::effects() const {
+ 
+     return effects;
+ }
++
++bool CWindowFadeout::noScreenShare() const {
++    return m_noScreenShare;
++}
+diff --git i/src/desktop/state/WindowFadeout.hpp w/src/desktop/state/WindowFadeout.hpp
+index c9a4ca9..5399a2f 100644
+--- i/src/desktop/state/WindowFadeout.hpp
++++ w/src/desktop/state/WindowFadeout.hpp
+@@ -14,6 +14,7 @@ namespace Desktop {
+         virtual float                 alpha() const override;
+         virtual bool                  done() const override;
+         virtual SFadeoutRenderEffects effects() const override;
++        virtual bool                  noScreenShare() const override;
+ 
+       private:
+         CWindowFadeout() = default;
+@@ -25,6 +26,7 @@ namespace Desktop {
+         Vector2D          m_sourceSize;
+         PHLANIMVAR<float> m_alpha;
+ 
++        bool              m_noScreenShare = false;
+         bool              m_blur          = false;
+         bool              m_blurXray      = false;
+         int               m_rounding      = 0;
+diff --git i/src/managers/screenshare/ScreenshareFrame.cpp w/src/managers/screenshare/ScreenshareFrame.cpp
+index c74adcb..c79e6b6 100644
+--- i/src/managers/screenshare/ScreenshareFrame.cpp
++++ w/src/managers/screenshare/ScreenshareFrame.cpp
+@@ -261,6 +261,10 @@ void CScreenshareFrame::renderMonitor() {
+     }
+ 
+     for (auto const& w : Desktop::windowState()->windows()) {
++        // with render:screenshare_exclude_windows the windows never reached the mirror texture, so there is nothing to cover
++        if (PMONITOR->m_screenshareExcludesWindows)
++            break;
++
+         if (!w->m_ruleApplicator->noScreenShare().valueOrDefault())
+             continue;
+ 
+diff --git i/src/output/Monitor.cpp w/src/output/Monitor.cpp
+index e69d8dd..50c296d 100644
+--- i/src/output/Monitor.cpp
++++ w/src/output/Monitor.cpp
+@@ -2715,6 +2715,11 @@ bool CMonitor::needsUnmodifiedCopy() {
+     if (*PKEEP == 1)
+         return true;
+ 
++    // no_screen_share windows are excluded from the mirror by rendering them without the mirror attachment,
++    // which needs the mirror to be produced as a second render target rather than copied from the final frame
++    if (m_screenshareExcludesWindows)
++        return true;
++
+     const bool HAS_MODS = m_sdrMinLuminance != SDR_MIN_LUMINANCE || m_sdrMaxLuminance != SDR_MAX_LUMINANCE || (m_sdrBrightness > 0 && m_sdrBrightness != 1.0) ||
+         (m_sdrSaturation > 0 && m_sdrSaturation != 1.0);
+ 
+diff --git i/src/output/Monitor.hpp w/src/output/Monitor.hpp
+index 945fecd..992b732 100644
+--- i/src/output/Monitor.hpp
++++ w/src/output/Monitor.hpp
+@@ -370,6 +370,7 @@ namespace Monitor {
+         bool                                m_noShaderCTM      = false; // sets drm CTM, restore needed
+ 
+         bool                                m_blurFBDirty        = true;
++        bool                                m_screenshareExcludesWindows = false; // set per frame by the renderer: no_screen_share windows are kept out of the mirror copy
+         bool                                m_blurFBShouldRender = false;
+ 
+         // For the list lookup
+diff --git i/src/render/ElementRenderer.cpp w/src/render/ElementRenderer.cpp
+index 50b5a79..cbc437b 100644
+--- i/src/render/ElementRenderer.cpp
++++ w/src/render/ElementRenderer.cpp
+@@ -191,6 +191,12 @@ void IElementRenderer::drawHints(WP<CRendererHintsPassElement> element, const CR
+     const auto& m_data = element->m_data;
+     if (m_data.renderModif.has_value())
+         g_pHyprRenderer->m_renderData.renderModif = *m_data.renderModif;
++
++    if (m_data.mirrorWrite.has_value()) {
++        const auto FB = g_pHyprRenderer->m_renderData.mainFB ? g_pHyprRenderer->m_renderData.mainFB : g_pHyprRenderer->m_renderData.currentFB;
++        if (FB)
++            FB->setMirrorWrite(*m_data.mirrorWrite);
++    }
+ }
+ 
+ void IElementRenderer::drawPreBlur(WP<CPreBlurElement> element, const CRegion& damage) {
+diff --git i/src/render/Framebuffer.hpp w/src/render/Framebuffer.hpp
+index 215e5ed..0590771 100644
+--- i/src/render/Framebuffer.hpp
++++ w/src/render/Framebuffer.hpp
+@@ -28,6 +28,10 @@ namespace Render {
+         SP<ITexture>                        getStencilTex();
+         void                                enableMirror(SP<ITexture> tex);
+         void                                disableMirror();
++        // while disabled, draws into this framebuffer do not reach the mirror attachment (no-op without a mirror)
++        virtual void                        setMirrorWrite(bool enabled) {
++            ;
++        }
+         NColorManagement::PImageDescription imageDescription();
+         void                                setImageDescription(NColorManagement::PImageDescription desc);
+ 
+diff --git i/src/render/Renderer.cpp w/src/render/Renderer.cpp
+index 249f084..078335b 100644
+--- i/src/render/Renderer.cpp
++++ w/src/render/Renderer.cpp
+@@ -558,6 +558,16 @@ void IHyprRenderer::renderWindow(PHLWINDOW pWindow, PHLMONITOR pMonitor, const T
+ 
+     TRACY_GPU_ZONE("RenderWindow");
+ 
++    // keep no_screen_share windows out of the mirror copy that screenshares read from
++    const bool EXCLUDE_FROM_MIRROR =
++        !standalone && m_renderMode == RENDER_MODE_NORMAL && pMonitor->m_screenshareExcludesWindows && pWindow->m_ruleApplicator->noScreenShare().valueOrDefault();
++    if (EXCLUDE_FROM_MIRROR)
++        addPassElement(makeUnique<CRendererHintsPassElement>(CRendererHintsPassElement::SData{.mirrorWrite = false}));
++    CScopeGuard mirrorWriteRestore([this, EXCLUDE_FROM_MIRROR] {
++        if (EXCLUDE_FROM_MIRROR)
++            addPassElement(makeUnique<CRendererHintsPassElement>(CRendererHintsPassElement::SData{.mirrorWrite = true}));
++    });
++
+     const auto  PWORKSPACE = pWindow->m_workspace;
+     const auto  REALPOS    = pWindow->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + (pWindow->m_pinned ? Vector2D{} : PWORKSPACE->m_renderOffset->value());
+     static auto PDIMAROUND = CConfigValue<Config::FLOAT>("decoration:dim_around");
+@@ -2136,6 +2146,34 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
+         m_renderData.useNearestNeighbor = false;
+     }
+ 
++    // no_screen_share windows: instead of covering them with black boxes in screenshare frames, keep them out of the
++    // mirror copy altogether by drawing them without the mirror attachment (see renderWindow / CScreenshareFrame::renderMonitor)
++    {
++        static auto PEXCLUDE = CConfigValue<Config::INTEGER>("render:screenshare_exclude_windows");
++        bool        exclude  = false;
++        if (*PEXCLUDE && pMonitor->needsACopyFB()) {
++            for (auto const& w : Desktop::windowState()->windows()) {
++                if (!w->m_isMapped || w->isHidden() || !w->m_ruleApplicator->noScreenShare().valueOrDefault() || !shouldRenderWindow(w, pMonitor))
++                    continue;
++                exclude = true;
++                break;
++            }
++            if (!exclude) {
++                for (auto const& f : Desktop::fadingOutState()->fadeouts()) {
++                    if (!f || f->monitor() != pMonitor || !f->noScreenShare())
++                        continue;
++                    exclude = true;
++                    break;
++                }
++            }
++        }
++
++        if (exclude != pMonitor->m_screenshareExcludesWindows) {
++            pMonitor->m_screenshareExcludesWindows = exclude;
++            pMonitor->resources()->invalidateMirrorFB(); // the mirror has to be rebuilt with (or without) those windows
++        }
++    }
++
+     CRegion damage, finalDamage;
+     if (!beginRender(pMonitor, damage, RENDER_MODE_NORMAL)) {
+         Log::logger->log(Log::ERR, "renderer: couldn't beginRender()!");
+@@ -3250,6 +3288,11 @@ void IHyprRenderer::renderFadeouts(PHLMONITOR monitor, Desktop::eFadeoutPlane pl
+ 
+         const auto EFFECTS = fadeout->effects();
+ 
++        // a closing no_screen_share window keeps its exclusion while it fades out
++        const bool EXCLUDE_FROM_MIRROR = fadeout->noScreenShare() && monitor->m_screenshareExcludesWindows;
++        if (EXCLUDE_FROM_MIRROR)
++            m_renderPass.add(makeUnique<CRendererHintsPassElement>(CRendererHintsPassElement::SData{.mirrorWrite = false}));
++
+         if (EFFECTS.dimAroundAlpha > 0.F) {
+             CRectPassElement::SRectData data;
+             data.box   = {0, 0, monitor->m_transformedSize.x, monitor->m_transformedSize.y};
+@@ -3282,6 +3325,9 @@ void IHyprRenderer::renderFadeouts(PHLMONITOR monitor, Desktop::eFadeoutPlane pl
+         data.blockBlurOptimization = EFFECTS.textureBlur.blockBlurOptimization;
+ 
+         m_renderPass.add(makeUnique<CTexPassElement>(std::move(data)));
++
++        if (EXCLUDE_FROM_MIRROR)
++            m_renderPass.add(makeUnique<CRendererHintsPassElement>(CRendererHintsPassElement::SData{.mirrorWrite = true}));
+     }
+ }
+ 
+diff --git i/src/render/gl/GLFramebuffer.cpp w/src/render/gl/GLFramebuffer.cpp
+index 695b578..79f655f 100644
+--- i/src/render/gl/GLFramebuffer.cpp
++++ w/src/render/gl/GLFramebuffer.cpp
+@@ -105,6 +105,18 @@ void CGLFramebuffer::bind() {
+         glViewport(0, 0, m_size.x, m_size.y);
+ }
+ 
++void CGLFramebuffer::setMirrorWrite(bool enabled) {
++    if (!m_fbAllocated || !m_mirrorTex)
++        return;
++
++    GLint prev = 0;
++    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_fb);
++    const GLenum drawBuffers[] = {GL_COLOR_ATTACHMENT0, enabled ? GL_COLOR_ATTACHMENT1 : GL_NONE};
++    glDrawBuffers(2, drawBuffers);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, sc<GLuint>(prev));
++}
++
+ void CGLFramebuffer::unbind() {
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+ }
+diff --git i/src/render/gl/GLFramebuffer.hpp w/src/render/gl/GLFramebuffer.hpp
+index 1927504..5b29892 100644
+--- i/src/render/gl/GLFramebuffer.hpp
++++ w/src/render/gl/GLFramebuffer.hpp
+@@ -17,6 +17,7 @@ namespace Render::GL {
+         bool   readPixels(CHLBufferReference buffer, uint32_t offsetX = 0, uint32_t offsetY = 0, uint32_t width = 0, uint32_t height = 0) override;
+ 
+         void   bind() override;
++        void   setMirrorWrite(bool enabled) override;
+         void   unbind();
+         GLuint getFBID();
+         void   invalidate(const std::vector<GLenum>& attachments);
+diff --git i/src/render/pass/RendererHintsPassElement.hpp w/src/render/pass/RendererHintsPassElement.hpp
+index 0a24ff6..0ac3ead 100644
+--- i/src/render/pass/RendererHintsPassElement.hpp
++++ w/src/render/pass/RendererHintsPassElement.hpp
+@@ -6,6 +6,7 @@ class CRendererHintsPassElement : public IPassElement {
+   public:
+     struct SData {
+         std::optional<Render::SRenderModifData> renderModif;
++        std::optional<bool>                     mirrorWrite; // toggle writes to the main FB's mirror attachment
+     };
+ 
+     CRendererHintsPassElement(const SData& data);

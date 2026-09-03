@@ -97,6 +97,14 @@ QtObject {
         send("GET", "/theme", null, function (t, ok) { if (ok) Theme.load(t) })
     }
 
+    // The backdrop catalogue. Fetched once and held, on its own route rather than in
+    // /state, because /state is re-serialized on every drag frame and the catalogue
+    // never changes for the life of the process.
+    property var backgrounds: ({ custom: "custom", entries: [] })
+    function loadBackgrounds() {
+        send("GET", "/backgrounds", null, function (b, ok) { if (ok) backgrounds = b })
+    }
+
     function op(name, args, cb) {
         send("POST", "/op", { op: name, args: args || {} }, function (s, ok) {
             if (ok)
@@ -162,6 +170,7 @@ QtObject {
         bundle = arg("--bundle", "")
         selftestMs = parseInt(arg("--selftest", "0"))
         loadTheme()
+        loadBackgrounds()
         refresh()
     }
 }

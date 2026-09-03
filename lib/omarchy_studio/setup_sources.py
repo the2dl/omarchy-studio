@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-CAMERA_MODES = ("off", "circle", "corner")
+CAMERA_MODES = ("off", "circle", "rounded", "rect")
 
 _REGION_RE = re.compile(r"^region:(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$")
 _SLURP_RE = re.compile(r"^(-?\d+),(-?\d+) (\d+)x(\d+)$")
@@ -68,13 +68,21 @@ def active_workspace(payload: list[dict]) -> int | None:
 # --- windows -----------------------------------------------------------------
 
 
-def windows(clients: list[dict], workspace_id: int | None) -> list[dict]:
+def windows(clients: list[dict], workspace_id: int | None,
+            skip_prefixes: tuple[str, ...] = ()) -> list[dict]:
     """Window-tab sources: active workspace only, hidden dropped, geometry deduped.
 
     The dedupe keeps the FIRST client at each geometry -- hidden group members and
     exactly-stacked windows collapse to one card, for the same reason capture-region
     collapses them: the capture rectangle is identical, so a second card would be a
     duplicate choice, not a second window.
+
+    `skip_prefixes` drops windows by title prefix, and exists because enumeration is
+    no longer a once-at-launch thing. The first pass runs before qml6 spawns and has
+    nothing of ours to hide; every RE-enumeration (a camera was plugged in, so the
+    lists rebuild) runs with our own sheets and the teleprompter mapped, and offering
+    the user the monitor-sized sheet that is covering their screen as a capture
+    target is not a choice, it is a bug with a card drawn around it.
     """
     out: list[dict] = []
     seen: set[tuple[int, int, int, int]] = set()
@@ -82,6 +90,9 @@ def windows(clients: list[dict], workspace_id: int | None) -> list[dict]:
         if workspace_id is None or c.get("workspace", {}).get("id") != workspace_id:
             continue
         if c.get("hidden"):
+            continue
+        title = str(c.get("title") or "")
+        if any(title.startswith(p) for p in skip_prefixes):
             continue
         x, y = int(c["at"][0]), int(c["at"][1])
         w, h = int(c["size"][0]), int(c["size"][1])
@@ -108,6 +119,32 @@ def cameras(listing: str) -> list[dict]:
         m = re.match(r"^(/dev/video\d+)\s+(.*)$", line.strip())
         if m:
             out.append({"device": m.group(1), "name": m.group(2).strip() or m.group(1)})
+    return out
+
+
+# --- microphones -------------------------------------------------------------
+
+
+def mics(payload: list[dict], default_name: str = "") -> list[dict]:
+    """Real capture devices from `pactl --format=json list sources`.
+
+    Monitor sources are dropped: every output has one, they outnumber the real
+    inputs, and recording a monitor as "the mic" records the desktop back into the
+    voice track. `default` marks the one PipeWire would pick, so the bar can open on
+    it without a second query.
+    """
+    out = []
+    for src in payload:
+        name = str(src.get("name") or "")
+        if not name or name.endswith(".monitor"):
+            continue
+        if str(src.get("monitor_source") or "") not in ("", "null"):
+            continue
+        out.append({
+            "name": name,
+            "label": str(src.get("description") or name),
+            "default": name == default_name,
+        })
     return out
 
 
@@ -160,18 +197,52 @@ def parse_target(target: str) -> dict:
 # --- the stdout contract ------------------------------------------------------
 
 
+def parse_camera_rect(raw: Any) -> dict[str, int] | None:
+    """The self-view's placement, in absolute LOGICAL desktop pixels, or None.
+
+    Absolute rather than normalized because the bar does not know what it is
+    normalizing against: the self-view is dragged on a monitor-sized sheet, while the
+    capture may be a region somewhere inside that monitor. Only capture.begin knows the
+    capture rectangle, so it does the division and this stays a plain rect.
+
+    None is a legitimate answer -- no camera, or a build of the bar that does not send
+    one -- and means "use WebcamSettings' defaults", which is what every run did before
+    the placement was carried at all.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"camera_rect must be an object, not {type(raw).__name__}")
+    try:
+        rect = {k: int(round(float(raw[k]))) for k in ("x", "y", "width", "height")}
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"camera_rect needs numeric x/y/width/height: {raw!r}") from e
+    if rect["width"] <= 0 or rect["height"] <= 0:
+        raise ValueError(f"degenerate camera_rect {raw!r}")
+    return rect
+
+
 def config(target: str, mic: bool, desktop_audio: bool,
            camera: str, camera_device: str | None,
-           countdown: int = 3) -> dict[str, Any]:
+           countdown: int = 3, mic_device: str | None = None,
+           camera_rect: Any = None) -> dict[str, Any]:
     """The one line bin/omarchy-capture-setup prints, validated.
 
     Keys are always all present (the consumer must not need .get defaults):
       target         monitor:NAME | region:WxH+X+Y | camera:/dev/videoN
-      mic            bool -- record the default microphone
+      mic            bool -- record the microphone
+      mic_device     the PulseAudio source to record, or null for the default one.
+                     Null is not "no mic" -- `mic` decides that; it means the
+                     recorder resolves the default at record time, which is the
+                     right behaviour when the user never touched the picker.
       desktop_audio  bool -- record system audio
-      camera         off | circle | corner (overlay shape; forced off for a
+      camera         off | circle | rounded | rect (overlay shape; forced off for a
                      camera: target, where the camera IS the recording)
       camera_device  /dev/videoN or null when no camera exists
+      camera_rect    where the self-view was left, as {x, y, width, height} in
+                     absolute logical desktop pixels, or null. Null means "use the
+                     WebcamSettings defaults" -- the placement is a preference, and a
+                     recording must never fail for want of one.
       countdown      whole seconds of on-screen countdown AFTER the line printed.
                      When > 0 the line is emitted the moment Start is pressed so
                      capture init can overlap the countdown; every setup surface
@@ -186,6 +257,10 @@ def config(target: str, mic: bool, desktop_audio: bool,
         raise ValueError(f"camera must be one of {CAMERA_MODES}, not {camera!r}")
     if camera_device is not None and not re.match(r"^/dev/video\d+$", camera_device):
         raise ValueError(f"bad camera_device: {camera_device!r}")
+    # A source name reaches a shell as one gsr -a argument; anything with
+    # whitespace in it is either not a real name or an injection attempt.
+    if mic_device is not None and not re.match(r"^[A-Za-z0-9_.:+-]+$", mic_device):
+        raise ValueError(f"bad mic_device: {mic_device!r}")
     if parsed["kind"] == "camera":
         # Recording the camera full-frame and overlaying it on itself is not a
         # thing; the setup UI disables the overlay row, and this guard makes the
@@ -194,11 +269,14 @@ def config(target: str, mic: bool, desktop_audio: bool,
         camera_device = parsed["device"]
     if camera != "off" and camera_device is None:
         raise ValueError("camera overlay requested but no camera_device")
+    rect = parse_camera_rect(camera_rect) if camera != "off" else None
     return {
         "target": target,
         "mic": bool(mic),
+        "mic_device": mic_device if mic else None,
         "desktop_audio": bool(desktop_audio),
         "camera": camera,
         "camera_device": camera_device,
+        "camera_rect": rect,
         "countdown": countdown,
     }

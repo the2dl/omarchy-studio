@@ -26,6 +26,7 @@ import argparse
 import json
 import re
 import shlex
+import statistics
 import subprocess
 import sys
 import time
@@ -133,11 +134,17 @@ def read_camera_realtime_us(tsv: Path | None, video: Path) -> int:
             line = line.strip()
             if line and not line.startswith("#"):
                 return int(float(line) * 1000)
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=start_time",
-         "-of", "csv=p=0", str(video)],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=start_time",
+             "-of", "csv=p=0", str(video)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as e:
+        # A camera file ffmpeg never got to close has no moov atom, and ffprobe exits
+        # non-zero on it. Raised as a CaptureError so finalize can treat it as "no
+        # usable camera" rather than dying on an unhandled CalledProcessError.
+        raise CaptureError(f"{video} is unreadable: {getattr(e, 'stderr', '') or e}") from e
     try:
         return int(float(out) * 1e6)
     except ValueError as e:
@@ -159,7 +166,148 @@ def realtime_to_monotonic_us(realtime_us: int, reference: tuple[int, int] | None
     return realtime_us + (now_mono - now_real)
 
 
+# --- camera warm-up ---------------------------------------------------------
+#
+# The sensor is still opening its iris when ffmpeg starts writing frames. On
+# media/cam.mp4 of the 2026-09-03_07-55-15 capture the mean luma runs
+#
+#     0.9  0.9  15  40  56  66  78  91  100  101  103  ...  ~106 from here on
+#
+# and the 2026-09-02_21-45-14 capture does the same thing one frame slower. That ramp is
+# recorded, so every export used to open with the camera bubble fading up out of black.
+# The render holds a settled frame across the head instead (render._align_camera), and
+# this is where the "how many frames are warm-up" question is answered -- once, at
+# finalize, beside every other derived fact about the media. Answering it at render time
+# would re-decode the camera's head on every export and every proxy build.
+
+# Everything below is in the CAMERA's own frames, and every threshold is RELATIVE to
+# what the camera settled at. An absolute luma cutoff would declare a legitimately dark
+# room -- dim from frame 0 to the last one -- to be one long warm-up and trim it away.
+#
+# Probe 2.5 s and take the settled reference from everything past the 1.5 s clamp, so
+# the reference can never be drawn out of a candidate warm-up. That leaves a 1 s (30
+# frame) median, long enough to shrug off a blink, and costs 0.28 s to decode.
+_WARMUP_PROBE_SECONDS = 2.5
+# A warm-up longer than this is not a warm-up, it is the content -- somebody switching a
+# lamp on. The two measured captures ramp in 0.30 s and 0.33 s and V4L2's own pipeline
+# warm-up is 210-228 ms, so 1.5 s is about five times the worst case seen. Past it we
+# clamp and move on rather than deciding the whole take is a fade-in.
+_WARMUP_MAX_SECONDS = 1.5
+# The ramp is over once the frame reaches this fraction of the settled level. Not
+# tighter: the settled level is not a constant, because auto-exposure keeps hunting --
+# the same file drifts 106.6 -> 104.4 across its first four seconds -- so a 0.98 would
+# chase that wobble and trim live content. 0.95 lands on frame 9 of the file above,
+# where the ramp is already within 5% and the fade is no longer visible in a bubble a
+# seventh of the frame wide.
+_WARMUP_SETTLED_FRACTION = 0.95
+# ...and nothing is a warm-up unless the head actually started DARK relative to where it
+# ended. This is the gate that protects the dark room: the bug's signature is 0.9
+# against 106, a ratio of 0.009, while a merely dim room begins within a few percent of
+# where it ends and never trips this.
+_WARMUP_DARK_FRACTION = 0.5
+# A stream that is black throughout (lens cap, disconnected sensor) has no settled level
+# to measure against and nothing to gain from trimming.
+_WARMUP_MIN_SETTLED_LUMA = 2.0
+
+_YAVG_RE = re.compile(r"lavfi\.signalstats\.YAVG=([0-9.]+)")
+
+
+def head_luma(path: Path, frames: int) -> list[float]:
+    """Mean luma of the first `frames` frames, one float each.
+
+    `-frames:v` on the output rather than a `select` in the graph: select still decodes
+    the whole file, while the frame limit stops the decoder (0.28 s against a full pass
+    over a 32 MB camera file). `signalstats` is the cheapest per-frame average ffmpeg
+    already has, and `metadata=print` is how it gets out to a pipe.
+    """
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path),
+         "-frames:v", str(int(frames)),
+         "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+         "-fps_mode", "passthrough", "-f", "null", "-"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return [float(m) for m in _YAVG_RE.findall(out)]
+
+
+def measure_warmup_frames(path: Path, fps: float) -> int:
+    """Frames of auto-exposure ramp at the head of a camera file, in ITS OWN frames.
+
+    Zero is the normal answer and the safe one: a camera that starts settled must leave
+    the render exactly as it was. So every way this can fail -- no ffmpeg, an
+    unparseable stream, a clip too short to hold a reference -- returns 0 rather than
+    raising. A warm-up we failed to measure costs the first tenth of a second of one
+    camera bubble; a finalize that died measuring it costs the whole recording.
+    """
+    if fps <= 0:
+        return 0
+    try:
+        ys = head_luma(path, max(4, round(_WARMUP_PROBE_SECONDS * fps)))
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return 0
+    if len(ys) < 4:
+        return 0
+
+    # len(ys) - 1 so a clip shorter than the clamp can never be trimmed away entirely:
+    # `tpad` clones the first surviving frame, and there has to be one.
+    clamp = min(round(_WARMUP_MAX_SECONDS * fps), len(ys) - 1)
+    tail = ys[clamp:]
+    if len(tail) < 3:
+        # A clip shorter than the probe window has no room past the clamp, so the
+        # reference comes from its last third instead. Any warm-up still inside that
+        # third drags the reference DOWN, which shortens the trim -- erring towards
+        # leaving a frame of ramp in, never towards eating live footage.
+        tail = ys[-max(3, len(ys) // 3):]
+    settled = statistics.median(tail)
+    if settled < _WARMUP_MIN_SETTLED_LUMA:
+        return 0
+    if ys[0] >= _WARMUP_DARK_FRACTION * settled:
+        return 0
+
+    floor = _WARMUP_SETTLED_FRACTION * settled
+    # The LAST frame below the floor, not the first at or above it: the ramp is not
+    # monotonic (frames 2 and 3 of the 09-02 capture both sit at 13.7 before it moves
+    # again), and a single frame that overshoots must not end the warm-up early.
+    warmup = 0
+    for i in range(clamp):
+        if ys[i] < floor:
+            warmup = i + 1
+    return warmup
+
+
 # --- manifest ---------------------------------------------------------------
+
+
+# The setup bar and WebcamSettings share one vocabulary now, so this is the identity --
+# and that is the point of still writing it down. It used to translate, badly: the bar
+# said "squircle" and "corner" for what the model called "squircle" and "rounded", the
+# editor panel offered a third set of names, and a shape chosen before recording was not
+# the shape the editor showed afterwards. WebcamSettings.LEGACY_SHAPES carries the old
+# names forward for bundles already on disk.
+SETUP_SHAPES = {"circle": "circle", "rounded": "rounded", "rect": "rect"}
+
+
+def camera_placement(rect: dict, logical: dict, shape: str = "circle") -> dict:
+    """The self-view's absolute logical rect as WebcamSettings fields.
+
+    The setup bar drags the self-view on a MONITOR-sized sheet, but the camera overlay
+    is normalized against the CAPTURE rectangle, and those are only the same thing when
+    the whole display is being recorded. Doing the division here, where the capture rect
+    is known, is what lets the bar stay ignorant of the target it is placing against.
+
+    Clamped into the capture rect rather than rejected: a camera dragged half outside a
+    region is a placement the user can still see and fix in the editor, and refusing the
+    recording over it would be absurd.
+    """
+    w = min(max(rect["width"] / logical["width"], 0.02), 1.0)
+    h = min(max(rect["height"] / logical["height"], 0.02), 1.0)
+    x = min(max((rect["x"] - logical["x"]) / logical["width"], 0.0), 1.0 - w)
+    y = min(max((rect["y"] - logical["y"]) / logical["height"], 0.0), 1.0 - h)
+    # "corner" is the bar's name for the rounded-rectangle preset; WebcamSettings has
+    # only ever known it as "rounded", and the export reads that name. Everything else
+    # is spelled the same on both sides.
+    return {"x": round(x, 5), "y": round(y, 5), "w": round(w, 5), "h": round(h, 5),
+            "shape": SETUP_SHAPES.get(shape, "circle")}
 
 
 def begin(
@@ -170,8 +318,16 @@ def begin(
     monitor_scale: float = 1.0,
     camera_burned_in: bool = False,
     calibration_c_ms: float = 0.0,
+    camera_rect: dict | None = None,
+    camera_shape: str = "circle",
 ) -> Bundle:
-    """Lay out the bundle and record everything that is only knowable now."""
+    """Lay out the bundle and record everything that is only knowable now.
+
+    `camera_rect` is the self-view's absolute logical rectangle from the setup bar. It
+    lands in edit.json rather than capture.json on purpose: where the camera sits is an
+    editing decision the user goes on to change, and capture.json is the immutable
+    record of what the hardware did.
+    """
     capture = Capture(
         created=datetime.now().astimezone().isoformat(timespec="seconds"),
         logical_geometry=dict(logical_geometry),
@@ -181,7 +337,13 @@ def begin(
         calibration_c_ms=float(calibration_c_ms),
         camera_burned_in=bool(camera_burned_in),
     )
-    return project.create(Path(root), capture)
+    bundle = project.create(Path(root), capture)
+    if camera_rect:
+        placement = camera_placement(camera_rect, logical_geometry, camera_shape)
+        for field, value in placement.items():
+            setattr(bundle.edit.webcam, field, value)
+        bundle.save_edit()
+    return bundle
 
 
 def _stream(root: Path, rel: str, anchor_us: int | None) -> Stream:
@@ -205,11 +367,18 @@ def finalize(
     screen: str = "media/screen.mp4",
     camera: str | None = None,
     camera_timestamps: str | None = "media/cam.tsv",
-) -> Bundle:
+) -> tuple[Bundle, str]:
     """Probe the recorded files and complete capture.json.
 
-    Missing media is an error, not a warning: a bundle whose manifest describes streams
-    that are not there fails much later and much more confusingly.
+    Returns the bundle and a camera fault string, empty when there was none.
+
+    A missing or unreadable SCREEN is still fatal -- a manifest describing a stream that
+    is not there fails much later and much more confusingly. A broken CAMERA is not:
+    it costs the camera track and nothing else, and refusing to write capture.json over
+    it throws away a perfectly good screen recording along with every cursor sample and
+    every zoom the editor could still have applied. That is exactly what happened when
+    a double SIGINT left cam.mp4 without its moov atom (see bin/omarchy-capture-camera's
+    LOCK_FILE): one broken camera, and the whole recording came back unopenable.
     """
     root = Path(root)
     capture = Capture.from_dict(json.loads((root / "capture.json").read_text()))
@@ -224,16 +393,32 @@ def finalize(
         ts_pair = read_gsr_ts(ts_file)
     capture.screen = _stream(root, screen, ts_pair[0] if ts_pair else None)
 
+    fault = ""
     if camera:
         cam_path = root / camera
-        if not cam_path.exists():
-            raise CaptureError(f"no camera recording at {cam_path}")
-        tsv = root / camera_timestamps if camera_timestamps else None
-        anchor = realtime_to_monotonic_us(read_camera_realtime_us(tsv, cam_path), ts_pair)
-        capture.camera = _stream(root, camera, anchor)
+        try:
+            if not cam_path.exists():
+                raise CaptureError(f"no camera recording at {cam_path}")
+            tsv = root / camera_timestamps if camera_timestamps else None
+            anchor = realtime_to_monotonic_us(
+                read_camera_realtime_us(tsv, cam_path), ts_pair)
+            cam = _stream(root, camera, anchor)
+            # After the probe, so the measurement runs on the frame rate the container
+            # actually reports rather than the one we asked v4l2 for. Non-fatal by
+            # construction (see measure_warmup_frames): a camera that survived this far
+            # must not be dropped over a luma measurement.
+            cam.warmup_frames = measure_warmup_frames(
+                cam_path, cam.fps_num / cam.fps_den)
+            capture.camera = cam
+        except (CaptureError, probe.ProbeError, OSError, ValueError) as e:
+            # Left null rather than half-filled: every consumer already branches on
+            # `camera is None` for a recording made without one, so a camera that did
+            # not survive lands on a path that is already exercised.
+            capture.camera = None
+            fault = str(e)
 
     (root / "capture.json").write_text(json.dumps(capture.to_dict(), indent=2) + "\n")
-    return Bundle(root)
+    return Bundle(root), fault
 
 
 # --- CLI --------------------------------------------------------------------
@@ -255,6 +440,11 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--scale", type=float, default=1.0)
     b.add_argument("--burn-in", action="store_true")
     b.add_argument("--calibration-ms", type=float, default=0.0)
+    b.add_argument("--camera-rect", default="",
+                   help="WxH+X+Y in logical pixels: where the setup bar left the "
+                        "self-view. Seeds edit.json's webcam placement.")
+    b.add_argument("--camera-shape", default="circle",
+                   choices=["circle", "rounded", "rect"])
 
     su = sub.add_parser("setup", help="parse the setup bar's JSON into shell assignments")
     su.add_argument("--json", required=True)
@@ -269,6 +459,16 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         help="drop this many seconds from the head (the setup countdown)",
+    )
+    f.add_argument(
+        "--trim-until-monotonic-us",
+        type=int,
+        default=0,
+        help="drop every frame captured before this CLOCK_MONOTONIC microsecond "
+             "(the instant the setup surfaces were gone). Preferred over "
+             "--trim-head-seconds: it is measured against the same first-frame anchor "
+             "the video is timed by, so it stays correct however long gsr took to "
+             "produce that frame.",
     )
 
     a = parser.parse_args(argv)
@@ -297,9 +497,18 @@ def main(argv: list[str] | None = None) -> int:
             "TARGET": target,
             "TARGET_KIND": parts["kind"],
             "SETUP_MIC": "true" if cfg.get("mic") else "false",
+            # Empty means "whatever the default source is at record time", which is
+            # what the recorder did unconditionally before the picker existed.
+            "SETUP_MIC_DEVICE": str(cfg.get("mic_device") or ""),
             "SETUP_DESKTOP_AUDIO": "true" if cfg.get("desktop_audio") else "false",
             "SETUP_CAMERA": str(cfg.get("camera") or "off"),
             "SETUP_CAMERA_DEVICE": str(cfg.get("camera_device") or ""),
+            # WxH+X+Y, the same spelling as every other rectangle that crosses this
+            # boundary, so the shell never has to know a second geometry format.
+            # Empty when the bar sent none, which means "keep the defaults".
+            "SETUP_CAMERA_RECT": (
+                format_geometry(cfg["camera_rect"]) if cfg.get("camera_rect") else ""
+            ),
             "SETUP_COUNTDOWN_S": str(int(cfg.get("countdown") or 0)),
         }
         for k, v in emit.items():
@@ -315,6 +524,8 @@ def main(argv: list[str] | None = None) -> int:
             monitor_scale=a.scale,
             camera_burned_in=a.burn_in,
             calibration_c_ms=a.calibration_ms,
+            camera_rect=parse_geometry(a.camera_rect) if a.camera_rect else None,
+            camera_shape=a.camera_shape,
         )
         physical = bundle.capture.physical_geometry
         size = capture_size(physical)
@@ -332,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{key}={shlex.quote(value)}")
         return 0
 
-    bundle = finalize(
+    bundle, camera_fault = finalize(
         Path(a.root),
         screen=a.screen,
         camera=a.camera,
@@ -347,10 +558,23 @@ def main(argv: list[str] | None = None) -> int:
     # frames were a countdown rather than an edit. Converted here because this is the
     # first point that knows the real frame rate; assuming 60 would mistrim every 30fps
     # capture by half.
-    if a.trim_head_seconds > 0:
-        bundle.edit.trim_head_frames = round(
-            a.trim_head_seconds * s.fps_num / s.fps_den
-        )
+    #
+    # Against the ANCHOR, not against zero. gsr's first frame does not arrive when gsr
+    # is launched: on a cold start it has been seen to land after the whole countdown
+    # had already elapsed, and a flat "drop the first 3 seconds" would then have cut
+    # three seconds of the actual take. Subtracting the anchor makes the trim exactly
+    # "the frames captured while the setup surfaces were still up", which is zero when
+    # capture only got going afterwards.
+    trim_frames = 0
+    if a.trim_until_monotonic_us > 0 and s.anchor_us is not None:
+        ahead_us = a.trim_until_monotonic_us - s.anchor_us
+        if ahead_us > 0:
+            trim_frames = round(ahead_us / 1e6 * s.fps_num / s.fps_den)
+    elif a.trim_head_seconds > 0:
+        trim_frames = round(a.trim_head_seconds * s.fps_num / s.fps_den)
+
+    if trim_frames > 0:
+        bundle.edit.trim_head_frames = trim_frames
         bundle.save_edit()
         print(f"TRIM_HEAD_FRAMES={bundle.edit.trim_head_frames}")
 
@@ -359,6 +583,16 @@ def main(argv: list[str] | None = None) -> int:
         c = bundle.capture.camera
         print(f"CAMERA={c.width}x{c.height}@{c.fps_num}/{c.fps_den} anchor={c.anchor_us}")
         print(f"CAMERA_OFFSET_FRAMES={bundle.camera_offset_frames()}")
+        # In camera frames, as stored. The render works in screen frames
+        # (Bundle.camera_warmup_frames), but this line is provenance for the log, and
+        # what was measured is what belongs in it.
+        print(f"CAMERA_WARMUP_FRAMES={c.warmup_frames}")
+    if camera_fault:
+        # stdout, because the caller greps this line to tell the user the camera
+        # specifically was lost -- as opposed to the manifest failing, which is now a
+        # different and much rarer thing.
+        print(f"CAMERA_UNREADABLE={camera_fault}")
+        print(f"camera track dropped: {camera_fault}", file=sys.stderr)
     return 0
 
 

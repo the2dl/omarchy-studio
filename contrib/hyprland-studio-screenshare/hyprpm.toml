@@ -1,0 +1,13 @@
+# hyprpm manifest. `hyprpm add <this repo>` builds against hyprpm's own STOCK
+# Hyprland headers, which is exactly what we want: the plugin must match the
+# upstream ABI, not the locally patched one this project used to ship.
+[repository]
+name = "omarchy-studio"
+authors = ["omarchy-studio"]
+description = "Recording-time compositor support for omarchy-studio"
+
+[omarchy-studio-screenshare]
+description = "Keeps no_screen_share windows out of screenshares (showing what is behind them) instead of covering them with black boxes"
+authors = ["omarchy-studio"]
+output = "build/omarchy-studio-screenshare.so"
+build = ["cmake -B build -S . -DCMAKE_BUILD_TYPE=Release", "cmake --build build --config Release"]

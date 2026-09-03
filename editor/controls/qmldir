@@ -7,3 +7,5 @@ Caption 1.0 Caption.qml
 PrimaryButton 1.0 PrimaryButton.qml
 GhostButton 1.0 GhostButton.qml
 RailButton 1.0 RailButton.qml
+SwatchGrid 1.0 SwatchGrid.qml
+GradientFill 1.0 GradientFill.qml

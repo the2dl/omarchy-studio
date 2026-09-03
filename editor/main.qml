@@ -25,6 +25,46 @@ ApplicationWindow {
     // content in the same 268px column, so a render can keep going beside live work.
     property bool exportOpen: false
 
+    // Preview mode (spec §1d region 1, "Preview"): show exactly what will export.
+    // Every piece of editing chrome -- rings, handles, chips, the redaction hatch and
+    // label, the zoom-region scrim, the rubber band -- binds to this and disappears;
+    // the composited pixels (including the real redaction blur) do not change at all.
+    // Scrubbing and playback stay live, because checking timing is the main reason to
+    // be in this mode. `P` toggles, Escape leaves.
+    property bool previewMode: false
+    // The layer list's disclosure. Kept on the app rather than inside the rail so a
+    // shortcut and the rail button drive one value.
+    property bool layersOpen: false
+
+    // --select <layer id> [--layers]: open on a layer already selected, and optionally
+    // with the list out. A verification hook of the same class as --selftest-op and
+    // --grab, and for the same reason those exist -- selection is UI state with no
+    // route through the bridge, so it is the only way to put a layer inspector on
+    // screen for a check that cannot click.
+    property bool startupSelectionDone: false
+    function applyStartupSelection() {
+        if (startupSelectionDone)
+            return
+        var want = Bridge.arg("--select", "")
+        if (want === "")
+            return
+        var layers = Bridge.state.layers || []
+        for (var i = 0; i < layers.length; ++i) {
+            if (layers[i].id === want) {
+                startupSelectionDone = true
+                preview.selectedId = want
+                preview.webcamSelected = false
+                if (Bridge.arg("--layers", "") !== "")
+                    app.layersOpen = true
+                return
+            }
+        }
+    }
+    Connections {
+        target: Bridge
+        function onStateChanged() { app.applyStartupSelection() }
+    }
+
     // 2e: the proxy build. The timeline (another agent's file) binds the same
     // Bridge.proxyStatus singleton -- .state === "building" and .progress (0..1) -- to
     // fill its thumbnail cells left to right; nothing here needs to be passed down.
@@ -48,10 +88,31 @@ ApplicationWindow {
         return st.canvas.height >= 2100 ? "4K" : (st.canvas.height + "p")
     }
 
+    // The undo stack lives in the bridge (one snapshot per op, drags coalesced to a
+    // single step server-side); these routes return the whole new state, which apply()
+    // then fans out to every binding. Not guarded on canUndo here: the server answers
+    // an empty stack with the unchanged state, so posting is always safe and the reply
+    // re-syncs a client whose state has gone stale. canUndo/canRedo drive only the
+    // buttons' disabled look.
+    function undo() {
+        Bridge.send("POST", "/undo", {}, function (s, ok) { if (ok) Bridge.apply(s) })
+    }
+    function redo() {
+        Bridge.send("POST", "/redo", {}, function (s, ok) { if (ok) Bridge.apply(s) })
+    }
+
+    // True while an editable text item owns focus -- the layer inspectors have text
+    // fields, and Ctrl+Z / P there must edit the field, not the project. cursorPosition
+    // exists on TextInput/TextEdit and nothing else in this chrome.
+    function typing() {
+        var f = app.activeFocusItem
+        return f !== null && f !== undefined && f.cursorPosition !== undefined
+               && f.readOnly !== true
+    }
+
     // Top bar, 46px (spec §1d region 1): file glyph, name, duration/format in text6,
-    // then the actions. Undo/redo and Preview from the mock are absent on purpose --
-    // the model has no undo stack and no preview render, and dead chrome would read
-    // as broken. Save/Reset take their place until those exist.
+    // then the actions -- undo/redo glyphs, Preview, Export (primary), per the mock,
+    // plus Save/Reset which the mock leaves implicit.
     header: Rectangle {
         height: Style.topBarHeight
         color: Theme.bg
@@ -108,6 +169,29 @@ ApplicationWindow {
             }
             Rectangle { width: 1; height: 16; color: Theme.hairline }
 
+            // Undo/redo, mock order: glyphs, divider, Preview, Export. Disabled rather
+            // than hidden when the stack is empty -- a control that vanishes moves
+            // everything beside it (the mock draws empty redo at text6, still there).
+            S.GlyphButton {
+                glyph: ""        // nf-fa-undo
+                enabled: app.st.canUndo === true
+                onClicked: app.undo()
+            }
+            S.GlyphButton {
+                glyph: ""        // nf-fa-repeat, the mock's redo arrow
+                enabled: app.st.canRedo === true
+                onClicked: app.redo()
+            }
+            Rectangle { width: 1; height: 16; color: Theme.hairline }
+
+            S.GhostToggle {
+                text: "Preview"
+                active: app.previewMode
+                // Spec §2e: while the proxy builds, Preview renders text-6, no fill.
+                dim: app.proxyBuilding
+                onClicked: app.previewMode = !app.previewMode
+            }
+
             // While the proxy builds, Export demotes to text-6 with no fill (spec §2e:
             // the shell is real, only playback is not -- nothing on this bar should
             // outshine the build). It still opens the pane: the render reads the
@@ -162,6 +246,7 @@ ApplicationWindow {
                     Repeater {
                         model: [
                             { id: "select",   glyph: "", tip: "Select" },        // nf-fa-mouse_pointer
+                            { id: "layers",   glyph: "\uf5fd", tip: "Layers" },        // nf-fa-layer_group
                             { id: "blur",     glyph: "", tip: "Blur box" },      // nf-fa-eye_slash
                             { id: "pixelate", glyph: "", tip: "Pixelate" },      // nf-fa-th
                             { id: "text",     glyph: "", tip: "Text" }           // nf-fa-font
@@ -169,10 +254,46 @@ ApplicationWindow {
                         C.RailButton {
                             glyph: modelData.glyph
                             tip: modelData.tip
-                            active: preview.tool === modelData.id
-                            onClicked: preview.tool = modelData.id
+                            // `layers` is a panel, not a canvas tool: it toggles the
+                            // list open and leaves the pointer alone, so it lights from
+                            // its own state rather than from preview.tool.
+                            active: modelData.id === "layers" ? app.layersOpen
+                                                              : preview.tool === modelData.id
+                            onClicked: {
+                                if (modelData.id === "layers") {
+                                    app.layersOpen = !app.layersOpen
+                                    return
+                                }
+                                // Picking a tool is an editing gesture; in preview mode
+                                // the rubber band is inert, so leave the mode rather
+                                // than light a tool that cannot draw.
+                                app.previewMode = false
+                                preview.tool = modelData.id
+                            }
                         }
                     }
+                }
+            }
+
+            // Spec §2a: the layers tool slides a 236px list out beside the rail, and
+            // the canvas and inspector shrink to fit. The component was written and
+            // never mounted -- there was no rail tool to open it, so the entire layer
+            // list was unreachable from the running app.
+            LayerList {
+                id: layerList
+                Layout.preferredWidth: app.layersOpen ? implicitWidth : 0
+                Layout.maximumWidth: Layout.preferredWidth
+                Layout.fillHeight: true
+                visible: Layout.preferredWidth > 0
+                clip: true
+                preview: preview
+                selectedId: preview.selectedId
+                onSelectLayer: function (id) {
+                    preview.selectedId = id
+                    preview.webcamSelected = false
+                }
+                Behavior on Layout.preferredWidth {
+                    NumberAnimation { duration: Theme.durSlow; easing.type: Easing.OutCubic }
                 }
             }
 
@@ -186,6 +307,7 @@ ApplicationWindow {
                     y: 0
                     width: parent.width
                     height: parent.height
+                    previewMode: app.previewMode
                 }
 
                 // 2e -- the proxy build. Not a scrim: the shell is real and the canvas
@@ -308,8 +430,41 @@ ApplicationWindow {
     Shortcut { sequences: [StandardKey.Save]; onActivated: Bridge.save() }
     Shortcut {
         sequences: [StandardKey.Delete]
-        onActivated: if (preview.selectedId !== "")
+        // Guarded by previewMode: with the ring hidden there is no visible selection,
+        // and deleting an invisible selection is how work gets lost.
+        onActivated: if (!app.previewMode && preview.selectedId !== "")
                          Bridge.op("delete_layer", { id: preview.selectedId })
+    }
+    // The typing() guards: a plain letter or Ctrl+Z in an inspector text field belongs
+    // to the field. Qt's ShortcutOverride usually arbitrates this, but the guard makes
+    // it a rule rather than platform behaviour.
+    Shortcut {
+        sequence: "P"
+        onActivated: if (!app.typing()) app.previewMode = !app.previewMode
+    }
+    Shortcut {
+        sequence: "L"
+        onActivated: if (!app.typing()) app.layersOpen = !app.layersOpen
+    }
+    Shortcut {
+        sequence: "Escape"
+        // An armed draw tool first: it is the more modal of the two states and the one
+        // a person is more likely to want out of, and leaving preview mode while a
+        // rubber band is armed would drop them into a canvas that draws boxes.
+        onActivated: {
+            if (preview.tool !== "select")
+                preview.tool = "select"
+            else if (app.previewMode)
+                app.previewMode = false
+        }
+    }
+    Shortcut {
+        sequences: [StandardKey.Undo]     // Ctrl+Z
+        onActivated: if (!app.typing()) app.undo()
+    }
+    Shortcut {
+        sequences: [StandardKey.Redo]     // Ctrl+Shift+Z on this platform
+        onActivated: if (!app.typing()) app.redo()
     }
 
     onClosing: Bridge.quit()
@@ -340,6 +495,12 @@ ApplicationWindow {
         var grab = Bridge.arg("--grab", "")
         if (grab !== "" && !selftestGrabDone) {
             selftestGrabDone = true
+            // Grabs are taken in preview mode: the parity harness compares the grab
+            // against an ffmpeg render, and preview mode is by definition the frame
+            // with no editing chrome -- the same frame the user checks by pressing P.
+            // This replaces the old selftestMs gate on the redaction marker, so the
+            // test measures a state a user can actually see.
+            app.previewMode = true
             preview.grabStage(grab, function () {
                 console.log("SELFTEST grabbed -> " + grab)
                 app.runSelftest()
@@ -366,6 +527,7 @@ ApplicationWindow {
             proxy: Bridge.proxyStatus.state,
             theme: Theme.mode,
             font: Theme.fontFamily,
+            previewMode: app.previewMode,
             previewFit: preview.fit,
             frame: preview.frame,
             zoomScale: preview.appliedZoomScale,

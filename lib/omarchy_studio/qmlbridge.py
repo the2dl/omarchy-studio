@@ -30,17 +30,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
+from . import backgrounds
+from . import cursor as _cursor_mod
 from . import events as _events
 from . import layers as _layers
 from . import zoom as _zoom
 from .geometry import (DEFAULT_REDACT, Canvas, Placement, Rect, Zoom,
                        pixelate_block_px, qml_blur)
-from .project import Bundle, Layer, ProjectError
+from .project import (Bundle, CursorSettings, Edit, Layer, ProjectError,
+                      WebcamSettings)
 from .timebase import CutMap, FrameRange, Timebase, normalize
 
 # The one font file both engines use. Naming a family instead lets fontconfig hand Qt
 # and libavfilter different faces, and the metrics diverge before the glyphs visibly do.
 FONT_FILE = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"
+
+# The camera size control's range, as a fraction of the canvas width. The floor is a
+# camera you can still see a face in; the ceiling is the point past which the camera is
+# the recording and the screen is the decoration.
+MIN_WEBCAM_WIDTH = 0.04
+MAX_WEBCAM_WIDTH = 0.60
 
 # A zoom track longer than this is a runaway click log, not a project; the preview would
 # ship megabytes of JSON per state refresh for no visible gain.
@@ -188,11 +197,26 @@ def resolve_backdrop(bundle: Bundle) -> dict:
     )
     d = resolve_placement(place, canvas)
     r = place.resolve(canvas)
+    # RESOLVED, not raw: `color`/`gradient` report the ground that will actually be
+    # rendered, so a swatch selection reaches the preview through the same two keys a
+    # custom colour always did. The raw model is still available under `edit.backdrop`
+    # for anything that needs to know which of the two the user chose.
+    ground = backgrounds.resolve(b, canvas)
+    x0, y0, x1, y1 = backgrounds.gradient_line(ground.angle, canvas.width, canvas.height)
     d.update(
         {
             "enabled": b.enabled,
-            "color": b.color,
-            "gradient": b.gradient,
+            "background": b.background,
+            "color": ground.colors[0],
+            "gradient": ground.colors[-1] if ground.is_gradient else None,
+            # The whole definition, plus the gradient line in canvas pixels. QML paints
+            # from THIS rather than from the angle: `gradient_line` is the construction
+            # the export uses, and a second implementation in JavaScript is exactly the
+            # kind of drift the preview exists to rule out.
+            "ground": {
+                **ground.to_dict(),
+                "line": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+            },
             "shadow": b.shadow,
             "padding": b.padding,
             "radius": b.corner_radius * short,
@@ -223,10 +247,14 @@ def resolve_webcam(bundle: Bundle) -> dict:
             "enabled": cam.enabled,
             "shape": cam.shape,
             "mirror": cam.mirror,
-            # Only meaningful for `rounded`. A circle is the ellipse inscribed in the
-            # tile -- that is what layers._circle_mask draws -- and the preview builds it
-            # by scaling a round rectangle, not from a radius.
-            "radius": cam.corner_radius * min(r.w, r.h) if cam.shape == "rounded" else 0.0,
+            # The size control's value: the width as a fraction of the canvas, which is
+            # the one number that describes the camera box (the height is derived --
+            # WebcamSettings.placement). The corner grip writes the same field through
+            # `rect`; this is what lets a slider show and set it without a drag.
+            "size": cam.w,
+            # Always 0: `rounded` is drawn as a superellipse by SquircleShape, which
+            # takes no radius. Kept in the payload so the overlay's binding stays valid.
+            "radius": 0.0,
             "corner_radius": cam.corner_radius,
         }
     )
@@ -243,6 +271,65 @@ def resolve_webcam(bundle: Bundle) -> dict:
     else:
         d["editable"] = True
         d["disabled_reason"] = ""
+    return d
+
+
+def resolve_cursor(bundle: Bundle) -> dict:
+    """The synthetic pointer's settings, resolved to the numbers the panel shows.
+
+    `size` is normalized (a fraction of the canvas height) because that is what the model
+    stores and what the slider writes back; `size_px` is the same value against THIS
+    canvas, so the panel can print "32 px" without dividing anything in JavaScript. The
+    smoothing slider is likewise 0..1 in the model and milliseconds here -- the seconds
+    are cursor.py's, reached through cursor.py, so a change to SMOOTH_MAX_SECONDS cannot
+    leave the panel reporting a number the render no longer uses.
+
+    A recording made before the cursor track existed has nothing to draw. The controls
+    are marked dead with a reason rather than silently doing nothing, the same way a
+    burned-in webcam's are: inert controls read as a bug in the editor.
+    """
+    c = bundle.edit.cursor
+    canvas = bundle.canvas
+    tb = bundle.timebase
+    ms_per_frame = 1000.0 * tb.fps_den / tb.fps_num
+    d: dict[str, Any] = {
+        "enabled": c.enabled,
+        "size": c.size,
+        "size_px": c.size * canvas.height,
+        "min_size": CursorSettings.MIN_SIZE,
+        "max_size": CursorSettings.MAX_SIZE,
+        "smoothing": c.smoothing,
+        "smoothing_ms": _cursor_mod.sigma_frames(c, tb) * ms_per_frame,
+        "click_ripple": c.click_ripple,
+        "ripple_frames": c.ripple_frames,
+        "ripple_ms": c.ripple_frames * ms_per_frame,
+    }
+    path = bundle.events_dir / "cursor.bin"
+    if not path.exists():
+        d["editable"] = False
+        d["disabled_reason"] = (
+            "This recording has no cursor track, so there is no pointer to draw. "
+            "Recordings made before the input recorder existed cannot have one added."
+        )
+        d["samples"] = 0
+        return d
+    try:
+        track = _events.read_cursor_track(path)
+    except _events.EventsError as e:
+        # A cursor.bin this build cannot decode is worth naming: the file is right there
+        # and the user is the only one who can tell us what wrote it.
+        d["editable"] = False
+        d["disabled_reason"] = f"The cursor track could not be read: {e}"
+        d["samples"] = 0
+        return d
+    d["editable"] = True
+    d["disabled_reason"] = ""
+    d["samples"] = len(track)
+    d["hz"] = track.hz
+    # A track the recorder never finalized is still usable -- it is only the tail that is
+    # unknown -- but the editor should be able to say so rather than leaving the user to
+    # wonder why the pointer stops before the video does.
+    d["truncated"] = not track.finalized
     return d
 
 
@@ -380,6 +467,25 @@ def _media_entry(path: Path | None, proxy: Path | None) -> dict | None:
     }
 
 
+def resolve_transcript(bundle: Bundle) -> dict:
+    """Is there a transcript, and is a local engine available to make one?
+
+    Both, because they lead to different sentences: "add the captions" when the
+    transcript is already there, "transcribe it first" when it is not, and "install an
+    engine" when the machine cannot. A menu item that fails on click would have to say
+    all three after the fact instead.
+    """
+    from . import transcribe as _transcribe
+
+    t = _transcribe.load(bundle)
+    return {
+        "available": t is not None and bool(t.segments),
+        "cues": len(t.segments) if t is not None else 0,
+        "language": (t.language or "") if t is not None else "",
+        "engine": _transcribe.available_engine() or "",
+    }
+
+
 def project_state(
     bundle: Bundle,
     *,
@@ -435,10 +541,26 @@ def project_state(
             # Signed, and read per recording: the offset between two files is launch
             # order plus per-pipeline warm-up, not a constant.
             "camera_offset_ms": bundle.camera_offset_frames() * ms_per_frame,
+            # The camera's own auto-exposure ramp, in CAMERA milliseconds. The export
+            # skips it (render._align_camera trims those frames and holds the first
+            # settled one across the head); the preview has to skip the same ones or the
+            # editor shows a black bubble the exported file does not have. Preview and
+            # export disagreeing about the camera has already happened once here, over
+            # the sign of the offset, and it is the worst kind of bug to ship: what you
+            # check disagrees with what you send, and only the thing you check is wrong.
+            "camera_warmup_ms": (
+                camera.warmup_frames * 1000.0 * camera.fps_den / camera.fps_num
+                if camera and camera.fps_num else 0.0
+            ),
         },
         "edit": bundle.edit.to_dict(),
         "webcam": resolve_webcam(bundle),
         "backdrop": resolve_backdrop(bundle),
+        "cursor": resolve_cursor(bundle),
+        # Whether there is anything to caption WITH. Only the count and a flag, never
+        # the cues: this dict is re-serialized on every drag frame, and a transcript of
+        # a ten-minute recording is thousands of strings.
+        "transcript": resolve_transcript(bundle),
         "layers": [resolve_layer(l, canvas, bundle) for l in layers],
         "clicks": click_events(bundle),
         "cuts": [c.to_dict() for c in normalize(bundle.edit.cuts)],
@@ -494,13 +616,30 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         if "rect" in args:
             p = rect_arg()
             cam.x, cam.y, cam.w, cam.h = p.x, p.y, p.w, p.h
+        if "size" in args:
+            # About the CENTRE, unlike the corner grip, which is anchored at its
+            # top-left because that is the corner the hand is not holding. A slider has
+            # no such corner, and growing from the top-left walks the bubble across the
+            # frame while you drag -- so the centre is what stays put here.
+            before = cam.placement(canvas).resolve(canvas)
+            cam.w = max(MIN_WEBCAM_WIDTH, min(MAX_WEBCAM_WIDTH, float(args["size"])))
+            after = cam.placement(canvas).resolve(canvas)
+            p = placement_from_rect(
+                before.x + (before.w - after.w) / 2.0,
+                before.y + (before.h - after.h) / 2.0,
+                after.w,
+                after.h,
+                canvas,
+            )
+            cam.x, cam.y, cam.w, cam.h = p.x, p.y, p.w, p.h
         for key in ("enabled", "mirror"):
             if key in args:
                 setattr(cam, key, bool(args[key]))
         if "shape" in args:
-            if args["shape"] not in ("circle", "rounded", "rect"):
+            shape = WebcamSettings.LEGACY_SHAPES.get(args["shape"], args["shape"])
+            if shape not in ("circle", "rounded", "rect"):
                 raise BridgeError(f"unknown webcam shape {args['shape']!r}")
-            cam.shape = args["shape"]
+            cam.shape = shape
         if "corner_radius" in args:
             cam.corner_radius = float(args["corner_radius"])
 
@@ -515,6 +654,27 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             if ms in args:
                 setattr(z, key, max(1, tb.to_frame(float(args[ms]) / 1000.0)))
 
+    elif op == "set_cursor":
+        c = edit.cursor
+        for key in ("enabled", "click_ripple"):
+            if key in args:
+                setattr(c, key, bool(args[key]))
+        if "size" in args:
+            c.size = float(args["size"])
+        if "smoothing" in args:
+            c.smoothing = float(args["smoothing"])
+        if "ripple_ms" in args:
+            # Frames, like every other duration in the project: the ripple's gates are
+            # frame comparisons, and a duration stored in milliseconds would round
+            # differently here and in the graph.
+            c.ripple_frames = max(0, tb.to_frame(float(args["ripple_ms"]) / 1000.0))
+        if "ripple_frames" in args:
+            c.ripple_frames = max(0, int(args["ripple_frames"]))
+        # Re-run the model's own clamps rather than repeating them here. A slider that
+        # can reach 0.09 must not be able to write a pointer a tenth of the frame tall,
+        # and CursorSettings is the one place that decides what the limits are.
+        c.__post_init__()
+
     elif op == "set_backdrop":
         b = edit.backdrop
         for key in ("enabled", "shadow"):
@@ -523,8 +683,24 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         for key in ("padding", "corner_radius"):
             if key in args:
                 setattr(b, key, float(args[key]))
+        # Naming a colour IS choosing the custom ground. Without this the swatch that
+        # was selected keeps outranking `color`, and the colour picker reads as dead --
+        # the same class of bug as the editor's three shape labels against four values.
         if "color" in args:
-            b.color = str(args["color"])
+            b.color = _backdrop_color(args["color"])
+            b.background = backgrounds.CUSTOM
+        if "gradient" in args:
+            second = args["gradient"]
+            b.gradient = None if second in (None, "") else _backdrop_color(second)
+            b.background = backgrounds.CUSTOM
+        # Applied last so an op carrying both a swatch and a colour lands on the swatch:
+        # the id is the more specific intent, and the colour is what the picker will be
+        # seeded with if the user goes looking for it.
+        if "background" in args:
+            bg_id = str(args["background"])
+            if bg_id != backgrounds.CUSTOM and backgrounds.find(bg_id) is None:
+                raise BridgeError(f"unknown background {bg_id!r}")
+            b.background = bg_id
 
     elif op == "add_image":
         src = Path(args["path"])
@@ -542,16 +718,53 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             )
         )
 
+    elif op == "add_captions":
+        # Built from the bundle's own transcript.json rather than from anything the UI
+        # sends: the transcript is the artefact the model produced, and round-tripping
+        # a few thousand cues through the bridge to get them back to where they started
+        # would be the largest payload in the protocol by an order of magnitude.
+        from . import captions as _captions
+        from . import transcribe as _transcribe
+
+        t = _transcribe.load(bundle)
+        if t is None:
+            raise BridgeError(
+                "this recording has no transcript yet. Run "
+                "`omarchy-studio-transcribe <recording>` first -- it runs locally and "
+                "nothing leaves the machine."
+            )
+        if not t.segments:
+            raise BridgeError(
+                "the transcript has no cues, so there is nothing to caption. The "
+                "recording's audio may be silent."
+            )
+        # REPLACES rather than appends. Two caption layers draw two plates over each
+        # other and read as a rendering bug, and adding captions twice is the normal
+        # thing to do after re-transcribing.
+        edit.layers = [l for l in edit.layers if l.type != "caption"]
+        edit.layers.append(_captions.caption_layer(t.to_dict()))
+
     elif op in ("add_blur", "add_pixelate", "add_text", "add_shape"):
         kind = op[4:]
         p = rect_arg()
         props: dict[str, Any] = {}
-        if kind == "blur":
+        if kind in ("blur", "pixelate"):
+            # Both redaction methods ride the same preset ladder. This wrote `block` for
+            # pixelate, and both readers prefer an explicit `block` over a preset, so
+            # every pixelate layer made in the UI had an inert preset and a fixed 0.012
+            # mosaic -- the preset ladder was bypassed for half the feature that the
+            # spec's one non-negotiable rule is about. `block` is still READ for projects
+            # that already carry one; nothing writes one now.
             props["preset"] = str(args.get("preset", DEFAULT_REDACT))
-        elif kind == "pixelate":
-            props["block"] = float(args.get("block", 0.012))
         elif kind == "text":
             props["text"] = str(args.get("text", "Text"))
+        elif kind == "shape":
+            # Fill redactions are shapes with a solid colour; taking it here means the
+            # caller does not have to add-then-update and briefly show the wrong colour.
+            if "color" in args:
+                props["color"] = str(args["color"])
+            if args.get("redact"):
+                props["redact"] = True
         edit.layers.append(
             Layer(
                 id=_new_id(edit.layers, kind),
@@ -575,6 +788,16 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             layer.z = int(args["z"])
         if "props" in args:
             layer.props.update(args["props"])
+        if "fade_ms" in args:
+            # Stored as frames like every other time in the project, so a fade cannot
+            # drift against the grid the gates are evaluated on.
+            layer.fade_frames = max(0, tb.to_frame(float(args["fade_ms"]) / 1000.0))
+        if "follow_window" in args:
+            # Records the intent and the window it was placed over. The renderer does not
+            # track windows yet, so this changes nothing about the output -- but a
+            # redaction the user asked to follow a window is worth persisting rather than
+            # silently dropping, and the UI shows it as pending rather than active.
+            layer.props["follow_window"] = bool(args["follow_window"])
         if "start_ms" in args or "end_ms" in args:
             layer.t = _range_from_ms(tb, args.get("start_ms"), args.get("end_ms"))
 
@@ -621,6 +844,29 @@ def _find_layer(layers: list[Layer], layer_id: str) -> Layer:
 
 
 # --- theme -------------------------------------------------------------------
+
+
+def _backdrop_color(value: Any) -> str:
+    """A custom backdrop colour, or a refusal the editor can show.
+
+    Checked here rather than in the model because the model also loads files: an
+    edit.json with a colour this build cannot parse degrades to a wrong-looking
+    backdrop, but a colour arriving from a picker in this build's own UI is a bug worth
+    surfacing while someone can still fix it.
+    """
+    if not backgrounds.is_color(value):
+        raise BridgeError(f"bad backdrop colour {value!r}; want #rrggbb")
+    return str(value)
+
+
+def background_catalog() -> dict:
+    """The backdrop library, for the swatch grid.
+
+    Static for the life of the build, so it is served from its own route rather than
+    riding in `project_state`, which is re-serialized on every drag frame. `custom` is
+    named rather than hardcoded in QML so there is one spelling of the sentinel.
+    """
+    return {"custom": backgrounds.CUSTOM, "entries": backgrounds.catalog()}
 
 
 def theme_tokens() -> dict:
@@ -949,6 +1195,21 @@ class Session:
         self.exporter = Exporter(bundle, repo_root)
         self.dirty = False
         self.quit_requested = threading.Event()
+        # Undo is a stack of whole-Edit snapshots rather than per-op inverses. Edit is a
+        # few kB of JSON even with hundreds of layers, and a snapshot cannot get an
+        # inverse subtly wrong -- which matters here because ops like the redact method
+        # switch are already add-then-delete chains whose hand-written inverse would be
+        # the easiest thing in the file to get wrong.
+        self._undo: list[dict] = []
+        self._redo: list[dict] = []
+
+    # A drag fires an op per frame; without coalescing, one drag would be 60 undo steps
+    # and Ctrl+Z would appear broken. Consecutive ops of the same kind on the same target
+    # collapse into the first one's snapshot.
+    _COALESCE = frozenset(
+        {"set_webcam", "update_layer", "set_zoom", "set_backdrop", "set_cursor"}
+    )
+    UNDO_LIMIT = 100
 
     # Only these change the zoom track; every other op leaves it out of the reply so a
     # drag does not re-serialize thousands of samples per second.
@@ -963,13 +1224,54 @@ class Session:
                 include_zoom_track=include_zoom_track,
             )
             s["dirty"] = self.dirty
+            # Exposed so the top bar can disable rather than hide the buttons: a control
+            # that vanishes when unavailable moves everything beside it.
+            s["canUndo"] = bool(self._undo)
+            s["canRedo"] = bool(self._redo)
             return s
 
     def op(self, name: str, args: dict) -> dict:
         with self.lock:
+            key = (name, str(args.get("id", "")))
+            if not (
+                self._undo
+                and name in self._COALESCE
+                and self._undo[-1].get("_key") == key
+            ):
+                snap = self.bundle.edit.to_dict()
+                snap["_key"] = key
+                self._undo.append(snap)
+                del self._undo[:-self.UNDO_LIMIT]
+            # Any new edit invalidates the redo branch, as in every editor.
+            self._redo.clear()
             apply_op(self.bundle, name, args)
             self.dirty = True
             return self.state(include_zoom_track=name in self.ZOOM_OPS)
+
+    def _restore(self, snap: dict) -> None:
+        snap = {k: v for k, v in snap.items() if k != "_key"}
+        self.bundle.edit = Edit.from_dict(snap)
+        self.dirty = True
+
+    def undo(self) -> dict:
+        with self.lock:
+            if not self._undo:
+                return self.state()
+            cur = self.bundle.edit.to_dict()
+            cur["_key"] = ("", "")
+            self._redo.append(cur)
+            self._restore(self._undo.pop())
+            return self.state()
+
+    def redo(self) -> dict:
+        with self.lock:
+            if not self._redo:
+                return self.state()
+            cur = self.bundle.edit.to_dict()
+            cur["_key"] = ("", "")
+            self._undo.append(cur)
+            self._restore(self._redo.pop())
+            return self.state()
 
     def save(self) -> dict:
         with self.lock:
@@ -1021,6 +1323,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(dict(self.session.proxy.status))
             if r == "/theme":
                 return self._send(theme_tokens())
+            if r == "/backgrounds":
+                return self._send(background_catalog())
         except Exception as e:
             return self._send({"error": f"{type(e).__name__}: {e}"}, 500)
         self._send({"error": "not found"}, 404)
@@ -1053,6 +1357,10 @@ class _Handler(BaseHTTPRequestHandler):
                 # for the next open to mistake for a finished proxy.
                 self.session.proxy.stop()
                 return self._send(dict(self.session.proxy.status))
+            if r == "/undo":
+                return self._send(self.session.undo())
+            if r == "/redo":
+                return self._send(self.session.redo())
             if r == "/quit":
                 self.session.quit_requested.set()
                 return self._send({"ok": True})

@@ -20,6 +20,26 @@ Item {
     implicitHeight: 26
     opacity: enabled ? 1.0 : 0.45
 
+    // Chips are equal width, so the widest label has to set the width for all of them.
+    // Without this the control simply took whatever width the layout handed it, and a
+    // caller that guessed low got labels running into each other rather than a squeezed
+    // chip -- the text is centred in the chip and nothing clips it. Four chips in a
+    // fixed 186px did exactly that on the setup bar.
+    readonly property real chipPadding: 18
+    implicitWidth: {
+        var widest = 0
+        for (var i = 0; i < model.length; ++i)
+            widest = Math.max(widest, metrics.advanceWidth(String(model[i])))
+        return Math.ceil(model.length * (widest + chipPadding)
+                         + 4 * Math.max(0, model.length - 1))
+    }
+
+    FontMetrics {
+        id: metrics
+        font.family: Theme.fontFamily
+        font.pixelSize: Theme.fsRow
+    }
+
     Row {
         anchors.fill: parent
         spacing: 4

@@ -31,6 +31,7 @@ import shutil
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from . import backgrounds
 from .geometry import Canvas, Placement, Zoom
 from .timebase import CutMap, FrameRange, Timebase
 
@@ -60,6 +61,17 @@ class Stream:
     # separate calibration because it stamps every frame rather than only the first.
     anchor_us: int | None = None
     has_audio: bool = False
+    # Frames of sensor warm-up at the head of this stream, in THIS stream's own frames.
+    # Zero for the screen, which has no iris; measured for the camera at finalize by
+    # capture.measure_warmup_frames. Nine on media/cam.mp4 of the 2026-09-03 capture,
+    # whose mean luma runs 0.9, 0.9, 15, 40, 56, 66, 78, 91, 100 and only settles at
+    # ~106 from frame 9 -- 0.3 s of the camera bubble fading up from black at the top of
+    # every export. Stored rather than re-derived, because deriving it costs a decode of
+    # the camera's head (0.28 s measured) and a render must not pay that every time.
+    #
+    # Absent from every capture.json written before this existed, which is why it has a
+    # default: an old bundle loads with 0 and renders byte-identically to how it did.
+    warmup_frames: int = 0
 
     @property
     def timebase(self) -> Timebase:
@@ -190,13 +202,30 @@ class WebcamSettings:
     """The camera overlay. Only meaningful when the camera was recorded separately."""
 
     enabled: bool = True
-    x: float = 0.72
-    y: float = 0.70
-    w: float = 0.22
-    h: float = 0.22
+    # Bottom-right with an even margin, at a size that reads as a talking head rather
+    # than a second subject. 0.22 was a quarter of the frame wide -- big enough that
+    # people asked how to shrink it before they asked anything else about it.
+    x: float = 0.83
+    y: float = 0.72
+    w: float = 0.14
+    h: float = 0.14
     shape: str = "circle"  # circle | rounded | rect
     corner_radius: float = 0.12
     mirror: bool = True
+
+    # One vocabulary, three shapes, everywhere: the setup bar, this model, the editor
+    # panel and the live self-view all say circle / rounded / rect. They did not always
+    # -- the bar said "squircle" and "corner", the model said "squircle" and "rounded",
+    # and the editor panel offered three labels against four values, so choosing
+    # "Rounded" in the editor actually wrote "squircle" and choosing "Rect" wrote
+    # "rounded". `rounded` IS the superellipse now; the old shallow rounded rectangle is
+    # gone, and both of its former names land on it.
+    LEGACY_SHAPES = {"squircle": "rounded", "corner": "rounded"}
+
+    def __post_init__(self) -> None:
+        self.shape = self.LEGACY_SHAPES.get(self.shape, self.shape)
+        if self.shape not in ("circle", "rounded", "rect"):
+            self.shape = "circle"
 
     def placement(self, canvas: Canvas) -> Placement:
         """The camera box, square in PIXELS for a circle.
@@ -206,23 +235,99 @@ class WebcamSettings:
         what shipped and looked wrong. The design carries ONE size control (spec 1g),
         so `w` is the size and a circular camera derives its height from it.
 
-        `rounded` and `rect` keep both values, because a deliberately wide camera box is
-        a legitimate thing to want and only a circle is a lie when it is not round.
+        `rect` keeps both values, because a deliberately wide camera box is a legitimate
+        thing to want and only a round shape is a lie when it is not round.
         """
         h = self.h
-        if self.shape == "circle":
+        if self.shape in ("circle", "rounded"):
             h = self.w * canvas.width / canvas.height
         return Placement(self.x, self.y, self.w, h, "top-left")
 
 
 @dataclass
+class CursorSettings:
+    """The synthetic pointer drawn back in over the recording.
+
+    It has to be drawn back in: the screen is captured with the hardware cursor off
+    (`-cursor no`), so without this the exported video has no pointer at all. `enabled`
+    therefore defaults to TRUE, and an edit.json written before this existed carries no
+    `cursor` key and picks the default up -- which is the intended behaviour, because the
+    alternative is that every project made so far renders a mouse-driven demo with no
+    mouse in it.
+
+    Sizes are normalized like every other dimension in the project, so a setting chosen
+    against the 1080p preview proxy renders identically on the 1440p master.
+    """
+
+    enabled: bool = True
+    # Height as a fraction of the canvas. 0.022 is 32px at 1440p, which is about what a
+    # scale-1 desktop cursor measures there; anything under ~24px reads as a speck once
+    # the video is playing in a feed at half size.
+    size: float = 0.022
+    # 0..1, converted to a Gaussian sigma in SECONDS by cursor.py so the same value
+    # smooths the same amount at 30 and at 120fps. 0.5 is 40ms.
+    smoothing: float = 0.5
+    click_ripple: bool = True
+    # ~0.35s at 60fps. Stored in frames like every other duration in the project, so it
+    # cannot drift against the grid the ripple's gates are evaluated on.
+    ripple_frames: int = 21
+
+    # The size control's range, as a fraction of the canvas height. The floor is a
+    # pointer still visible at half playback size; the ceiling is a pointer that hides
+    # what it is pointing at.
+    MIN_SIZE = 0.008
+    MAX_SIZE = 0.08
+
+    def __post_init__(self) -> None:
+        # Clamped rather than validated, on the WebcamSettings precedent: this object is
+        # constructed from a file as often as from the UI, and a hand-edited size of 5.0
+        # should render a big pointer, not refuse to open the recording.
+        self.size = min(max(float(self.size), self.MIN_SIZE), self.MAX_SIZE)
+        self.smoothing = min(max(float(self.smoothing), 0.0), 1.0)
+        self.ripple_frames = max(0, int(self.ripple_frames))
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CursorSettings":
+        """Unknown keys are dropped rather than fatal.
+
+        Same forward-compatibility rule Layer follows for unknown types: a project
+        written by a newer build loses the setting it asked for, it does not refuse to
+        open. `CursorSettings(**d)` would raise TypeError on the first field added after
+        this one, and it would do it while loading a file the user cannot edit back.
+        """
+        known = set(cls.__dataclass_fields__)
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+
+@dataclass
 class BackdropSettings:
+    """The plate the recording is inset on.
+
+    `background` names an entry in `backgrounds.CATALOG`; `backgrounds.CUSTOM` means
+    "use `color`, and `gradient` if it is set". The DEFAULT is CUSTOM, and that is a
+    compatibility decision rather than a taste one: every edit.json written before the
+    library existed carries only `color`/`gradient`, and so does everything the headless
+    editor writes today (`--backdrop=color:#101010` sets those two fields and nothing
+    else). A catalogue id as the default would silently outrank both.
+    """
+
     enabled: bool = False
+    background: str = backgrounds.CUSTOM
     color: str = "#1b1d24"
     gradient: str | None = None
     padding: float = 0.04
     corner_radius: float = 0.015
     shadow: bool = True
+
+    def __post_init__(self) -> None:
+        # An id this build does not know degrades to the custom colour rather than
+        # raising, which is the same forward-compatibility rule Layer follows for
+        # unknown types: a project written by a newer build loses the ground it asked
+        # for, it does not refuse to open. The BRIDGE does raise on an unknown id --
+        # there it came from a click in this build's own UI, so it is a bug, not a file
+        # from the future.
+        if self.background != backgrounds.CUSTOM and backgrounds.find(self.background) is None:
+            self.background = backgrounds.CUSTOM
 
 
 @dataclass
@@ -235,6 +340,7 @@ class Edit:
     zoom: ZoomSettings = field(default_factory=ZoomSettings)
     webcam: WebcamSettings = field(default_factory=WebcamSettings)
     backdrop: BackdropSettings = field(default_factory=BackdropSettings)
+    cursor: CursorSettings = field(default_factory=CursorSettings)
     normalize_audio: bool = True
     trim_head_frames: int = 0
 
@@ -246,6 +352,7 @@ class Edit:
             "zoom": asdict(self.zoom),
             "webcam": asdict(self.webcam),
             "backdrop": asdict(self.backdrop),
+            "cursor": asdict(self.cursor),
             "normalize_audio": self.normalize_audio,
             "trim_head_frames": self.trim_head_frames,
         }
@@ -264,6 +371,7 @@ class Edit:
             zoom=ZoomSettings(**d.get("zoom", {})),
             webcam=WebcamSettings(**d.get("webcam", {})),
             backdrop=BackdropSettings(**d.get("backdrop", {})),
+            cursor=CursorSettings.from_dict(d.get("cursor", {})),
             normalize_audio=bool(d.get("normalize_audio", True)),
             trim_head_frames=int(d.get("trim_head_frames", 0)),
         )
@@ -363,6 +471,21 @@ class Bundle:
             return 0
         delta_s = (c.anchor_us - s.anchor_us) / 1e6
         return round(delta_s * s.fps_num / s.fps_den)
+
+    def camera_warmup_frames(self) -> int:
+        """The camera's auto-exposure ramp, converted to SCREEN frames.
+
+        Stored in the camera's own frames because that is what was measured, converted
+        here because that is what the render needs: the camera is resampled onto the
+        project grid before it is aligned, so a trim expressed in camera frames would
+        remove the wrong material. Nine camera frames at 30 fps is 18 frames of a 60 fps
+        capture, and trimming 9 there would leave half the fade in shot.
+        """
+        s, c = self.capture.screen, self.capture.camera
+        if s is None or c is None or c.warmup_frames <= 0:
+            return 0
+        seconds = c.warmup_frames * c.fps_den / c.fps_num
+        return round(seconds * s.fps_num / s.fps_den)
 
     # -- integrity
     def validate(self) -> None:

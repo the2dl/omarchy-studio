@@ -4,3 +4,5 @@
 ProxyBuildOverlay 1.0 ProxyBuildOverlay.qml
 ExportPane 1.0 ExportPane.qml
 RenderChip 1.0 RenderChip.qml
+GlyphButton 1.0 GlyphButton.qml
+GhostToggle 1.0 GhostToggle.qml

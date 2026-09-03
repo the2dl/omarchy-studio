@@ -12,3 +12,10 @@
 singleton Theme 1.0 Theme.qml
 singleton Bridge 1.0 Bridge.qml
 singleton Style 1.0 Style.qml
+
+# Shared geometry: the camera overlay and the setup self-view must draw the same
+# squircle, and layers.py's _squircle_mask must draw it a third time identically.
+SquircleShape 1.0 SquircleShape.qml
+
+# The camera-to-screen time conversion, in one place because it is a SIGN.
+CameraSync 1.0 CameraSync.qml

@@ -13,6 +13,7 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
+import QtQuick.Dialogs
 import "controls" as C
 import "inspectors" as I
 
@@ -75,7 +76,18 @@ ScrollView {
     // impossibilities applies -- they get different words because they are different
     // facts: burned-in means the camera is IN the frames; no-camera means there is no
     // camera anywhere.
+    // Canvas pixels are the currency every placement control posts in, the same one the
+    // inspectors use (see inspectors/ImageInspector.qml).
+    readonly property var canvas: Bridge.state.canvas || ({ width: 1920, height: 1080 })
+    readonly property var cursor: st.cursor || ({})
+    readonly property bool cursorEditable: cursor.editable !== false && cursor.samples > 0
+    // Both gates, because the sliders below are meaningless without a track AND
+    // pointless while the pointer is switched off.
+    readonly property bool cursorOn: cursorEditable && cursor.enabled === true
     readonly property bool camEditable: cam.editable === true
+    // The shape chips' values, positionally paired with their labels below. One list,
+    // named once, so the two can no longer drift out of step with each other.
+    readonly property var shapeValues: ["circle", "rounded", "rect"]
     readonly property bool camBurnedIn: st.capture ? st.capture.camera_burned_in === true : false
 
     contentWidth: availableWidth
@@ -150,6 +162,13 @@ ScrollView {
             spec: visible ? root.selLayer : ({})
             onSelectLayer: function (id) { root.selectLayer(id) }
         }
+        I.CaptionInspector {
+            Layout.fillWidth: true
+            visible: root.selLayer !== null && root.selLayer.type === "caption"
+            spec: visible ? root.selLayer : ({})
+            canvas: root.canvas
+            onSelectLayer: function (id) { root.selectLayer(id) }
+        }
 
         // ====================================================================
         // Recording panels -- only while no layer is selected.
@@ -206,6 +225,108 @@ ScrollView {
                 display: (liveValue / 1000).toFixed(2) + " s"
                 enabled: root.zoom.enabled === true
                 onCommitted: function (v) { Bridge.op("set_zoom", { ease_ms: v }) }
+            }
+
+            Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
+
+            // -- cursor (spec §1e, the second half of the zoom inspector) -----
+            // Spec: "Zoom properties use accent sliders, cursor properties use text-3
+            // sliders -- accent marks what the panel is ABOUT." So every slider here is
+            // subject:false, and that is the whole visual difference between the two
+            // halves of this panel.
+            //
+            // The capture runs with the hardware cursor off, so without these the export
+            // has no pointer at all -- which is why `enabled` defaults on rather than
+            // being something to discover.
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                C.Caption { text: "cursor"; Layout.fillWidth: true }
+                Rectangle {
+                    visible: !root.cursorEditable
+                    width: cursorBadge.implicitWidth + 14
+                    height: 17
+                    radius: 5
+                    color: Theme.fillSubtle
+                    Text {
+                        id: cursorBadge
+                        anchors.centerIn: parent
+                        text: "no track"
+                        color: Theme.text5
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fsHint
+                    }
+                }
+                C.Toggle {
+                    visible: root.cursorEditable
+                    checked: root.cursor.enabled === true
+                    onToggled: function (v) { Bridge.op("set_cursor", { enabled: v }) }
+                }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: cursorWhy.implicitHeight + 20
+                visible: !root.cursorEditable
+                radius: Theme.radiusRow
+                color: Qt.rgba(1, 1, 1, 0.025)
+                Text {
+                    id: cursorWhy
+                    x: 12
+                    y: 10
+                    width: parent.width - 24
+                    text: root.cursor.disabled_reason
+                          || "This recording has no cursor track, so there is no pointer "
+                           + "to draw."
+                    color: Theme.text3
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsCaption
+                    lineHeight: 1.4
+                    wrapMode: Text.WordWrap
+                }
+            }
+
+            LabelledSlider {
+                Layout.fillWidth: true
+                label: "size"
+                subject: false
+                from: root.cursor.min_size === undefined ? 0.008 : root.cursor.min_size
+                to: root.cursor.max_size === undefined ? 0.08 : root.cursor.max_size
+                modelValue: root.cursor.size === undefined ? 0.022 : root.cursor.size
+                // Pixels, not the normalized fraction: the fraction is the honest unit
+                // for the model and a meaningless one to a person sizing a pointer.
+                display: Math.round(liveValue * (root.canvas.height || 1080)) + " px"
+                enabled: root.cursorOn
+                onCommitted: function (v) { Bridge.op("set_cursor", { size: v }) }
+            }
+
+            LabelledSlider {
+                Layout.fillWidth: true
+                label: "smoothing"
+                subject: false
+                from: 0.0
+                to: 1.0
+                modelValue: root.cursor.smoothing === undefined ? 0.5 : root.cursor.smoothing
+                display: liveValue < 0.02 ? "off" : Math.round(liveValue * 80) + " ms"
+                enabled: root.cursorOn
+                onCommitted: function (v) { Bridge.op("set_cursor", { smoothing: v }) }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                C.Toggle {
+                    checked: root.cursor.click_ripple === true
+                    enabled: root.cursorOn
+                    onToggled: function (v) { Bridge.op("set_cursor", { click_ripple: v }) }
+                }
+                Text {
+                    text: "Click ripple"
+                    color: root.cursorOn ? Theme.text3 : Theme.text6
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsRow
+                    Layout.fillWidth: true
+                }
             }
 
             Rectangle { Layout.fillWidth: true; height: 1; color: Theme.hairline }
@@ -306,10 +427,62 @@ ScrollView {
                 enabled: root.camEditable
                 // Bound to the model and never assigned locally (Segmented only
                 // emits), so a rejected shape change snaps the chips back.
-                currentIndex: ["circle", "rounded", "rect"].indexOf(root.cam.shape)
+                //
+                // Labels and values are ONE list apart and must stay the same length.
+                // They were not: three labels against a four-value list meant "Rounded"
+                // wrote `squircle`, "Rect" wrote `rounded`, and a project already saved
+                // as `rect` lit no chip at all.
+                currentIndex: root.shapeValues.indexOf(root.cam.shape)
                 onActivated: function (i) {
-                    Bridge.op("set_webcam", { shape: ["circle", "rounded", "rect"][i] })
+                    Bridge.op("set_webcam", { shape: root.shapeValues[i] })
                 }
+            }
+
+            C.Caption { text: "placement"; opacity: root.camEditable ? 1.0 : 0.5 }
+
+            // Spec §1g: "The grid is the primary placement control; dragging the bubble
+            // on canvas is the secondary one." Dragging was the only one that existed,
+            // which made corner placement -- the thing every recording actually wants --
+            // a freehand gesture you had to eyeball against the frame edge.
+            I.PlacementGrid {
+                Layout.fillWidth: true
+                enabled: root.camEditable
+                currentCell: {
+                    var r = root.cam.rect
+                    if (!r || !root.canvas)
+                        return -1
+                    var cx = r.x + r.width / 2
+                    var cy = r.y + r.height / 2
+                    var col = Math.min(2, Math.max(0, Math.floor(cx / (root.canvas.width / 3))))
+                    var row = Math.min(2, Math.max(0, Math.floor(cy / (root.canvas.height / 3))))
+                    return row * 3 + col
+                }
+                onPlaced: function (col, row) {
+                    var m = 0.04 * Math.min(root.canvas.width, root.canvas.height)
+                    var w = root.cam.rect.width
+                    var h = root.cam.rect.height
+                    var x = col === 0 ? m : col === 1 ? (root.canvas.width - w) / 2
+                                                      : root.canvas.width - w - m
+                    var y = row === 0 ? m : row === 1 ? (root.canvas.height - h) / 2
+                                                      : root.canvas.height - h - m
+                    Bridge.op("set_webcam", { rect: { x: x, y: y, width: w, height: h } })
+                }
+            }
+
+            C.Caption { text: "size"; opacity: root.camEditable ? 1.0 : 0.5 }
+
+            // The camera could only ever be resized by finding an invisible 22px target
+            // on a 7px dot, and only after clicking the camera to select it first. The
+            // grip still works and is still the fast way; this is the one you can find.
+            LabelledSlider {
+                Layout.fillWidth: true
+                label: "width"
+                from: 0.04
+                to: 0.60
+                modelValue: root.cam.size === undefined ? 0.14 : root.cam.size
+                display: Math.round(liveValue * 100) + "% of frame"
+                enabled: root.camEditable
+                onCommitted: function (v) { Bridge.op("set_webcam", { size: v }) }
             }
 
             Text {
@@ -385,6 +558,28 @@ ScrollView {
                     checked: root.backdrop.enabled === true
                     onToggled: function (v) { Bridge.op("set_backdrop", { enabled: v }) }
                 }
+            }
+
+            // The grounds. Above the sliders because it is the choice that changes what
+            // the recording looks like; padding and radius are adjustments to it.
+            C.SwatchGrid {
+                Layout.fillWidth: true
+                enabled: root.backdrop.enabled === true
+                opacity: enabled ? 1.0 : 0.45
+                catalogue: Bridge.backgrounds
+                currentId: root.backdrop.background || "custom"
+                customColor: root.backdrop.color || "#1b1d24"
+                onPicked: function (id) { Bridge.op("set_backdrop", { background: id }) }
+                onCustomPicked: colorDialog.open()
+            }
+
+            ColorDialog {
+                id: colorDialog
+                selectedColor: root.backdrop.color || "#1b1d24"
+                // Sending `color` is what flips the backdrop back to `custom`, so the
+                // well cannot be outranked by a swatch that is still selected.
+                onAccepted: Bridge.op("set_backdrop",
+                                      { color: selectedColor.toString().substring(0, 7) })
             }
 
             LabelledSlider {

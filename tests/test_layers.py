@@ -6,6 +6,7 @@ import pytest
 from ffmpeg_harness import FFMPEG, FONTFILE, framehashes, needs_ffmpeg, needs_font
 
 from omarchy_studio.geometry import Canvas, Placement, ffmpeg_blur, text_placement
+from omarchy_studio import layers as layers_mod
 from omarchy_studio.layers import (
     DEFAULT_FONTFILE,
     InputRegistry,
@@ -269,6 +270,67 @@ def test_webcam_layer_adapts_the_settings():
     layer = webcam_layer(WebcamSettings(x=0.5, y=0.25, shape="rounded"), CANVAS)
     assert layer.type == "webcam" and layer.x == 0.5 and layer.y == 0.25
     assert layer.props["shape"] == "rounded"
+
+
+# -- `rounded`, the superellipse ----------------------------------------------
+#
+# A superellipse, not a rounded rectangle with a generous radius. It has to survive
+# three separate implementations of the same outline -- this filtergraph mask,
+# editor/SquircleShape.qml, and the setup bar's self-view -- so the properties that
+# make it that shape are asserted here rather than left to the eye.
+
+
+def test_rounded_gets_the_square_centre_crop_like_the_circle():
+    # Without it the camera's 16:9 frame is stretched into a square box, and every
+    # face in it is 33% too wide.
+    chain = compile_one(
+        Layer(id="w", type="webcam", props={"shape": "rounded"}), camera="[cam]"
+    ).filter_chain
+    assert "crop=w='min(iw,ih)'" in chain
+
+
+def test_rounded_is_the_superellipse_and_not_a_rounded_rectangle():
+    rounded = compile_one(
+        Layer(id="w", type="webcam", props={"shape": "rounded"}), camera="[cam]"
+    ).filter_chain
+    # The Lamé exponent is what makes it that shape; a rounded rect has no pow().
+    assert "pow(" in rounded
+    assert layers_mod._rounded_rect_mask(64, 64, 8) not in rounded
+
+
+def test_the_old_shape_names_still_open():
+    # Bundles recorded before the three names were agreed say "squircle" (the model's
+    # old name) or "corner" (the setup bar's). Both meant this shape; neither should
+    # open as a circle, and neither should raise.
+    for legacy in ("squircle", "corner"):
+        assert WebcamSettings(shape=legacy).shape == "rounded"
+    assert WebcamSettings(shape="nonsense").shape == "circle"
+
+
+def test_the_squircle_mask_reduces_to_the_circle_at_n_equals_two():
+    """The cheapest proof the superellipse maths is right: at n=2 a Lamé curve IS an
+    ellipse, so the two masks must agree pixel for pixel on a square tile."""
+    import re as _re
+
+    def sample(expr, x, y):
+        # geq's variables, evaluated in Python. The expressions use only abs/pow/
+        # hypot/clip, all of which mean the same thing in both languages.
+        env = {"X": x, "Y": y, "abs": abs, "pow": pow,
+               "hypot": __import__("math").hypot,
+               "clip": lambda v, lo, hi: max(lo, min(hi, v))}
+        return eval(_re.sub(r"\bclip\(", "clip(", expr), {"__builtins__": {}}, env)
+
+    circle = layers_mod._circle_mask(64, 64)
+    lame2 = layers_mod._squircle_mask(64, 64, n=2.0)
+    for x, y in ((32, 32), (2, 2), (32, 1), (10, 55), (63, 63)):
+        assert abs(sample(circle, x, y) - sample(lame2, x, y)) < 0.5
+
+
+def test_a_rounded_camera_is_square_in_pixels():
+    # Same correction the circle gets: w and h normalize against different axes, so
+    # equal values are an ellipse on any non-square canvas.
+    place = WebcamSettings(w=0.2, h=0.2, shape="rounded").placement(CANVAS)
+    assert place.w * CANVAS.width == pytest.approx(place.h * CANVAS.height)
 
 
 def test_registry_indices_are_sequential():

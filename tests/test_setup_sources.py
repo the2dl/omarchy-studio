@@ -14,6 +14,8 @@ import importlib.machinery
 import importlib.util
 import json
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -105,6 +107,23 @@ def test_windows_drops_degenerate_rects():
     assert ss.windows([client(size=[0, 686])], 2) == []
 
 
+def test_windows_skips_our_own_surfaces_by_title_prefix():
+    # Only matters once enumeration repeats: the first pass runs before qml6 exists,
+    # every later one runs with our monitor-sized sheets mapped over everything.
+    clients = [
+        client(title="shell"),
+        client(title="omarchy-setup-sheet-DP-1", at=[0, 0], size=[2560, 1440]),
+        client(title="omarchy-studio-teleprompter", at=[40, 40], size=[600, 300]),
+    ]
+    out = ss.windows(clients, 2, ("omarchy-setup-sheet-", "omarchy-studio-teleprompter"))
+    assert [w["title"] for w in out] == ["shell"]
+
+
+def test_windows_keeps_everything_when_no_prefixes_are_given():
+    clients = [client(title="omarchy-setup-sheet-DP-1")]
+    assert len(ss.windows(clients, 2)) == 1
+
+
 # --- cameras -----------------------------------------------------------------
 
 
@@ -161,8 +180,9 @@ def test_parse_target_rejects_malformed(bad):
 def test_config_has_every_key_always():
     c = ss.config("monitor:DP-1", mic=True, desktop_audio=False,
                   camera="off", camera_device=None)
-    assert c == {"target": "monitor:DP-1", "mic": True, "desktop_audio": False,
-                 "camera": "off", "camera_device": None, "countdown": 3}
+    assert c == {"target": "monitor:DP-1", "mic": True, "mic_device": None,
+                 "desktop_audio": False, "camera": "off", "camera_device": None,
+                 "camera_rect": None, "countdown": 3}
 
 
 def test_config_carries_the_countdown():
@@ -191,13 +211,40 @@ def test_config_rejects_overlay_without_device():
 def test_config_forces_overlay_off_for_camera_target():
     # Recording the camera full-frame and overlaying it on itself is meaningless;
     # the contract guards it even if the UI regresses.
-    c = ss.config("camera:/dev/video1", False, False, "corner", "/dev/video0")
+    c = ss.config("camera:/dev/video1", False, False, "rounded", "/dev/video0")
     assert c["camera"] == "off"
     assert c["camera_device"] == "/dev/video1"
 
 
+def test_config_carries_where_the_self_view_was_left():
+    rect = {"x": 1800, "y": 900, "width": 400, "height": 400}
+    c = ss.config("monitor:DP-1", True, False, "circle", "/dev/video0",
+                  camera_rect=rect)
+    assert c["camera_rect"] == rect
+
+
+def test_config_drops_the_placement_when_there_is_no_camera():
+    # Nothing downstream should have to ask "is this placement for a camera that is
+    # not being recorded?" -- the answer is always no.
+    c = ss.config("monitor:DP-1", True, False, "off", None,
+                  camera_rect={"x": 10, "y": 10, "width": 100, "height": 100})
+    assert c["camera_rect"] is None
+
+
+@pytest.mark.parametrize("bad", [
+    {"x": 0, "y": 0, "width": 0, "height": 100},      # degenerate
+    {"x": 0, "y": 0, "width": 100},                    # missing a side
+    {"x": "left", "y": 0, "width": 100, "height": 100},
+    "400x400+10+10",                                   # a rect, but not this shape
+])
+def test_config_rejects_a_malformed_placement(bad):
+    with pytest.raises(ValueError):
+        ss.config("monitor:DP-1", True, False, "circle", "/dev/video0",
+                  camera_rect=bad)
+
+
 def test_config_is_one_json_line():
-    c = ss.config("region:1600x900+200+200", True, True, "corner", "/dev/video0")
+    c = ss.config("region:1600x900+200+200", True, True, "rounded", "/dev/video0")
     line = json.dumps(c)
     assert "\n" not in line
     assert json.loads(line) == c
@@ -290,3 +337,244 @@ def test_bridge_cancel_finishes_with_no_result(bridge):
     assert _call(port, "/cancel", session.token, {}) == {"ok": True}
     assert session.done.is_set()
     assert session.result is None
+
+
+# --- microphones --------------------------------------------------------------
+
+# One real input, its monitor, and an output's monitor: the shape pactl actually
+# returns, where monitors outnumber the inputs.
+PACTL_SOURCES = [
+    {"name": "alsa_output.pci-0000_10_00.6.analog-stereo.monitor",
+     "description": "Analog Stereo Monitor"},
+    {"name": "alsa_input.usb-Blue_Microphones-00.analog-stereo",
+     "description": "Blue Microphones Analog Stereo"},
+    {"name": "alsa_input.pci-0000_10_00.6.analog-stereo",
+     "description": "Ryzen HD Audio Analog Stereo"},
+]
+
+
+def test_mics_drops_monitor_sources():
+    """A monitor source recorded as "the mic" records the desktop into the voice
+    track, so they must never reach the picker."""
+    got = ss.mics(PACTL_SOURCES)
+    assert [m["name"] for m in got] == [
+        "alsa_input.usb-Blue_Microphones-00.analog-stereo",
+        "alsa_input.pci-0000_10_00.6.analog-stereo",
+    ]
+    assert got[0]["label"] == "Blue Microphones Analog Stereo"
+
+
+def test_mics_marks_the_default():
+    got = ss.mics(PACTL_SOURCES, "alsa_input.pci-0000_10_00.6.analog-stereo")
+    assert [m["default"] for m in got] == [False, True]
+
+
+def test_mics_falls_back_to_the_name_when_a_source_has_no_description():
+    got = ss.mics([{"name": "alsa_input.thing"}])
+    assert got[0]["label"] == "alsa_input.thing"
+
+
+def test_config_carries_the_picked_mic():
+    c = ss.config("monitor:DP-1", mic=True, desktop_audio=False, camera="off",
+                  camera_device=None, mic_device="alsa_input.usb-Blue-00.analog")
+    assert c["mic_device"] == "alsa_input.usb-Blue-00.analog"
+
+
+def test_config_drops_the_mic_device_when_the_mic_is_off():
+    """Otherwise the recorder is handed a source to open for a track nobody asked
+    for, and an unplugged device would fail a recording that wanted no audio."""
+    c = ss.config("monitor:DP-1", mic=False, desktop_audio=False, camera="off",
+                  camera_device=None, mic_device="alsa_input.usb-Blue-00.analog")
+    assert c["mic_device"] is None
+
+
+@pytest.mark.parametrize("bad", ["has space", "semi;colon", "quote'd", "new\nline"])
+def test_config_rejects_a_mic_device_that_could_not_be_a_source_name(bad):
+    """The name reaches a shell as one gsr -a argument."""
+    with pytest.raises(ValueError):
+        ss.config("monitor:DP-1", mic=True, desktop_audio=False, camera="off",
+                  camera_device=None, mic_device=bad)
+
+
+def test_the_bar_offers_the_same_three_shapes_as_the_editor():
+    # One vocabulary end to end. The bar used to say "squircle" and "corner" for shapes
+    # the model called "squircle" and "rounded", and the editor panel offered a third
+    # set of names again -- so the shape you set up was not the shape you got.
+    assert ss.CAMERA_MODES == ("off", "circle", "rounded", "rect")
+    for shape in ("circle", "rounded", "rect"):
+        assert ss.config("monitor:DP-1", True, False, shape, "/dev/video0")["camera"] == shape
+
+
+# --- hot-plug: sources that appear after the bar is already up -----------------
+
+
+class _FakeMeter:
+    """Stands in for MicMeter so the tests never spawn parec."""
+
+    def __init__(self) -> None:
+        self.device = ""
+        self.level = 0.0
+        self.db = -120.0
+        self.alive = False
+        self.retargets: list[str] = []
+
+    def start(self, device: str = "") -> None:
+        self.device = device
+
+    def retarget(self, device: str) -> None:
+        self.retargets.append(device)
+        self.device = device
+
+
+@pytest.fixture()
+def hotplug(cli, tmp_path, monkeypatch):
+    """A session whose view of the system is a mutable dict the test edits.
+
+    The whole bug this covers is that enumeration used to happen exactly once,
+    before qml6 spawned, so anything plugged in afterwards did not exist as far as
+    the bar was concerned -- the camera chip stayed "no camera" with the shape
+    control disabled beside it for the life of the process.
+    """
+    world = {"cameras": "", "nodes": (), "scans": 0, "mics": [], "clients": [],
+             "monitors": [{"name": "DP-1", "x": 0, "y": 0, "width": 2560,
+                           "height": 1440, "scale": 1.0, "focused": True,
+                           "activeWorkspace": {"id": 2}}]}
+
+    def fake_json(cmd):
+        return world["monitors"] if "monitors" in cmd else world["clients"]
+
+    def fake_scan(cmd):
+        world["scans"] += 1
+        return world["cameras"]
+
+    monkeypatch.setattr(cli, "_run_json", fake_json)
+    monkeypatch.setattr(cli, "_run_text", fake_scan)
+    monkeypatch.setattr(cli, "video_nodes", lambda: world["nodes"])
+    monkeypatch.setattr(cli, "list_mics", lambda: list(world["mics"]))
+
+    session = cli.SetupSession(tmp_path, countdown=3)
+    session.meter = _FakeMeter()
+    server = cli.serve(session, 0)
+    yield world, session, server.server_port
+    server.shutdown()
+
+
+def test_a_camera_plugged_in_after_launch_reaches_the_bar(hotplug):
+    world, session, port = hotplug
+    session.enumerate()
+    assert _call(port, "/sources", session.token)["cameras"] == []
+
+    world["cameras"] = "/dev/video2  Logitech StreamCam\n"
+    world["nodes"] = ("/dev/video2",)
+    session.enumerate()
+
+    cams = _call(port, "/sources", session.token)["cameras"]
+    assert [c["device"] for c in cams] == ["/dev/video2"]
+
+
+def test_the_camera_scan_is_skipped_while_the_video_nodes_are_unchanged(hotplug):
+    """v4l2-ctl costs ~86ms of the ~98ms an enumeration takes -- most of it, and all
+    of it wasted when nothing plugged in. The /dev/videoN set moves if and only if a
+    camera did, so it gates the scan exactly rather than approximately."""
+    world, session, port = hotplug
+    world["nodes"] = ("/dev/video0",)
+    world["cameras"] = "/dev/video0  Built-in\n"
+    session.enumerate()
+    assert world["scans"] == 1
+
+    session.enumerate()
+    session.enumerate()
+    assert world["scans"] == 1
+    assert _call(port, "/sources", session.token)["cameras"][0]["device"] == "/dev/video0"
+
+    world["nodes"] = ("/dev/video0", "/dev/video2")
+    session.enumerate()
+    assert world["scans"] == 2
+
+
+def test_a_mic_plugged_in_after_launch_reaches_the_bar_and_the_meter(hotplug):
+    world, session, port = hotplug
+    session.enumerate()
+    assert _call(port, "/sources", session.token)["mic"] is None
+
+    world["mics"] = [{"name": "alsa_input.usb-Blue", "label": "Yeti", "default": True}]
+    session.enumerate()
+
+    assert _call(port, "/sources", session.token)["mic"]["name"] == "alsa_input.usb-Blue"
+    # The meter was started dead (no mic existed); the rescan has to re-point it or
+    # the level stays flat next to a mic that is plainly working.
+    assert session.meter.device == "alsa_input.usb-Blue"
+
+
+def test_a_rescan_does_not_yank_the_meter_off_a_mic_the_user_picked(hotplug):
+    world, session, port = hotplug
+    world["mics"] = [{"name": "built-in", "label": "Built-in", "default": True}]
+    session.enumerate()
+
+    _call(port, "/mic-device", session.token, {"device": "alsa_input.usb-Blue"})
+    assert session.meter.device == "alsa_input.usb-Blue"
+
+    # Another device shows up and becomes the system default. The user's pick wins:
+    # the meter is answering "is THIS mic working?" about a mic they named.
+    world["mics"] = [{"name": "hdmi-thing", "label": "HDMI", "default": True}]
+    session.enumerate()
+    assert session.meter.device == "alsa_input.usb-Blue"
+
+
+def test_a_rescan_does_not_offer_our_own_sheets_as_capture_targets(hotplug):
+    world, session, port = hotplug
+    world["clients"] = [
+        {"class": "foot", "title": "shell", "at": [11, 45], "size": [2538, 686],
+         "workspace": {"id": 2}, "hidden": False},
+        {"class": "org.qt-project.qml", "title": "omarchy-setup-sheet-DP-1",
+         "at": [0, 0], "size": [2560, 1440], "workspace": {"id": 2}, "hidden": False},
+    ]
+    session.enumerate()
+    wins = _call(port, "/sources", session.token)["windows"]
+    assert [w["title"] for w in wins] == ["shell"]
+
+
+def test_the_rescan_pauses_while_the_area_picker_owns_the_screen(cli, hotplug,
+                                                                 monkeypatch):
+    """slurp has frozen a copy of the desktop with our windows unmapped; four
+    subprocesses describing that world are four subprocesses wasted -- and it must
+    pick itself back up when the pick is over, without anyone restarting it."""
+    world, session, port = hotplug
+    monkeypatch.setattr(cli, "RESCAN_SECONDS", 0.01)
+    calls: list[int] = []
+    session.enumerate = lambda: calls.append(1)   # type: ignore[method-assign]
+
+    session.picking = True
+    t = threading.Thread(target=session.rescan_forever, daemon=True)
+    t.start()
+    time.sleep(0.15)
+    assert calls == []
+
+    session.picking = False
+    time.sleep(0.15)
+    session.done.set()
+    t.join(timeout=2)
+    assert not t.is_alive()
+    assert calls
+
+
+def test_a_display_that_appears_gets_its_sheet_repositioned(hotplug):
+    """The sheet itself comes for free (the Repeater is bound to the list); being
+    moved onto the new output does not."""
+    world, session, port = hotplug
+    moved = []
+    session.reposition = lambda: moved.append(1)
+    session.enumerate()
+    assert moved == []          # same one monitor as the fixture built
+
+    world["monitors"] = world["monitors"] + [
+        {"name": "HDMI-A-1", "x": 2560, "y": 0, "width": 1920, "height": 1080,
+         "scale": 1.0, "focused": False, "activeWorkspace": {"id": 3}}]
+    session.enumerate()
+    for _ in range(20):         # reposition runs on its own thread
+        if moved:
+            break
+        time.sleep(0.02)
+    assert moved == [1]
+    assert [m["name"] for m in _call(port, "/sources", session.token)["monitors"]] \
+        == ["DP-1", "HDMI-A-1"]

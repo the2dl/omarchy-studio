@@ -24,6 +24,14 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 
+# The editor reports whether a local speech-to-text engine is available, so it has to be
+# able to SEE one -- and the engine lives in the repo's venv while this script is
+# launched by its shebang. See omarchy_studio.interpreter for why the check is on
+# sys.prefix rather than on the resolved interpreter path.
+from omarchy_studio.interpreter import reexec_into_venv  # noqa: E402
+
+reexec_into_venv(__file__, REPO)
+
 from omarchy_studio.project import Bundle, ProjectError  # noqa: E402
 from omarchy_studio import qmlbridge  # noqa: E402
 
@@ -59,6 +67,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="with --selftest: save a full-resolution grab of the stage")
     ap.add_argument("--frame", type=int, metavar="N",
                     help="with --selftest: park the playhead on this source frame")
+    ap.add_argument("--select", metavar="LAYER_ID",
+                    help="open with this layer selected, so its inspector is on screen. "
+                         "Selection is UI state with no route through the bridge, so "
+                         "this is the only way to photograph a layer inspector.")
+    ap.add_argument("--layers", action="store_true",
+                    help="open with the layer list out")
     ap.add_argument("--selftest-op", metavar="JSON",
                     help='with --selftest: apply one intent first, e.g. \'{"op":"set_webcam",'
                          '"args":{"shape":"rect"}}\'')
@@ -98,6 +112,10 @@ def main(argv: list[str] | None = None) -> int:
         argvq += ["--grab", str(Path(a.grab).expanduser().resolve())]
     if a.frame is not None:
         argvq += ["--frame", str(a.frame)]
+    if a.select:
+        argvq += ["--select", a.select]
+    if a.layers:
+        argvq += ["--layers", "1"]
     if a.selftest_op:
         argvq += ["--selftest-op", a.selftest_op]
 

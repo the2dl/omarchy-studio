@@ -1,11 +1,16 @@
 """The render driver: a Bundle in, one ffmpeg process out.
 
-STAGE ORDER IS LOAD-BEARING. cut -> zoom -> backdrop -> layers, in that order:
+STAGE ORDER IS LOAD-BEARING. cut -> cursor -> zoom -> backdrop -> layers, in that order:
 
 * Cut FIRST, not last. Same project, 2.20 s against 2.83 s, because every stage
   downstream then runs over fewer frames. Layer gates are remapped to output time by
   `CutMap.remap`, and rendering cut-first with remapped ranges against cut-last with
   verbatim ranges gave bit-identical frames, so the reordering is provably free.
+* Cursor BEFORE the zoom, so the zoom magnifies the pointer along with the pixels under
+  it. Drawn after the zoom it would have to have the zoom's own per-frame viewport
+  inverted into all four of its overlay expressions, and any disagreement between the
+  two copies shows up as the pointer sliding across the thing it is pointing at.
+  It costs the stream its chroma subsampling -- see `_cursor`.
 * Zoom SECOND, while the base is still planar YUV. `perspective` costs 8.4 ms/frame at
   1440p on yuv420p and 14.9 ms/frame once the backdrop has converted the stream to
   rgba/gbrap, and it is the same pixels either way.
@@ -43,7 +48,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import cuts, layers as layers_mod, probe
+from . import backgrounds, cuts, layers as layers_mod, probe
 from .geometry import Canvas
 from .project import Bundle, BackdropSettings, Layer, ProjectError
 from .timebase import CutMap, FrameRange, Timebase
@@ -165,7 +170,12 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
         # grid, so a 30 fps camera cut against indices computed for a 60 fps screen
         # would remove the wrong material.
         g.add(layers_mod.timebase_chain(f"[{idx}:v]", tb, "[cam_tb]"))
-        cam_aligned = _align_camera(g, "[cam_tb]", bundle.camera_offset_frames())
+        cam_aligned = _align_camera(
+            g,
+            "[cam_tb]",
+            bundle.camera_offset_frames(),
+            bundle.camera_warmup_frames(),
+        )
 
     has_audio = bool(capture.screen.has_audio)
 
@@ -191,6 +201,8 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
     cur = labels["[base]"]
     if cam_aligned:
         registry.bind("camera", labels[cam_aligned])
+
+    cur = _cursor(g, cur, bundle, cutmap, registry)
 
     zf = zoom_filter(_segments(bundle, cutmap), canvas, tb)
     if zf:
@@ -241,7 +253,7 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
     )
 
 
-def _align_camera(g: _Graph, label: str, offset: int) -> str:
+def _align_camera(g: _Graph, label: str, offset: int, warmup: int = 0) -> str:
     """Put camera frame 0 on screen frame 0, in whole frames.
 
     Positive offset means the camera started later, so the head is padded by cloning its
@@ -250,14 +262,31 @@ def _align_camera(g: _Graph, label: str, offset: int) -> str:
 
     Both are exact on the project grid. `-itsoffset` is not: verified on this build, a
     +0.2 s offset through `fps=30` delays by exactly 6 frames but -0.2 s advances by 4.
+
+    `warmup` is the sensor's auto-exposure ramp (Stream.warmup_frames, converted to
+    screen frames by Bundle.camera_warmup_frames), and the frame it clones is the first
+    frame PAST it. What the head holds is the only thing that changes: trim `warmup`,
+    then pad by `offset + warmup` instead of by `offset`. After the trim the stream's
+    frame 0 is the old frame W, and padding by offset+W puts it back at screen frame
+    W+offset -- exactly where it started. Camera frame k lands at screen frame k+offset
+    either way, so the lip sync this function exists to protect is untouched, and the
+    head shows a settled face instead of the bubble fading up from black.
+
+    Negative `offset + warmup` needs no warm-up branch of its own: the whole point of
+    that case is that the camera's first frames belong before screen frame 0 and are
+    dropped, and `offset + warmup <= 0` means -offset >= warmup, so the ramp is inside
+    the frames going away regardless.
     """
-    if offset == 0:
-        return label
+    # Where the first SETTLED camera frame belongs, in screen frames.
+    head = offset + warmup
     out = "[cam_aligned]"
-    if offset > 0:
-        g.add(f"{label}tpad=start={offset}:start_mode=clone{out}")
-    else:
+    if head <= 0:
+        if offset == 0:
+            return label  # warmup is 0 here too; nothing to do, and no filter emitted
         g.add(f"{label}trim=start_frame={-offset},setpts=PTS-STARTPTS{out}")
+        return out
+    pre = f"trim=start_frame={warmup},setpts=PTS-STARTPTS," if warmup > 0 else ""
+    g.add(f"{label}{pre}tpad=start={head}:start_mode=clone{out}")
     return out
 
 
@@ -283,6 +312,93 @@ def _segments(bundle: Bundle, cutmap: CutMap):
     except events.EventsError:
         return []
     return zoom_segments(clicks, settings, bundle.timebase, cutmap)
+
+
+# --- cursor ------------------------------------------------------------------
+
+# The overlay's working format. NOT the yuv420 default: `overlay` in yuv420 snaps its
+# x/y to EVEN pixels, because the chroma planes are half resolution and a chroma sample
+# cannot land between two of them. Measured on this build with `x='n'` -- yuv420 walked
+# 0,2,2,4,4,6 across six frames while yuv444 walked 0,1,2,3,4,5. Two-pixel steps on a
+# slowly-moving pointer are exactly the staircase the smoothing above exists to remove,
+# so the format is worth what it costs: `perspective` measured 8.28 ms/frame on yuv420p,
+# 11.65 on yuv444p and 14.21 on rgba at 2560x1440, so the cursor buys whole-pixel
+# positioning for 3.4 ms/frame and still undercuts doing the same overlay in rgba.
+_CURSOR_OVERLAY_FORMAT = "yuv444"
+
+
+def _cursor(
+    g: _Graph,
+    cur: str,
+    bundle: Bundle,
+    cutmap: CutMap,
+    registry: layers_mod.InputRegistry,
+) -> str:
+    """Composite the synthetic pointer, or return the frame untouched.
+
+    Every failure here degrades to "no cursor", never to a failed export, and the list of
+    things that can fail is long: the bundle may predate the cursor track, cursor.bin may
+    be truncated by a killed recorder, the capture may have no anchor, the cache
+    directory may be unwritable. The recording is still perfectly good video in all of
+    them, and refusing to render it would be the worse failure -- the same rule
+    `_segments` follows for the auto-zoom.
+    """
+    settings = bundle.edit.cursor
+    if not settings.enabled:
+        return cur
+    from . import cursor as cursor_mod, events
+
+    try:
+        path = bundle.events_dir / "cursor.bin"
+        if not path.exists():
+            return cur
+        track = events.read_cursor_track(path)
+        clicks_path = bundle.events_dir / "input.jsonl"
+        clicks = events.read_clicks(clicks_path) if clicks_path.exists() else []
+        plan = cursor_mod.build_plan(
+            track, clicks, bundle.capture, bundle.timebase, cutmap, settings, bundle.canvas
+        )
+        if plan is None:
+            return cur
+        arrow, sheet = cursor_mod.write_sprites(plan, bundle.proxy_dir / "cursor")
+    except (events.EventsError, cursor_mod.CursorError, OSError, ValueError):
+        return cur
+
+    tb = bundle.timebase
+    # The ripple goes UNDER the pointer: the ring marks the point the tip is already on,
+    # and drawing it over the arrow would put a translucent band across the glyph.
+    if sheet is not None:
+        # `-loop 1` at the PROJECT rate, because the tile selector below is a function of
+        # the filmstrip stream's own frame counter. A still image would deliver one frame
+        # and `crop` would evaluate its x exactly once, freezing the ripple on tile 0 --
+        # the same once-at-init trap that made `crop` unusable for the zoom.
+        idx = registry.add(
+            ["-loop", "1", "-framerate", f"{tb.fps_num}/{tb.fps_den}", "-i", str(sheet)]
+        )
+        s = plan.ripple_px
+        g.add(
+            f"[{idx}:v]crop=w={s}:h={s}:"
+            f"x='{cursor_mod.ripple_stage_expr(plan)}*{s}':y=0[cur_ripple]"
+        )
+        rx, ry = cursor_mod.ripple_position_exprs(plan)
+        # shortest=1 because that input is infinite: without it the graph would run until
+        # every input ends and the looped filmstrip never does.
+        g.add(
+            f"{cur}[cur_ripple]overlay=x='{rx}':y='{ry}'"
+            f":shortest=1:format={_CURSOR_OVERLAY_FORMAT}[cur_rippled]"
+        )
+        cur = "[cur_rippled]"
+
+    ax, ay = cursor_mod.overlay_position_exprs(plan)
+    idx = registry.add(["-i", str(arrow)])
+    # A single still frame, held by overlay's eof_action=repeat -- the same idiom
+    # layers.py uses for a static image tile. Only the POSITION changes per frame, and
+    # that is an expression, so there is nothing to loop.
+    g.add(
+        f"{cur}[{idx}:v]overlay=x='{ax}':y='{ay}'"
+        f":format={_CURSOR_OVERLAY_FORMAT}[cursored]"
+    )
+    return "[cursored]"
 
 
 def _layer_list(bundle: Bundle, registry: layers_mod.InputRegistry) -> list[Layer]:
@@ -338,6 +454,35 @@ def _rounded_rect_mask(w: int, h: int, r: int) -> str:
     return f"clip(255*({r}-hypot({dx},{dy})+0.5),0,255)"
 
 
+def _ground(bg: backgrounds.Background, W: int, H: int, rate: str) -> str:
+    """The infinite source that fills the whole frame behind the video.
+
+    `speed=0` is not cosmetic. `gradients` turns its own line by `speed` radians every
+    frame and defaults to 0.01, so the ground shipped as a slowly rotating gradient --
+    at 30 fps a black-to-white diagonal's top-left pixel walked 0x00 -> 0x0d over 45
+    frames. Motion in a still plate reads as an encoder artefact.
+
+    The oversized frame and the `crop` are the price of an arbitrary angle, and of a
+    gradient that is the same on every render: see `backgrounds.GradientPlan`.
+    """
+    if not bg.is_gradient:
+        return f"color=c={_hex(bg.colors[0])}:s={W}x{H}:r={rate}"
+    if not 2 <= len(bg.colors) <= backgrounds.MAX_STOPS:
+        raise RenderError(
+            f"background {bg.id!r} has {len(bg.colors)} stops; "
+            f"gradients takes 2 to {backgrounds.MAX_STOPS}"
+        )
+    p = backgrounds.gradient_plan(bg.angle, W, H)
+    stops = ":".join(f"c{i}={_hex(c)}" for i, c in enumerate(bg.colors))
+    src = (
+        f"gradients=s={p.width}x{p.height}:{stops}:nb_colors={len(bg.colors)}"
+        f":x0={p.x0}:y0={p.y0}:x1={p.x1}:y1={p.y1}:speed=0:r={rate}"
+    )
+    if p.crop is not None:
+        src += ",crop=" + ":".join(str(v) for v in p.crop)
+    return src
+
+
 def _backdrop(
     g: _Graph, cur: str, canvas: Canvas, tb: Timebase, bd: BackdropSettings
 ) -> str:
@@ -358,13 +503,7 @@ def _backdrop(
     px, py = (W - dw) // 2, (H - dh) // 2
     radius = int(round(bd.corner_radius * min(W, H)))
 
-    if bd.gradient:
-        g.add(
-            f"gradients=s={W}x{H}:c0={_hex(bd.color)}:c1={_hex(bd.gradient)}"
-            f":x0=0:y0=0:x1={W}:y1={H}:r={rate},format=rgba[bgi]"
-        )
-    else:
-        g.add(f"color=c={_hex(bd.color)}:s={W}x{H}:r={rate},format=rgba[bgi]")
+    g.add(_ground(backgrounds.resolve(bd, canvas), W, H, rate) + ",format=rgba[bgi]")
 
     g.add(f"{cur}scale={dw}:{dh}:flags=bicubic,format=rgba[inset]")
     g.add(

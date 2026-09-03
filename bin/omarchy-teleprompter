@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""The teleprompter: your script on screen while you record, and out of the recording.
+
+# omarchy:summary=A floating script you can read from while recording
+# omarchy:group=capture
+# omarchy:args=[--toggle] [--anyway]
+
+WHY THIS IS A SEPARATE PROCESS. It has to outlive the setup surfaces (which are
+destroyed the moment Record is pressed) and it has to stay up across a whole take, so it
+cannot live inside bin/omarchy-capture-setup's process. It is also useful with no
+recording running at all -- rehearsing is most of what a prompter gets used for.
+
+THE EXCLUSION IS THE WHOLE FEATURE. `no_screen_share` keeps this window out of the
+portal's frames, but only on a compositor carrying contrib/hyprland-screenshare-exclude;
+stock Hyprland paints a black rectangle where the window is instead, which is worse than
+showing the prompter, because a black box moves with it and smears through the take. So
+the capability is probed rather than assumed, and a session that cannot exclude says so
+plainly instead of discovering it in the export.
+
+Launch pattern notes shared with bin/omarchy-capture-setup and bin/omarchy-studio, each
+one a past debugging session: /usr/bin/qml6 by absolute path (plain `qml` is Qt 5.15 and
+dies silently), QT_ASSUME_STDERR_HAS_CONSOLE=1 (or QML warnings vanish into the journal),
+and a tokened loopback bridge (any local process can reach a loopback port).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import secrets
+import signal
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+from omarchy_studio import compositor  # noqa: E402
+from omarchy_studio.qmlbridge import theme_tokens  # noqa: E402
+
+QML6 = "/usr/bin/qml6"
+PROMPTER_QML = REPO / "editor" / "teleprompter" / "main.qml"
+
+# The join key between QML and Hyprland, exactly as the self-view uses one: the rule is
+# matched on the title before the window maps, and the address is looked up after.
+# A dynamic window rule cannot be removed for the life of the compositor, so this title
+# is deliberately specific and must not be reused for anything that wants to be recorded.
+WINDOW_TITLE = "omarchy-studio-teleprompter"
+
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+PID_FILE = RUNTIME_DIR / "omarchy-studio-teleprompter.pid"
+# Written only when the prompter was raised BY a recording (the setup bar's Script
+# toggle). It came with the recording, so it goes with the recording -- a prompter left
+# on screen after Stop is a window the user has to hunt for, and worse, on a KMS capture
+# it is a window that will be in the NEXT take. One a person started themselves is
+# theirs and is never taken away.
+OWNED_FILE = RUNTIME_DIR / "omarchy-studio-teleprompter.owned-by-recording"
+STATE_FILE = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+              / "omarchy-studio" / "teleprompter.json")
+
+DEFAULT_STATE = {"script": "", "wpm": 130, "font_size": 26, "dim": 1.0,
+                 "width": 720, "height": 420}
+
+
+# --- persistence -------------------------------------------------------------
+
+
+def load_state() -> dict:
+    """The saved script and settings, or the defaults.
+
+    Never raises. A prompter that will not open because its own state file is malformed
+    is strictly worse than one that opens empty, and the file is rewritten on the next
+    edit anyway.
+    """
+    state = dict(DEFAULT_STATE)
+    try:
+        stored = json.loads(STATE_FILE.read_text())
+        if isinstance(stored, dict):
+            state.update({k: v for k, v in stored.items() if k in DEFAULT_STATE})
+    except Exception:
+        pass
+    return state
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    keep = {k: v for k, v in state.items() if k in DEFAULT_STATE}
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(keep, indent=2))
+    tmp.replace(STATE_FILE)          # atomic: a half-written script is a lost script
+
+
+# --- Hyprland ----------------------------------------------------------------
+
+
+def hypr(*args: str) -> str:
+    try:
+        return subprocess.run(["hyprctl", *args], capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+
+def exclusion_available() -> bool:
+    """Whether this compositor can leave a window OUT of a screenshare rather than
+    black it out. Absent on stock Hyprland; provided by the plugin in
+    contrib/hyprland-studio-screenshare (see omarchy_studio.compositor)."""
+    return compositor.self_view_exclusion_available()
+
+
+def install_window_rule() -> None:
+    """Applied before qml6 spawns so it lands at map time.
+
+    `hyprctl eval` with the hl.* form is the only one that works under Omarchy's Lua
+    parser -- the legacy keyword form is refused outright. Field names here were all
+    probed against the live parser, which rejects unknown fields by name.
+    """
+    rule = (f'hl.window_rule({{ match = {{ title = "^{WINDOW_TITLE}$" }}, '
+            f'float = true, pin = true, no_screen_share = true, no_dim = true, '
+            f'border_size = 0, no_shadow = true, animation = "none", no_anim = true }})')
+    subprocess.run(["hyprctl", "eval", rule], capture_output=True)
+
+
+def window_address() -> str:
+    try:
+        clients = json.loads(hypr("clients", "-j") or "[]")
+    except json.JSONDecodeError:
+        return ""
+    for c in clients:
+        if c.get("title") == WINDOW_TITLE:
+            return c.get("address", "")
+    return ""
+
+
+def rule_landed(address: str) -> bool:
+    """Asked of `getprop`, never of `hyprctl clients -j`.
+
+    The clients JSON has no noScreenShare field at all -- it answers null for every
+    window, including one the rule definitely applied to, which is how the camera
+    self-view's own guard silently disabled itself for every recording.
+    """
+    return hypr("getprop", f"address:{address}", "no_screen_share") == "true"
+
+
+def notify(title: str, body: str, urgency: str = "normal") -> None:
+    subprocess.run(["omarchy-notification-send", "-u", urgency, "-t", "5000",
+                    title, body], capture_output=True)
+
+
+# --- the bridge --------------------------------------------------------------
+
+
+def serve(state: dict, token: str, port: int = 0) -> ThreadingHTTPServer:
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, obj, status=200):
+            body = json.dumps(obj).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authed(self) -> bool:
+            if self.headers.get("X-Studio-Token") == token:
+                return True
+            self._send({"error": "bad token"}, 403)
+            return False
+
+        def do_GET(self):
+            if not self._authed():
+                return
+            if self.path == "/state":
+                with lock:
+                    return self._send(state)
+            if self.path == "/theme":
+                return self._send(theme_tokens())
+            self._send({"error": "not found"}, 404)
+
+        def do_POST(self):
+            if not self._authed():
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except json.JSONDecodeError:
+                return self._send({"error": "bad json"}, 400)
+            if self.path == "/state":
+                with lock:
+                    state.update(body)
+                    save_state(state)
+                return self._send({"ok": True})
+            self._send({"error": "not found"}, 404)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+# --- toggle ------------------------------------------------------------------
+
+
+def running_pid() -> int:
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except Exception:
+        return 0
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return 0
+    return pid
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--toggle", action="store_true",
+                    help="close the prompter if one is already up (for a keybind)")
+    ap.add_argument("--owned-by-recording", action="store_true",
+                    help="close automatically when the recording that raised this stops")
+    ap.add_argument("--anyway", action="store_true",
+                    help="open even where the compositor cannot keep it out of a "
+                         "recording, without the warning")
+    a = ap.parse_args(argv)
+
+    existing = running_pid()
+    if existing:
+        if a.toggle:
+            os.kill(existing, signal.SIGTERM)
+            PID_FILE.unlink(missing_ok=True)
+            return 0
+        print(f"a teleprompter is already running (pid {existing})", file=sys.stderr)
+        return 1
+
+    if not exclusion_available() and not a.anyway:
+        # Not fatal: rehearsing is most of what a prompter gets used for, and refusing
+        # to open would take that away to prevent a mistake the user may not be about to
+        # make. Said loudly, once, so it cannot be discovered in the export instead.
+        print("This compositor cannot keep a window out of a screen recording, so the\n"
+              "prompter will be a black rectangle in anything you record while it is up.\n"
+              "See contrib/hyprland-screenshare-exclude/README.md. --anyway silences this.",
+              file=sys.stderr)
+        notify("Teleprompter will be recorded",
+               "This compositor cannot exclude it from a capture.", "critical")
+
+    state = load_state()
+    token = secrets.token_urlsafe(16)
+    server = serve(state, token)
+    install_window_rule()
+
+    env = dict(os.environ)
+    env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
+    proc = subprocess.Popen(
+        [QML6, "-I", str(REPO / "editor"), str(PROMPTER_QML), "--",
+         "--port", str(server.server_port), "--token", token,
+         "--theme", json.dumps(theme_tokens())],
+        env=env)
+    PID_FILE.write_text(str(os.getpid()))
+    if a.owned_by_recording:
+        OWNED_FILE.write_text(str(os.getpid()))
+
+    def terminate(*_):
+        proc.terminate()
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+
+    try:
+        # The window maps a beat after qml6 starts; the rule is checked once it is there
+        # rather than trusted, for the reason rule_landed's docstring gives.
+        def verify():
+            for _ in range(60):
+                address = window_address()
+                if address:
+                    if exclusion_available() and not rule_landed(address):
+                        notify("Teleprompter is not hidden from capture",
+                               "Hyprland did not apply no_screen_share to it.", "critical")
+                    return
+                threading.Event().wait(0.1)
+        threading.Thread(target=verify, daemon=True).start()
+        return proc.wait()
+    finally:
+        PID_FILE.unlink(missing_ok=True)
+        OWNED_FILE.unlink(missing_ok=True)
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

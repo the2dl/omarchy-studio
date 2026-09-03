@@ -120,18 +120,20 @@ def test_webcam_without_camera_stream_is_disabled(tmp_path):
     assert qmlbridge.resolve_webcam(b)["editable"] is False
 
 
-def test_webcam_radius_only_applies_to_the_rounded_shape(bundle):
-    """A circle is the ellipse inscribed in the tile (layers._circle_mask), so it has no
-    radius at all: sending min(w,h)/2 would draw a stadium in the preview and an ellipse
-    in the export the moment the box is not square -- which the 0.22x0.22 default on a
-    16:9 canvas already is."""
+def test_no_webcam_shape_reports_a_corner_radius(bundle):
+    """None of the three shapes is drawn from a radius any more.
+
+    A circle is the ellipse inscribed in the tile (layers._circle_mask) and `rounded` is
+    the superellipse (layers._squircle_mask); both are masks, not rectangles with
+    rounded corners, and `rect` has square corners on purpose. The overlay keeps reading
+    `radius`, so it has to stay in the payload -- as zero, for every shape. Sending a
+    real one drew a stadium in the preview against an ellipse in the export the moment
+    the box was not square, which the 0.22x0.22 default on a 16:9 canvas already is."""
     bundle.edit.webcam.w, bundle.edit.webcam.h = 0.3, 0.1
-    assert qmlbridge.resolve_webcam(bundle)["radius"] == 0.0
-    bundle.edit.webcam.shape = "rounded"
     bundle.edit.webcam.corner_radius = 0.25
-    w = qmlbridge.resolve_webcam(bundle)
-    # Normalized to the SHORT side, the same normalization layers._radius_px uses.
-    assert w["radius"] == pytest.approx(0.25 * min(w["rect"]["width"], w["rect"]["height"]))
+    for shape in ("circle", "rounded", "rect"):
+        bundle.edit.webcam.shape = shape
+        assert qmlbridge.resolve_webcam(bundle)["radius"] == 0.0
 
 
 # --- events ------------------------------------------------------------------

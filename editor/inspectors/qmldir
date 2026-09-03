@@ -9,3 +9,4 @@ ImageInspector 1.0 ImageInspector.qml
 TextInspector 1.0 TextInspector.qml
 RedactInspector 1.0 RedactInspector.qml
 ShapeInspector 1.0 ShapeInspector.qml
+CaptionInspector 1.0 CaptionInspector.qml

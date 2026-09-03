@@ -2,7 +2,7 @@
 
 # omarchy:summary=Record the webcam into a recording bundle as its own stream
 # omarchy:group=capture
-# omarchy:args=start <bundle-dir> [--device=<dev>] [--size=<small|medium|large>] [--self-view=<yes|no>] [--outside=<WxH+X+Y>] | stop | status
+# omarchy:args=start <bundle-dir> [--device=<dev>] [--size=<small|medium|large>] [--shape=<circle|rounded|rect>] [--self-view=<yes|no>] [--outside=<WxH+X+Y>] [--exclude=<yes|no>] | stop | status
 # omarchy:hidden=true
 #
 # One ffmpeg process opens the camera ONCE and fans it out: cam.mp4 for the editor,
@@ -28,18 +28,50 @@ PID_FILE="$RUNTIME_DIR/omarchy-studio-camera.pid"
 PREVIEW_PID_FILE="$RUNTIME_DIR/omarchy-studio-camera-preview.pid"
 FIFO="$RUNTIME_DIR/omarchy-studio-camera.fifo"
 LOG_FILE="$RUNTIME_DIR/omarchy-studio-camera.log"
+# start and stop mutate the same processes, and stop is deliberately called from two
+# places at once: the recorder's stop path, and the detached watchdog that fires when
+# gsr exits. Unserialized, both found the same live ffmpeg and both sent it SIGINT --
+# and a SECOND signal is not a second polite request, it is ffmpeg's "Immediate exit"
+# path, which abandons the mp4 trailer. The symptom was a cam.mp4 with no moov atom
+# (unreadable by ffprobe, so finalize could not complete capture.json) beside a
+# perfectly good screen.mp4. Verified in the wild on 2026-09-02_19-10-25.
+LOCK_FILE="$RUNTIME_DIR/omarchy-studio-camera.lock"
 
 readonly MARGIN=40
 readonly SELF_VIEW_MARKER="omarchy_studio_selfview=1"
+# The radius `rounded` uses, as hundredths of the window's side. Derived from
+# layers.SQUIRCLE_N (the real Lamé exponent, 4) in shape_self_view's comment -- the live
+# bubble approximates that curve with an ordinary arc, because Hyprland's rounding_power
+# chamfers rather than curves at the radius the true shape would need.
+readonly ROUNDED_RADIUS_PCT=27
+# The self-view's window title. WebcamOverlay is the burn-in overlay's title and must
+# stay visible to the capture; the excluded self-view needs a title of its own because
+# the no_screen_share rule is matched on it and a dynamic rule, once added, is permanent
+# for the life of the compositor.
+SELF_VIEW_TITLE="WebcamOverlay"
+readonly EXCLUDED_SELF_VIEW_TITLE="WebcamSelfView"
 
 DEVICE=""
 SIZE="medium"
+# The shape the setup bar was left on, in the one vocabulary everything uses now. The
+# self-view is masked to it by the compositor so that what is on screen while you record
+# is the shape the editor and the export will draw -- see shape_self_view().
+SHAPE="circle"
 SELF_VIEW="no"
 OUTSIDE=""
-FPS=30
+# --exclude=yes: the recorder is on the portal backend and the compositor keeps a
+# no_screen_share window out of its frames, so the self-view may sit INSIDE the capture.
+EXCLUDE="no"
+# Empty means "the best frame rate the device offers at the mode we chose". It was 30,
+# which silently halved a 60fps camera and, worse, ASKED a 30fps-max camera for a rate
+# it does not have.
+FPS=""
+CAM_FPS=30
+# nv12 or mjpeg, whichever resolve_capture_format finds is best on the device.
+CAM_PIXFMT="mjpeg"
 
 usage() {
-  echo "Usage: omarchy-capture-camera start <bundle-dir> [--device=<dev>] [--size=<small|medium|large>] [--self-view=<yes|no>] [--outside=<WxH+X+Y>]" >&2
+  echo "Usage: omarchy-capture-camera start <bundle-dir> [--device=<dev>] [--size=<small|medium|large>] [--shape=<circle|rounded|rect>] [--self-view=<yes|no>] [--outside=<WxH+X+Y>] [--exclude=<yes|no>]" >&2
   echo "       omarchy-capture-camera stop|status" >&2
   exit 1
 }
@@ -66,20 +98,73 @@ resolve_device() {
 # The fan-out copies the camera's native MJPEG to the preview branch, so an MJPEG mode
 # is required rather than preferred: without one the preview would have to be re-encoded
 # and the zero-copy branch is the reason the self-view is free.
+#
+# THE BEST MODE THE DEVICE OFFERS, not the first one off a wishlist. This used to walk
+# `1280x720 640x480 1920x1080` and take the first match, which meant every camera that
+# could do 720p recorded at 720p -- including one that also offered 1080p and 1664x1248,
+# and including any 4K camera you might plug in later. The list could not be reordered
+# to fix it either: putting 1920x1080 first would have penalised a camera whose only
+# 1080p mode ran at 5fps. Sorting by pixels and then by frame rate answers both.
+# NV12 AND MJPEG, preferring NV12 at equal size and rate.
+#
+# This used to demand MJPEG, because the self-view branch copied the camera's native
+# MJPEG to mpv without re-encoding. That reason is gone -- the preview is scaled on the
+# GPU and re-encoded small -- and the requirement had become the expensive option.
+# Measured on a 3840x2160 camera, 300 frames against 10.0s of real time:
+#
+#   MJPEG in:  12.2s   (a JPEG decode plus a yuvj422p -> nv12 swscale, both on the CPU)
+#   NV12 in:   10.4s   (neither; the encoder wants nv12 and the camera already speaks it)
+#
+# Taking 12.2s to produce 10s of frames is a 22% deficit, and a deficit does not show up
+# as dropped frames -- it shows up as a backlog that GROWS, which is why the self-view
+# ended up "a solid 3-6 seconds behind real time" and getting worse the longer it ran.
+#
+# It costs USB bandwidth instead (4K30 nv12 is ~370 MB/s uncompressed), but a camera only
+# advertises a mode it can deliver over the link it is attached to, so trusting the
+# descriptors is the right call. MJPEG stays for the many cameras that offer nothing
+# else, where the decode is cheap anyway.
 resolve_capture_format() {
-  local formats
+  local formats best
   formats=$(v4l2-ctl --list-formats-ext -d "$DEVICE" 2>/dev/null)
-  grep -q "MJPG" <<<"$formats" || return 1
 
-  local resolution
-  for resolution in 1280x720 640x480 1920x1080; do
-    if grep -q "$resolution" <<<"$formats"; then
-      CAM_WIDTH=${resolution%x*}
-      CAM_HEIGHT=${resolution#*x}
-      return 0
-    fi
-  done
-  return 1
+  # One "pixels pref width height fps fmt" row per (usable size, interval) pair. Stepwise
+  # and continuous sizes are skipped -- they have no enumerated modes to compare, and
+  # every UVC webcam publishes discrete ones alongside them. `pref` breaks ties to nv12.
+  best=$(awk '
+    /^[[:space:]]*\[[0-9]+\]/ {
+      fmt = ($0 ~ /MJPG/) ? "mjpeg" : (($0 ~ /NV12/) ? "nv12" : "")
+      w = 0
+    }
+    fmt != "" && /Size: Discrete/   { split($3, d, "x"); w = d[1] + 0; h = d[2] + 0 }
+    fmt != "" && /Interval: Discrete/ && w > 0 {
+      f = $0; sub(/.*\(/, "", f); sub(/[[:space:]]*fps\).*/, "", f)
+      printf "%d %d %d %d %d %s\n", w * h, (fmt == "nv12" ? 1 : 0), w, h, f + 0, fmt
+    }
+  ' <<<"$formats" | sort -k1,1nr -k5,5nr -k2,2nr | head -1)
+
+  [[ -n $best ]] || return 1
+  read -r _ _ CAM_WIDTH CAM_HEIGHT CAM_FPS CAM_PIXFMT <<<"$best"
+  [[ ${CAM_WIDTH:-0} -gt 0 && ${CAM_HEIGHT:-0} -gt 0 ]] || return 1
+  ((CAM_FPS > 0)) || CAM_FPS=30
+  # An explicit --fps is a deliberate override and outranks the device's opinion.
+  [[ -n $FPS ]] && CAM_FPS=$FPS
+  return 0
+}
+
+# Bits per second for the camera encode, scaled from the 6 Mbit that was tuned at
+# 1280x720. A fixed 6M was thin the moment the capture stopped being 720p, and the
+# camera is the one stream a viewer looks straight at. Clamped at both ends: below 4M
+# even a small camera goes blocky on motion, and above 40M the file grows faster than
+# any visible gain -- 4K30 asks for 54M by the linear rule and does not need it.
+# 0.217 bits per pixel per frame is what the old flat 6M worked out to at 1280x720@30,
+# so the baseline reproduces itself (5.99 -> 5M) and everything else scales off a number
+# that was actually tuned rather than invented. /1e9 because the answer is in MEGAbits:
+# the intermediate is ~1.4e10 for a 4K mode, which is why this is 64-bit arithmetic.
+camera_bitrate() {
+  local bps=$((CAM_WIDTH * CAM_HEIGHT * CAM_FPS * 217 / 1000000000))
+  ((bps < 4)) && bps=4
+  ((bps > 40)) && bps=40
+  echo "${bps}M"
 }
 
 monitors_logical() {
@@ -98,28 +183,26 @@ rects_overlap() {
 
 # The 8:9 portrait presets from default/hypr/apps/webcam-overlay.lua, scaled from the
 # host monitor's height so the self-view is the same share of a 1080p and a 6K display.
+# SQUARE, like the self-view in the setup window and like WebcamSettings.placement for
+# every shape but `rect`. It was 16:18 portrait -- 320x360 at medium -- against a 4:3
+# camera, so mpv letterboxed the picture into it and the bubble on screen was a black
+# box with a strip of face in the middle. Nothing else was ever square-shaped about it:
+# a circle in a 320x360 window is an ellipse.
 preset_size() {
   local monitor_height=$1
   case $SIZE in
-  small)
-    PRESET_W=$((monitor_height * 4 / 25))
-    PRESET_H=$((monitor_height * 9 / 50))
-    ;;
-  large)
-    PRESET_W=$((monitor_height * 3 / 10))
-    PRESET_H=$((monitor_height * 27 / 80))
-    ;;
-  *)
-    PRESET_W=$((monitor_height * 2 / 9))
-    PRESET_H=$((monitor_height / 4))
-    ;;
+  small) PRESET_W=$((monitor_height * 4 / 25)) ;;
+  large) PRESET_W=$((monitor_height * 3 / 10)) ;;
+  *) PRESET_W=$((monitor_height * 2 / 9)) ;;
   esac
+  PRESET_H=$PRESET_W
 }
 
 # Finds a spot for the self-view that the capture cannot see. Leaves it in PARK_X/PARK_Y
-# (plus PRESET_W/PRESET_H) and returns 1 when there is nowhere to put it -- there is no
-# software trick that hides a window from gsr, so "nowhere" means no self-view rather
-# than a self-view in the recording.
+# (plus PRESET_W/PRESET_H) and returns 1 when there is nowhere to put it. Nothing hides a
+# window from the KMS capture, so "nowhere" means no self-view rather than a self-view in
+# the recording -- unless --exclude=yes, when the compositor hides it from the portal
+# and it is parked inside the capture instead.
 find_park_spot() {
   local ex_w=0 ex_h=0 ex_x=0 ex_y=0
   if [[ $OUTSIDE =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]]; then
@@ -135,7 +218,7 @@ find_park_spot() {
 
   # A gap on the captured monitor first: the user is looking at that screen, and a
   # self-view on a display they are not facing is not a self-view.
-  while IFS=$'\t' read -r _ mx my mw mh; do
+  while IFS=$'\t' read -r mname mx my mw mh; do
     rects_overlap "$ex_x" "$ex_y" "$ex_w" "$ex_h" "$mx" "$my" "$mw" "$mh" || continue
     preset_size "$mh"
 
@@ -143,39 +226,119 @@ find_park_spot() {
     if ((mx + mw - right_edge >= PRESET_W + 2 * MARGIN)); then
       PARK_X=$((mx + mw - PRESET_W - MARGIN))
       PARK_Y=$((my + mh - PRESET_H - MARGIN))
+      PARK_MON=$mname PARK_MX=$mx PARK_MY=$my
       return 0
     fi
     if ((ex_x - mx >= PRESET_W + 2 * MARGIN)); then
       PARK_X=$((mx + MARGIN))
       PARK_Y=$((my + mh - PRESET_H - MARGIN))
+      PARK_MON=$mname PARK_MX=$mx PARK_MY=$my
       return 0
     fi
     if ((my + mh - bottom_edge >= PRESET_H + 2 * MARGIN)); then
       PARK_X=$((mx + mw - PRESET_W - MARGIN))
       PARK_Y=$((my + mh - PRESET_H - MARGIN))
+      PARK_MON=$mname PARK_MX=$mx PARK_MY=$my
       return 0
     fi
     if ((ex_y - my >= PRESET_H + 2 * MARGIN)); then
       PARK_X=$((mx + mw - PRESET_W - MARGIN))
       PARK_Y=$((my + MARGIN))
+      PARK_MON=$mname PARK_MX=$mx PARK_MY=$my
       return 0
     fi
   done < <(monitors_logical)
 
   # Otherwise any monitor the capture does not cover at all.
-  while IFS=$'\t' read -r _ mx my mw mh; do
+  while IFS=$'\t' read -r mname mx my mw mh; do
     rects_overlap "$ex_x" "$ex_y" "$ex_w" "$ex_h" "$mx" "$my" "$mw" "$mh" && continue
     preset_size "$mh"
     PARK_X=$((mx + mw - PRESET_W - MARGIN))
     PARK_Y=$((my + mh - PRESET_H - MARGIN))
+    PARK_MON=$mname PARK_MX=$mx PARK_MY=$my
+    return 0
+  done < <(monitors_logical)
+
+  # Nowhere outside the capture. Excluded, it goes inside: bottom-right of the captured
+  # rectangle, sized for the monitor under that corner. The user can drag it anywhere
+  # afterwards -- the exclusion follows the window, not the spot.
+  [[ $EXCLUDE == "yes" ]] || return 1
+  local cx=$((ex_x + ex_w - 1)) cy=$((ex_y + ex_h - 1))
+  while IFS=$'\t' read -r mname mx my mw mh; do
+    ((cx >= mx && cx < mx + mw && cy >= my && cy < my + mh)) || continue
+    preset_size "$mh"
+    PARK_X=$((ex_x + ex_w - PRESET_W - MARGIN))
+    PARK_Y=$((ex_y + ex_h - PRESET_H - MARGIN))
+    PARK_MON=$mname PARK_MX=$mx PARK_MY=$my
     return 0
   done < <(monitors_logical)
 
   return 1
 }
 
+# Applied on EVERY start, not once per compositor instance. A dynamic rule survives
+# until the next config reload -- and Hyprland reloads its config on plugin loads
+# (hyprpm reload), theme switches and `hyprctl reload`, silently dropping every rule
+# added with hyprctl eval. A once-per-instance stamp outlived the rule, the preview
+# mapped un-ruled (tiled, full screen for a blink), the check below saw no_screen_share
+# missing and closed it mid-take. Re-adding a rule is harmless (the newest one wins); the
+# stamp was not. launch_preview still verifies the rule actually landed on the window.
+# hyprctl eval with hl.* is the only form that works under Omarchy's Lua config.
+apply_self_view_rule() {
+  # no_anim, not animation = "none": the string picks a style, the bool makes Hyprland
+  # skip the close-fade SNAPSHOT entirely. A fadeout snapshot is not masked out of the
+  # screenshare mirror, so without this, closing the bubble mid-take can flash it into
+  # the recording on the way out.
+  #
+  # monitor/move/size are in the rule so the window MAPS at the park spot, at its final
+  # size. Without them a floating window maps dead-centre and the dispatches below then
+  # drag it to the corner in plain view -- a jerk on every take, right after the
+  # countdown. `move` is relative to the window's monitor, which is why the rule also
+  # pins the monitor (a new window otherwise opens on the focused one).
+  hyprctl eval 'hl.window_rule({ match = { title = "^'"$EXCLUDED_SELF_VIEW_TITLE"'$" }, float = true, pin = true, monitor = "'"$PARK_MON"'", move = "'"$((PARK_X - PARK_MX)) $((PARK_Y - PARK_MY))"'", size = "'"$PRESET_W $PRESET_H"'", no_screen_share = true, no_anim = true })' >/dev/null 2>&1
+}
+
+# The self-view is an mpv window, and mpv cannot mask itself into a circle. The
+# compositor can: Hyprland rounds window corners, so a SQUARE window with the radius at
+# half its side is a circle, and no radius at all is `rect`.
+#
+# `rounded` IS APPROXIMATED, and deliberately. It means the Lamé n=4 superellipse
+# everywhere else (layers._squircle_mask, SquircleShape.qml), and Hyprland's
+# `rounding_power` is nominally that exponent -- but at a radius of half the side, power
+# 4 does not curve, it CHAMFERS: photographed, it comes out as a circle with flats cut
+# across it, which is what got reported as "some weird octagon shape". So this uses an
+# ordinary power-2 arc at the radius that best matches the real superellipse instead.
+#
+# 0.27 of the side, from the geometry rather than by eye: the n=4 superellipse crosses
+# the 45-degree diagonal at 0.4204 of the half-side (a circle crosses at 0.3536, a square
+# at 0.5), and a rounded rect matches that at r = 0.272. Close enough that the live
+# bubble and the exported one read as the same shape; the export still draws the true
+# curve.
+#
+# set_prop, not a window rule: hl.window_rule has no rounding field (only the boolean
+# no_rounding), and a dynamic rule cannot be removed for the life of the compositor
+# anyway -- so a rule would freeze the first recording's shape onto every later one.
+shape_self_view() {
+  local window=$1 rounding power
+  case $SHAPE in
+  rect) rounding=0 power=2 ;;
+  circle) rounding=$((PRESET_W / 2)) power=2 ;;
+  *) rounding=$((PRESET_W * ROUNDED_RADIUS_PCT / 100)) power=2 ;;
+  esac
+  hypr_dispatch \
+    "hl.dsp.window.set_prop({ prop = 'rounding', value = $rounding, window = \"$window\" })" \
+    setprop "$window rounding $rounding"
+  hypr_dispatch \
+    "hl.dsp.window.set_prop({ prop = 'rounding_power', value = $power, window = \"$window\" })" \
+    setprop "$window rounding_power $power"
+}
+
 start_preview() {
   find_park_spot || return 1
+  if [[ $EXCLUDE == "yes" ]]; then
+    apply_self_view_rule || return 1
+    SELF_VIEW_TITLE="$EXCLUDED_SELF_VIEW_TITLE"
+  fi
 
   rm -f "$FIFO"
   mkfifo "$FIFO" || return 1
@@ -189,20 +352,34 @@ launch_preview() {
     echo $$ >"$3"
     cat "$1" | mpv --demuxer-lavf-format=mpjpeg \
       --profile=low-latency --untimed --no-cache --cache=no \
-      --title=WebcamOverlay --wayland-app-id="WebcamOverlay-$2" \
+      --title="$4" --wayland-app-id="$4-$2" \
       --script-opts='"$SELF_VIEW_MARKER"' \
+      --keepaspect=yes --panscan=1.0 --video-unscaled=no \
+      --vf=hflip \
       --no-border --no-audio --no-osc --osd-level=0 --really-quiet fd://0
-  ' _ "$FIFO" "$SIZE" "$PREVIEW_PID_FILE" &>/dev/null &
+  ' _ "$FIFO" "$SIZE" "$PREVIEW_PID_FILE" "$SELF_VIEW_TITLE" &>/dev/null 9>&- &   # LOCK_FD_NOTE
 
   local waited=0
-  while ((waited < 60)) && ! hyprctl clients -j | jq -e 'any(.[]; .title == "WebcamOverlay")' >/dev/null 2>&1; do
+  while ((waited < 60)) && ! hyprctl clients -j | jq -e --arg t "$SELF_VIEW_TITLE" 'any(.[]; .title == $t)' >/dev/null 2>&1; do
     sleep 0.05
     ((waited++))
   done
 
   local address
-  address=$(hyprctl clients -j | jq -r 'first(.[] | select(.title == "WebcamOverlay") | .address) // empty')
+  address=$(hyprctl clients -j | jq -r --arg t "$SELF_VIEW_TITLE" 'first(.[] | select(.title == $t) | .address) // empty')
   [[ -n $address ]] || return 1
+
+  # Inside the capture, the window is only acceptable if the compositor really did mark
+  # it: a preview the portal can see is the user's face in the recording. The effective
+  # rule is only reachable through `hyprctl getprop`; `hyprctl clients -j` carries no
+  # noScreenShare field at all, so asking there answers "not marked" for every window
+  # and silently disables the mode even when the rule did land.
+  if [[ $EXCLUDE == "yes" ]] &&
+    [[ $(hyprctl getprop "address:$address" no_screen_share 2>/dev/null) != "true" ]]; then
+    echo "self-view off: Hyprland did not apply no_screen_share to the preview, so it would be recorded" >&2
+    stop_preview
+    return 1
+  fi
 
   local window="address:$address"
   hypr_dispatch \
@@ -211,6 +388,7 @@ launch_preview() {
   hypr_dispatch \
     "hl.dsp.window.move({ window = \"$window\", x = $PARK_X, y = $PARK_Y })" \
     movewindowpixel "exact $PARK_X $PARK_Y,$window"
+  shape_self_view "$window"
 }
 
 start_camera() {
@@ -227,7 +405,9 @@ start_camera() {
     return 1
   }
   resolve_capture_format || {
-    echo "$DEVICE offers no usable MJPEG mode" >&2
+    echo "$DEVICE offers no usable NV12 or MJPEG mode. It reports:" >&2
+    v4l2-ctl --list-formats-ext -d "$DEVICE" 2>/dev/null |
+      grep -E "^[[:space:]]*\[[0-9]+\]|Size: Discrete" | sed 's/^/  /' >&2
     return 1
   }
 
@@ -237,9 +417,35 @@ start_camera() {
       # Only wired up when something will read it: ffmpeg's fifo muxer blocks on opening
       # the FIFO for write until a reader appears, so an unread branch would hang the
       # output thread and stall the graceful shutdown at stop.
+      #
+      # SCALED ON THE GPU AND RE-ENCODED SMALL, not copied. Three measurements got this
+      # to its current shape, all on a 3840x2160 camera:
+      #
+      #   * `-c:v copy` of the camera's native MJPEG (the original) was free for the
+      #     recorder and ruinous for the preview: mpv had to decode 8.3 megapixels 30
+      #     times a second, sat at 136% CPU, and fell 1-3 SECONDS behind -- reported as
+      #     moving in the chair and watching it arrive a beat later.
+      #   * Scaling it down on the CPU instead fixed mpv (12%) and moved the problem into
+      #     this ffmpeg: 142.8% without a preview branch, 195.6% with one. Two cores is
+      #     not a budget, it is a ceiling, and past it the frames simply do not arrive on
+      #     time -- the same lag, one process to the left.
+      #   * The frames are ALREADY on the GPU: the recording branch uploads them for
+      #     h264_vaapi. So the graph splits after that upload and scales the preview copy
+      #     with scale_vaapi, which costs the CPU nothing.
+      #
+      # Hence one filtergraph rather than a -vf per output: the decode, the nv12
+      # conversion and the upload happen ONCE and both branches read the result. Doing it
+      # with two -vf chains would run all of that twice, which is what made the CPU
+      # version so expensive.
+      #
+      # Sized off the SHORT side, because mpv panscans this to fill a square window: at
+      # 2x the window's logical size the square crop is still crisp on a HiDPI display.
+      # queue_size 6, not 30: at 30fps that was a full second of buffered latency in
+      # front of a preview whose only job is to be current, and dropping frames is the
+      # right failure for it -- the recording is a separate branch and unaffected.
       preview_branch=(
-        -map 0:v -c:v copy
-        -f fifo -fifo_format mpjpeg -queue_size 30 -drop_pkts_on_overflow 1
+        -map "[pv]" -c:v mjpeg -q:v 6
+        -f fifo -fifo_format mpjpeg -queue_size 6 -drop_pkts_on_overflow 1
         -attempt_recovery 1 -recover_any_error 1 -max_recovery_attempts 100 -recovery_wait_time 1
         "$FIFO"
       )
@@ -255,44 +461,68 @@ start_camera() {
     fi
   fi
 
+  # ONE graph, so the decode, the nv12 conversion and the upload to the GPU happen once
+  # and every output reads the result. A -vf per output would repeat all three, which is
+  # exactly what made the CPU-scaled preview cost 53% of a core on top of the 143% the 4K
+  # encode already needed.
+  # The conversion is only there for MJPEG: it decodes to yuvj422p, which the encoder
+  # cannot take. An nv12 capture is already in the encoder's own format, so the whole
+  # swscale pass -- the expensive half of the MJPEG path -- simply does not exist.
+  local convert=""
+  [[ $CAM_PIXFMT == "nv12" ]] || convert="format=nv12,"
+  local filtergraph="[0:v]${convert}hwupload[enc_hw]"
+  if ((${#preview_branch[@]})); then
+    filtergraph="[0:v]${convert}hwupload,split=2[enc_hw][pv_hw];"
+    filtergraph+="[pv_hw]scale_vaapi=w=-2:h=$((PRESET_W * 2)),hwdownload,format=nv12[pv]"
+  fi
+
   : >"$LOG_FILE"
+  echo "camera: ${CAM_WIDTH}x${CAM_HEIGHT}@${CAM_FPS} ${CAM_PIXFMT} -> $(camera_bitrate)" >>"$LOG_FILE"
 
-  # `echo $$` before exec so the pid file holds ffmpeg's own pid whether or not setsid
-  # forked, and SIGINT to that pid at stop writes a complete moov atom.
-  setsid bash -c 'echo $$ >"$1"; shift; exec "$@"' _ "$PID_FILE" \
-    ffmpeg -hide_banner -loglevel warning -y \
-    -vaapi_device /dev/dri/renderD128 \
-    -copyts -f v4l2 -ts abs -input_format mjpeg \
-    -video_size "${CAM_WIDTH}x${CAM_HEIGHT}" -framerate "$FPS" -i "$DEVICE" \
-    -map 0:v -vf format=nv12,hwupload -c:v h264_vaapi -b:v 6M "$bundle/media/cam.mp4" \
-    -map 0:v -c:v copy -f mkvtimestamp_v2 "$bundle/media/cam.tsv" \
-    "${preview_branch[@]}" \
-    >>"$LOG_FILE" 2>&1 &
+  # The device is routinely still held when a recording starts: the setup window's own
+  # preview lets go a beat before this runs, and V4L2 hands the device on a beat after
+  # that. ffmpeg does not wait for the handover -- it exits inside ~200ms with "Device
+  # or resource busy" -- so the frame wait below never gets the chance to be patient
+  # about it. Patience has to live here, in relaunching, not in waiting.
+  local deadline=$((SECONDS + 12)) started="no" pid
+  while :; do
+    # `echo $$` before exec so the pid file holds ffmpeg's own pid whether or not setsid
+    # forked, and SIGINT to that pid at stop writes a complete moov atom.
+    # LOCK_FD_NOTE: 9>&- closes the inherited camera lock in the child. Without it this
+    # ffmpeg holds the lock for the whole recording and every stop deadlocks against it.
+    setsid bash -c 'echo $$ >"$1"; shift; exec "$@"' _ "$PID_FILE" \
+      ffmpeg -hide_banner -loglevel warning -y \
+      -vaapi_device /dev/dri/renderD128 \
+      -copyts -f v4l2 -ts abs -input_format "$CAM_PIXFMT" \
+      -video_size "${CAM_WIDTH}x${CAM_HEIGHT}" -framerate "$CAM_FPS" -i "$DEVICE" \
+      -filter_complex "$filtergraph" \
+      -map "[enc_hw]" -c:v h264_vaapi -b:v "$(camera_bitrate)" "$bundle/media/cam.mp4" \
+      -map 0:v -c:v copy -f mkvtimestamp_v2 "$bundle/media/cam.tsv" \
+      "${preview_branch[@]}" \
+      >>"$LOG_FILE" 2>&1 9>&- &
 
-  # Device open to first frame was 661ms in one measured run, so neither the launcher's
-  # wallclock nor a short fixed sleep can stand in for "the camera is running". A growing
-  # cam.mp4 is the signal: cam.tsv looks empty for the first ~77 seconds because the
-  # timestamp muxer writes through a 32KB AVIO buffer that only flushes when it fills or
-  # the file closes, so waiting on it here declared every short recording a failure.
-  # Ten seconds, not the one the 661ms measurement suggests: a USB camera that was in
-  # use moments ago has been seen to take several seconds to hand over, and declaring
-  # failure there kills a recording that was about to work.
-  local waited=0 size=0 previous=0 running="yes"
-  while ((waited < 200)); do
-    size=$(stat -c %s "$bundle/media/cam.mp4" 2>/dev/null || echo 0)
-    # Two rising samples, not merely a non-empty file: the container header is written
-    # before any frame arrives, so only growth proves the device is delivering.
-    ((previous > 0 && size > previous)) && break
-    previous=$size
-    alive "$(cat "$PID_FILE" 2>/dev/null)" || {
-      running="no"
+    await_camera_frames "$bundle" && {
+      started="yes"
       break
     }
-    sleep 0.05
-    ((waited++))
+
+    # Only a device someone else was holding is worth another go. Every other failure
+    # fails the same way twice, and the second one costs the user twelve more seconds
+    # before they are told the same thing.
+    grep -qi "resource busy" "$LOG_FILE" || break
+    ((SECONDS < deadline)) || break
+
+    # Not stop_camera: that also tears down the preview and removes the FIFO the next
+    # attempt's preview branch is about to write to.
+    for pid in $(fanout_pids); do
+      kill -INT "$pid" 2>/dev/null
+    done
+    : >"$LOG_FILE"
+    echo "camera: ${CAM_WIDTH}x${CAM_HEIGHT}@${CAM_FPS} ${CAM_PIXFMT} -> $(camera_bitrate) (device busy, retrying)" >>"$LOG_FILE"
+    sleep 0.4
   done
 
-  if [[ $running == "no" ]] || ((previous == 0 || size <= previous)); then
+  if [[ $started != "yes" ]]; then
     echo "camera did not start: $(tail -1 "$LOG_FILE" 2>/dev/null) (full log: $LOG_FILE)" >&2
     stop_camera
     return 1
@@ -300,6 +530,36 @@ start_camera() {
 
   [[ ${#preview_branch[@]} -gt 0 ]] && launch_preview
   return 0
+}
+
+# A growing cam.mp4 is the only honest signal that the device is delivering. cam.tsv
+# looks empty for the first ~77 seconds because the timestamp muxer writes through a 32KB
+# AVIO buffer that only flushes when it fills or the file closes, so waiting on it here
+# declared every short recording a failure; and the mp4 container header is written
+# before any frame arrives, so a non-empty file is not enough either. Ten seconds, not
+# the 661ms one measured run took to reach its first frame.
+#
+# Liveness is asked of fanout_pids, never of the pid file. That file is written by the
+# setsid child, and this loop can reach its first check before the write lands -- an
+# empty pid made `alive` answer "dead" and killed a camera that was starting perfectly
+# well. It only lost the race under load, which is precisely when a recording starts.
+# Absence only counts once the process has been seen, or after a second of never seeing
+# it, so an ffmpeg that dies on the device handover is still noticed promptly.
+await_camera_frames() {
+  local bundle=$1 waited=0 size=0 previous=0 seen="no"
+  while ((waited < 200)); do
+    size=$(stat -c %s "$bundle/media/cam.mp4" 2>/dev/null || echo 0)
+    ((previous > 0 && size > previous)) && return 0
+    previous=$size
+    if [[ -n $(fanout_pids) ]]; then
+      seen="yes"
+    elif [[ $seen == "yes" ]] || ((waited > 20)); then
+      return 1
+    fi
+    sleep 0.05
+    ((waited++))
+  done
+  return 1
 }
 
 # Every fan-out ffmpeg, whether or not it still has a pid file. Both halves of the match
@@ -359,6 +619,29 @@ command -v ffmpeg >/dev/null || {
   exit 1
 }
 
+# Held for the whole of start or stop, so the second caller waits and then finds
+# nothing left to signal rather than hard-killing a trailer that was being written.
+# `status` is a read and stays unlocked: it must answer while a stop is in flight.
+# flock is util-linux and always present here, but a missing one must not be the thing
+# that stops a recording -- without it the old race is simply back.
+#
+# TWO THINGS HERE ARE LOAD-BEARING, both learned the hard way in one sitting:
+#
+#   * every long-lived child MUST be spawned with 9>&- (see LOCK_FD_NOTE below). An fd
+#     opened by `exec 9>` has no close-on-exec, so the camera ffmpeg inherited the fd
+#     AND the lock on it, and held both for the entire recording. Every later stop then
+#     blocked forever on a lock owned by the process it was trying to stop: the webcam
+#     light stayed on and cam.mp4 grew to 196MB before it was noticed.
+#   * the wait is BOUNDED. If an fd ever leaks again, a stop that degrades to the old
+#     race is a bad day; a stop that hangs forever never releases /dev/video0, which is
+#     strictly worse. Ten seconds is far longer than a real stop (a trailer flush is
+#     well under a second) and far shorter than a person's patience.
+with_camera_lock() {
+  command -v flock >/dev/null || return 0
+  exec 9>"$LOCK_FILE"
+  flock -w 10 9 || echo "camera lock timed out; proceeding unserialized" >&2
+}
+
 ACTION=${1:-}
 shift || true
 
@@ -373,6 +656,8 @@ start)
     --size=*) SIZE="${arg#*=}" ;;
     --self-view=*) SELF_VIEW="${arg#*=}" ;;
     --outside=*) OUTSIDE="${arg#*=}" ;;
+    --shape=*) SHAPE="${arg#*=}" ;;
+    --exclude=*) EXCLUDE="${arg#*=}" ;;
     --fps=*) FPS="${arg#*=}" ;;
     *) usage ;;
     esac
@@ -384,9 +669,11 @@ start)
     exit 1
     ;;
   esac
+  with_camera_lock
   start_camera "$BUNDLE"
   ;;
 stop)
+  with_camera_lock
   stop_camera
   ;;
 status)

@@ -339,12 +339,39 @@ def test_dropping_the_calibration_would_shift_by_its_own_latency(tb):
     assert without == 120
 
 
-def test_dropping_the_scale_would_halve_the_focal_point(tb):
-    """(c). The failure mode is not an error -- it is a zoom on the wrong quadrant."""
+def test_the_click_is_placed_against_the_region_not_the_monitor_scale(tb):
+    """(c). The failure mode is not an error -- it is a zoom on the wrong quadrant.
+
+    monitor_scale must not enter the placement at all. Both the click and the capture
+    rectangle are logical, so their ratio is the answer; the scale only ever said how
+    the video SHOULD have been sized, which is a different question from how it was.
+    """
     c = Click(ANCHOR + 2_000_000, "left", 1000, 650)
-    unscaled = map_clicks([c], make_capture(monitor_scale=1.0), tb)[0]
-    assert (unscaled.px, unscaled.py) == (800.0, 450.0)
-    assert (unscaled.cx, unscaled.cy) == (0.25, 0.25)
+    for scale in (1.0, 2.0, 3.5):
+        m = map_clicks([c], make_capture(monitor_scale=scale), tb)[0]
+        assert (m.cx, m.cy) == (0.5, 0.5)
+        assert (m.px, m.py) == (1600.0, 900.0)
+
+
+def test_a_capture_capped_below_physical_still_lands_the_click(tb):
+    """The bug this guards: a 5120x2880 display is over h264's 4096 limit, so
+    capture.capture_size halves the encode to 2560x1440. Multiplying the click by
+    monitor_scale then placed it at twice its coordinate -- a click 92% of the way
+    across the screen came out at cx 1.85, off the canvas, and auto-zoom framed a
+    point that is not in the video at all."""
+    cap = make_capture(
+        screen=Stream("media/screen.mp4", 2560, 1440, 60, anchor_us=ANCHOR),
+        logical_geometry={"x": 0, "y": 0, "w": 2560, "h": 1440},
+        physical_geometry={"x": 0, "y": 0, "w": 5120, "h": 2880},
+        monitor_scale=2.0,
+    )
+    # A real click from the recording that surfaced this.
+    (m,) = map_clicks([Click(ANCHOR, "left", 2371, 1204)], cap, tb)
+    assert m.cx == pytest.approx(0.9262, abs=1e-4)
+    assert m.cy == pytest.approx(0.8361, abs=1e-4)
+    assert 0.0 <= m.cx <= 1.0 and 0.0 <= m.cy <= 1.0
+    # And in video pixels it is inside the 2560x1440 frame, not the 5120x2880 desktop.
+    assert (m.px, m.py) == pytest.approx((2371.0, 1204.0))
 
 
 def test_region_origin_is_subtracted(tb):
@@ -361,7 +388,9 @@ def test_geometry_written_as_width_height_is_accepted(tb):
 
 
 def test_fullscreen_capture_has_no_origin(tb):
-    cap = make_capture(logical_geometry={})
+    """x and y are absent for a whole-display capture and default to 0. The SIZE is
+    not optional, though -- it is what the click is normalized against."""
+    cap = make_capture(logical_geometry={"w": 1600, "h": 900})
     (m,) = map_clicks([Click(ANCHOR, "left", 1000, 650)], cap, tb)
     assert (m.px, m.py) == (2000.0, 1300.0)
 
@@ -383,9 +412,18 @@ def test_a_missing_screen_is_fatal(tb):
         map_clicks([Click(ANCHOR, "left", 1, 1)], make_capture(screen=None), tb)
 
 
-def test_a_degenerate_scale_is_fatal(tb):
-    with pytest.raises(EventsError, match="monitor_scale"):
-        map_clicks([Click(ANCHOR, "left", 1, 1)], make_capture(monitor_scale=0.0), tb)
+def test_a_capture_region_with_no_size_is_fatal(tb):
+    """The region is what a click is measured against, so a manifest without one has to
+    stop rather than quietly place every zoom at the origin."""
+    with pytest.raises(EventsError, match="logical_geometry"):
+        map_clicks([Click(ANCHOR, "left", 1, 1)], make_capture(logical_geometry={}), tb)
+
+
+def test_a_degenerate_scale_is_no_longer_fatal(tb):
+    """It used to be, because the placement multiplied by it. It does not any more, and
+    a manifest whose scale is wrong or missing still places its clicks correctly."""
+    m = map_clicks([Click(ANCHOR, "left", 1000, 650)], make_capture(monitor_scale=0.0), tb)[0]
+    assert (m.cx, m.cy) == (0.5, 0.5)
 
 
 def test_clicks_to_frames_agrees_with_map_clicks(tb):

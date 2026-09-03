@@ -49,16 +49,25 @@ Rectangle {
             return "\"" + ((l.props && l.props.text) ? l.props.text : "") + "\""
         if (l.type === "blur" || l.type === "pixelate" || (l.props && l.props.redact))
             return "Redact · " + l.id
+        if (l.type === "caption") {
+            // The cue count, not the opening words: a caption track is one layer holding
+            // a whole transcript, and naming it after its first line would read as a text
+            // layer that happens to say that.
+            var n = (l.props && l.props.segments) ? l.props.segments.length : 0
+            return "Captions · " + n + (n === 1 ? " cue" : " cues")
+        }
         return l.id
     }
 
     function glyphFor(l) {
-        // nf-fa: image / font / square_o / eye_slash / th, matching the rail's register.
+        // nf-fa: image / font / square_o / eye_slash / th / comment, matching the
+        // rail's register.
         switch (l.type) {
         case "image": return ""
         case "text": return ""
         case "shape": return ""
         case "pixelate": return ""
+        case "caption": return "\uf27a"   // nf-fa-comment
         default: return ""
         }
     }
@@ -165,7 +174,8 @@ Rectangle {
                     { label: "Image…", act: "image" },
                     { label: "Text", act: "text" },
                     { label: "Shape", act: "shape" },
-                    { label: "Redact", act: "redact" }
+                    { label: "Redact", act: "redact" },
+                    { label: root.captionLabel, act: "captions" }
                 ]
                 delegate: Rectangle {
                     required property var modelData
@@ -196,6 +206,15 @@ Rectangle {
         }
     }
 
+    // Three different sentences, because there are three different situations and the
+    // difference matters before the click rather than after it.
+    readonly property var transcript: st.transcript || ({})
+    readonly property bool canCaption: transcript.available === true
+    readonly property string captionLabel:
+        canCaption ? ("Captions · " + transcript.cues + " cues")
+        : transcript.engine ? "Captions — transcribe first"
+        : "Captions — no engine installed"
+
     function addLayer(kind) {
         var before = idsBefore()
         var cw = canvas.width
@@ -210,6 +229,22 @@ Rectangle {
             Bridge.op("add_shape", { rect: { x: cw * 0.375, y: ch * 0.4,
                                              width: cw * 0.25, height: ch * 0.2 } },
                       function (s, ok) { if (ok) root.selectNew(before, s) })
+        } else if (kind === "captions") {
+            if (!root.canCaption) {
+                // The bridge would answer with the same guidance, but a menu item that
+                // does nothing on click reads as broken -- so the item that cannot work
+                // says why in place instead of failing.
+                root.captionHint = root.transcript.engine
+                    ? "Run `omarchy-studio-transcribe " + (Bridge.bundle || "<recording>")
+                      + " --captions` first. It runs locally; nothing leaves the machine."
+                    : "No local speech-to-text engine. Install one with "
+                      + "`.venv/bin/pip install faster-whisper` or "
+                      + "`sudo pacman -S whisper-cpp`."
+                hintTimer.restart()
+                return
+            }
+            Bridge.op("add_captions", {},
+                      function (s, ok) { if (ok) root.selectNew(before, s) })
         } else if (kind === "redact") {
             // A redaction placed blind covers nothing in particular; hand the user the
             // blur tool so the box is drawn over the thing it is meant to hide.
@@ -221,6 +256,11 @@ Rectangle {
                           function (s, ok) { if (ok) root.selectNew(before, s) })
         }
     }
+
+    // A transient line under the header rather than a dialog: it is guidance, not an
+    // error, and a modal for "run this command" is a modal you dismiss without reading.
+    property string captionHint: ""
+    Timer { id: hintTimer; interval: 9000; onTriggered: root.captionHint = "" }
 
     FileDialog {
         id: imageDialog
@@ -406,7 +446,7 @@ Rectangle {
         }
 
         Text {
-            visible: root.ordered.length === 0
+            visible: root.ordered.length === 0 && root.captionHint === ""
             x: 14
             y: 8
             width: parent.width - 28
@@ -415,6 +455,30 @@ Rectangle {
             font.family: Theme.fontFamily
             font.pixelSize: Theme.fsHint
             wrapMode: Text.WordWrap
+        }
+
+        Rectangle {
+            visible: root.captionHint !== ""
+            x: 8
+            y: 6
+            width: parent.width - 16
+            height: hintText.implicitHeight + 18
+            radius: Theme.radiusRow
+            color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.07)
+            border.width: 1
+            border.color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.28)
+            Text {
+                id: hintText
+                x: 10
+                y: 9
+                width: parent.width - 20
+                text: root.captionHint
+                color: Theme.text3
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsHint
+                lineHeight: 1.4
+                wrapMode: Text.WordWrap
+            }
         }
     }
 

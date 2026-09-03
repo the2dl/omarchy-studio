@@ -2,6 +2,9 @@
 // Backspace/Restore/retime round trips exercise the same delete_cut/add_cut path the
 // app uses -- a mocked bridge would prove nothing about whether the frames come back.
 //
+// qmltest: needs-bridge -- tests/test_qml_suites.py skips this one, because it talks to
+// a REAL bridge server that has to be started by hand first.
+//
 // Run (see scratchpad tl/server.py for the server half):
 //   .venv/bin/python server.py &            # writes {port, token} to tl/bridge.json
 //   qmltestrunner -input editor/timeline/tst_cuts.qml
@@ -175,6 +178,84 @@ Item {
             keyClick(Qt.Key_Escape)
             compare(tl.expandedCutIndex, -1)
             // Leave the bundle's in-memory edit as we found it.
+            E.Bridge.op("delete_cut", { index: 0 })
+            tryVerify(function () { return tl.cuts.length === 0 }, 5000)
+        }
+
+        // -- horizontal zoom (spec §5) ------------------------------------
+
+        function test_07_fit_is_initial_and_floor() {
+            compare(tl.zoomX, 1)          // Fit is the initial state
+            compare(tl.panX, 0)
+            tl.zoomAboutPlayhead(1 / 1.5) // below Fit is meaningless: clamped
+            compare(tl.zoomX, 1)
+            compare(tl.panX, 0)
+            tl.zoomAboutPlayhead(1e9)     // and the far end caps at maxZoomX
+            fuzzyCompare(tl.zoomX, tl.maxZoomX, 1e-9)
+            verify(tl.maxZoomX * tl.trackW >= tl.sourceFrames * 4 - 4)
+            tl.fitZoom()
+            compare(tl.zoomX, 1)
+            compare(tl.panX, 0)
+        }
+
+        function test_08_zoom_holds_playhead_and_seam_stays_16px() {
+            E.Bridge.op("add_cut", { start_ms: 30000, end_ms: 36000 })
+            tryVerify(function () { return tl.cuts.length === 1 }, 5000)
+            previewStub.frame = Math.round(tl.sourceFrames * 0.55)   // past the cut
+            var c = tl.cuts[0]
+            compare(tl.foldX(c.end) - tl.foldX(c.start), tl.seamW)   // seam at Fit
+            var vxBefore = tl.frameToX(tl.frame)
+            var zoomBtn = findChild(tl, "zoomIn")
+            verify(zoomBtn !== null)
+            for (var i = 0; i < 3; ++i)
+                mouseClick(zoomBtn, zoomBtn.width / 2, zoomBtn.height / 2)
+            fuzzyCompare(tl.zoomX, Math.pow(1.5, 3), 1e-6)
+            // Zoom is about the PLAYHEAD: the frame under it must not move.
+            fuzzyCompare(tl.frameToX(tl.frame), vxBefore, 0.51)
+            // ...and the seam is a splice, not a duration: still exactly 16px.
+            fuzzyCompare(tl.foldX(c.end) - tl.foldX(c.start), tl.seamW, 1e-6)
+            // The kept spans DID scale: the whole folded axis is zoomX * trackW.
+            fuzzyCompare(tl.foldX(tl.sourceFrames), tl.contentW, 1e-6)
+            shoot("t_zoomed.png")
+        }
+
+        function test_09_pan_and_fit_button() {
+            verify(tl.zoomX > 1)   // carried over from test_08
+            var pan0 = tl.panX
+            var f = tl.xToFrame(tl.trackW / 2)
+            mouseWheel(tl, tl.trackX + 100, rowY(), 0, -120,
+                       Qt.NoButton, Qt.ShiftModifier)   // shift+scroll pans
+            compare(tl.panX, Math.min(pan0 + 120, tl.contentW - tl.trackW))
+            // The whole axis slid together: the frame that was mid-viewport moved
+            // left by exactly the pan delta.
+            fuzzyCompare(tl.frameToX(f), tl.trackW / 2 - (tl.panX - pan0), 0.51)
+            shoot("t_zoom_panned.png")
+            var fit = findChild(tl, "zoomFit")
+            verify(fit !== null)
+            mouseClick(fit, fit.width / 2, fit.height / 2)
+            compare(tl.zoomX, 1)
+            compare(tl.panX, 0)
+        }
+
+        function test_10_ctrl_wheel_zooms_about_cursor() {
+            compare(tl.zoomX, 1)
+            // Whole px: QtTest delivers wheel events at integer coordinates, and a
+            // fractional vx would make the "under the cursor" frame ambiguous.
+            var vx = Math.round(tl.trackW * 0.3)
+            var f = tl.xToFrame(vx)
+            mouseWheel(tl, tl.trackX + vx, rowY(), 0, 120,
+                       Qt.NoButton, Qt.ControlModifier)
+            fuzzyCompare(tl.zoomX, 1.25, 1e-6)
+            // The pointer is the anchor: the frame under it stays put. xToFrame
+            // rounds to a frame, so allow one frame's width of slack.
+            fuzzyCompare(tl.frameToX(f), vx, tl.contentW / tl.sourceFrames + 0.01)
+            // Interactions still resolve through the zoomed mapping: a click on the
+            // seam still expands the cut.
+            mouseClick(tl, tl.trackX + tl.frameToX(tl.cuts[0].start) + tl.seamW / 2, rowY())
+            compare(tl.expandedCutIndex, 0)
+            keyClick(Qt.Key_Escape)
+            // Leave the edit and the view as we found them.
+            tl.fitZoom()
             E.Bridge.op("delete_cut", { index: 0 })
             tryVerify(function () { return tl.cuts.length === 0 }, 5000)
         }

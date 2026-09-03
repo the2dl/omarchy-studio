@@ -27,6 +27,10 @@
 //              edge handles that retime the cut. Restore brings them back for good.
 // Nothing here says "delete" and nothing is red: the source is never touched, a cut
 // only changes what the export keeps.
+//
+// Horizontal zoom (spec §5, and the transport's `− Fit +` per the mock): the rows
+// scale about the playhead (Ctrl+scroll: about the cursor) while the 74px gutter and
+// its labels stay fixed. Zoom composes with the fold -- see the fold section.
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Window
@@ -98,13 +102,61 @@ Item {
     readonly property real trackX: Style.pad + Style.gutterWidth + 12
     readonly property real trackW: Math.max(1, width - trackX - Style.pad)
 
+    // -- horizontal zoom (spec §5: "Timeline rows scale horizontally with zoom
+    // level; gutter labels stay fixed") -------------------------------------
+    // zoomX 1 == Fit, the whole recording in trackW; that is also the floor, because
+    // a view smaller than the recording shows nothing Fit does not. The cap keeps one
+    // frame ~4px wide -- wider than the 2px playhead, so a single frame is a real
+    // click target -- instead of allowing infinite magnification.
+    property real zoomX: 1
+    // How far the view is slid into the zoomed content, in px. 0..contentW-trackW.
+    property real panX: 0
+    readonly property real contentW: trackW * zoomX
+    readonly property real maxZoomX: Math.max(1, sourceFrames * 4 / trackW)
+    onTrackWChanged: panX = clampPan(panX)
+
+    function clampPan(p) {
+        return Math.max(0, Math.min(p, contentW - trackW))
+    }
+
+    // Zoom keeping the frame `anchor` at viewport x `anchorVx`. Reading foldX after
+    // the zoomX write sees the rebuilt fold, so the pan lands on the new geometry.
+    function setZoomAt(z, anchor, anchorVx) {
+        z = Math.max(1, Math.min(z, maxZoomX))
+        if (z === zoomX) {
+            panX = clampPan(panX)
+            return
+        }
+        zoomX = z
+        panX = clampPan(foldX(anchor) - anchorVx)
+    }
+
+    // The buttons zoom about the PLAYHEAD: the user zooms in to inspect the thing
+    // they are parked on, so that thing must stay put. If the playhead was panned
+    // out of view its virtual x is kept anyway and the pan clamp pulls the view
+    // back into range.
+    function zoomAboutPlayhead(factor) {
+        setZoomAt(zoomX * factor, frame, foldX(frame) - panX)
+    }
+
+    function fitZoom() {
+        zoomX = 1
+        panX = 0
+    }
+
     // -- the fold ----------------------------------------------------------
     // Piecewise x mapping: each collapsed cut occupies exactly 16px (the seam, spec
     // §2c state 2) and the kept time -- plus the expanded cut, whose frames return in
     // place -- shares the rest proportionally. Every row draws through frameToX, so
     // the whole tray folds together instead of each row drawing its own gap.
+    //
+    // Zoom composes with the fold rather than replacing it: the fold is built at the
+    // zoomed CONTENT width, and buildFold hands each seam its fixed 16px off the top
+    // before scaling what remains -- a seam is a splice, not a duration, so it must
+    // not grow with the kept time around it. frameToX then subtracts the pan, so all
+    // rows slide together.
     readonly property int seamW: 16
-    readonly property var fold: buildFold(cuts, expandedCutIndex, trackW, sourceFrames)
+    readonly property var fold: buildFold(cuts, expandedCutIndex, contentW, sourceFrames)
 
     function buildFold(cs, xi, w, total) {
         var pieces = []
@@ -138,7 +190,8 @@ Item {
         return pieces
     }
 
-    function frameToX(f) {
+    // Frame -> x in CONTENT space (the zoomed, folded axis, before the pan).
+    function foldX(f) {
         var p = fold
         if (!p.length)
             return 0
@@ -150,7 +203,13 @@ Item {
         return p[p.length - 1].x1
     }
 
+    // Frame -> x in VIEWPORT space (what the rows draw at). At Fit the two agree.
+    function frameToX(f) {
+        return foldX(f) - panX
+    }
+
     function xToFrame(x) {
+        x += panX   // viewport -> content, then invert the fold
         var p = fold
         if (!p.length)
             return 0
@@ -388,6 +447,29 @@ Item {
             enabled: root.hasSelection
             onClicked: root.clearSelection()
         }
+
+        // Zoom cluster, right of the divider like the mock's `− Fit +` group. Steps
+        // of 1.5x: three presses roughly triple the view, small enough that nothing
+        // the user was watching leaves the screen between presses.
+        Rectangle { width: 1; height: 15; color: Theme.hairline }
+        C.GhostButton {   // U+2212 minus sign, same glyph weight as the + below
+            objectName: "zoomOut"   // reached by editor/timeline/tst_cuts.qml
+            text: "−"
+            enabled: root.zoomX > 1
+            onClicked: root.zoomAboutPlayhead(1 / 1.5)
+        }
+        C.GhostButton {
+            objectName: "zoomFit"   // reached by editor/timeline/tst_cuts.qml
+            text: "Fit"
+            enabled: root.zoomX > 1
+            onClicked: root.fitZoom()
+        }
+        C.GhostButton {
+            objectName: "zoomIn"    // reached by editor/timeline/tst_cuts.qml
+            text: "+"
+            enabled: root.zoomX < root.maxZoomX && root.sourceFrames > 0
+            onClicked: root.zoomAboutPlayhead(1.5)
+        }
     }
 
     // -- ruler -------------------------------------------------------------
@@ -397,14 +479,22 @@ Item {
         y: transport.y + transport.height
         width: root.trackW
         height: 18
+        clip: true   // zoomed, most ticks live off-screen; they must not spill
+
+        // 6 ticks at Fit (the mock's 0:00..2:30); more as the axis stretches, so the
+        // visible stretch keeps roughly the same label density at any zoom.
+        readonly property int tickCount: 1 + 5 * Math.max(1, Math.ceil(root.zoomX))
 
         Repeater {
-            model: 6
+            model: ruler.tickCount
             Text {
                 // Ticks stay at fixed source fractions and are PLACED through the
                 // fold, so a collapsed cut shifts them the way it shifts everything.
-                readonly property int tickFrame: Math.round(index / 5 * root.sourceFrames)
-                x: Math.min(ruler.width - width, root.frameToX(tickFrame))
+                readonly property int tickFrame: Math.round(index / (ruler.tickCount - 1)
+                                                            * root.sourceFrames)
+                // Clamp in CONTENT space so the last label tucks inside the axis end
+                // rather than being pinned to the viewport edge while panning.
+                x: Math.min(root.contentW - width, root.foldX(tickFrame)) - root.panX
                 y: 0
                 text: root.shortTime(tickFrame)
                 color: Theme.text6
@@ -423,11 +513,24 @@ Item {
         y: ruler.y
         width: root.trackW
         height: ruler.height + rows.height
-        acceptedButtons: Qt.LeftButton | Qt.RightButton
+        acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
         property int anchorFrame: 0
         property bool selecting: false
         property bool fromRuler: false
+        // Middle-drag pans the zoomed view; scrub (left) and mark (right) keep their
+        // buttons, so panning never fights the edit gestures.
+        property bool panning: false
+        property real panGrabX: 0
+        property real panGrabPan: 0
+        cursorShape: panning ? Qt.ClosedHandCursor : Qt.ArrowCursor
         onPressed: function (m) {
+            if (m.button === Qt.MiddleButton) {
+                panning = true
+                panGrabX = m.x
+                panGrabPan = root.panX
+                return
+            }
+            panning = false
             anchorFrame = root.xToFrame(m.x)
             fromRuler = m.y < ruler.height
             selecting = m.button === Qt.RightButton
@@ -442,6 +545,10 @@ Item {
         onPositionChanged: function (m) {
             if (!pressed)
                 return
+            if (panning) {
+                root.panX = root.clampPan(panGrabPan - (m.x - panGrabX))
+                return
+            }
             var f = root.xToFrame(m.x)
             if (!selecting && fromRuler && Math.abs(f - anchorFrame) >= 1) {
                 selecting = true
@@ -450,11 +557,16 @@ Item {
             if (selecting) {
                 root.selStart = Math.min(anchorFrame, f)
                 root.selEnd = Math.max(anchorFrame, f)
-            } else if (root.preview) {
+            }
+            if (!selecting && root.preview) {
                 root.preview.seekFrame(f)
             }
         }
         onReleased: function (m) {
+            if (panning) {
+                panning = false
+                return
+            }
             // An unmoved press on the ruler is still a seek.
             if (fromRuler && !selecting && root.preview)
                 root.preview.seekFrame(anchorFrame)
@@ -476,24 +588,32 @@ Item {
             spacing: 12
             C.Caption { width: Style.gutterWidth; text: "screen"; anchors.verticalCenter: parent.verticalCenter; font.pixelSize: Theme.fsHint }
             Rectangle {
+                id: screenLane
                 width: root.trackW
                 height: Style.screenRowH
                 radius: Theme.radiusChip
                 color: Theme.fillSubtle
                 clip: true
-                Row {
-                    x: 3; y: 3
-                    spacing: 2
-                    Repeater {
-                        model: Math.max(1, Math.floor((root.trackW - 6) / 46))
-                        Rectangle {
-                            width: (root.trackW - 6 - 2 * (Math.max(1, Math.floor((root.trackW - 6) / 46)) - 1))
-                                   / Math.max(1, Math.floor((root.trackW - 6) / 46))
-                            height: Style.screenRowH - 6
-                            radius: 4
-                            color: Theme.canvasA
-                            opacity: 0.5
-                        }
+
+                // Cells are laid out across the zoomed CONTENT width (rows scale
+                // with zoom, spec §5) but only the viewport's worth is instantiated:
+                // at the 4px/frame cap the content runs to tens of thousands of px,
+                // and a Rectangle per off-screen cell would be thousands of items.
+                readonly property int cellCount: Math.max(1, Math.floor((root.contentW - 6) / 46))
+                readonly property real cellW: (root.contentW - 6 - 2 * (cellCount - 1)) / cellCount
+                readonly property real pitch: cellW + 2
+                readonly property int firstCell: Math.max(0, Math.floor((root.panX - 3) / pitch))
+                Repeater {
+                    model: Math.max(0, Math.min(screenLane.cellCount - screenLane.firstCell,
+                                                Math.ceil(root.trackW / screenLane.pitch) + 1))
+                    Rectangle {
+                        x: 3 + (screenLane.firstCell + index) * screenLane.pitch - root.panX
+                        y: 3
+                        width: screenLane.cellW
+                        height: Style.screenRowH - 6
+                        radius: 4
+                        color: Theme.canvasA
+                        opacity: 0.5
                     }
                 }
             }
@@ -517,6 +637,7 @@ Item {
                         height: 18
                         radius: Theme.radiusChip - 1
                         color: Theme.fillSubtle
+                        clip: true   // zoomed, a bar can run past the viewport
                         readonly property bool sel: root.preview && root.preview.selectedId === modelData.id
                         readonly property bool whole: !modelData.t
                         readonly property int f0: modelData.t ? modelData.t.start : 0
@@ -560,6 +681,7 @@ Item {
                 radius: Theme.radiusChip
                 color: Theme.fillSubtle
                 opacity: 1
+                clip: true   // zoomed, blocks can run past the viewport
 
                 Repeater {
                     model: root.segments
@@ -595,6 +717,7 @@ Item {
                 height: Style.clicksRowH
                 radius: Theme.radiusChip
                 color: Theme.fillSubtle
+                clip: true   // zoomed, dots can pan out of view (and must not catch clicks there)
 
                 Repeater {
                     model: root.st.clicks || []
@@ -624,24 +747,28 @@ Item {
             spacing: 12
             C.Caption { width: Style.gutterWidth; text: "audio"; anchors.verticalCenter: parent.verticalCenter; font.pixelSize: Theme.fsHint }
             Rectangle {
+                id: audioLane
                 width: root.trackW
                 height: Style.audioRowH
                 radius: Theme.radiusChip
                 color: Theme.fillSubtle
-                Row {
-                    x: 5
-                    height: parent.height
-                    spacing: 2
-                    Repeater {
-                        model: Math.max(1, Math.floor((root.trackW - 10) / 6))
-                        Rectangle {
-                            width: 4
-                            height: 9
-                            radius: 1
-                            anchors.verticalCenter: parent.verticalCenter
-                            color: Theme.text6
-                            opacity: 0.55
-                        }
+                clip: true
+
+                // Same windowed layout as the screen cells: bars pitch across the
+                // zoomed content on the 6px grid, only the visible ones exist.
+                readonly property int barCount: Math.max(1, Math.floor((root.contentW - 10) / 6))
+                readonly property int firstBar: Math.max(0, Math.floor((root.panX - 5) / 6))
+                Repeater {
+                    model: Math.max(0, Math.min(audioLane.barCount - audioLane.firstBar,
+                                                Math.ceil(root.trackW / 6) + 2))
+                    Rectangle {
+                        x: 5 + (audioLane.firstBar + index) * 6 - root.panX
+                        width: 4
+                        height: 9
+                        radius: 1
+                        anchors.verticalCenter: parent.verticalCenter
+                        color: Theme.text6
+                        opacity: 0.55
                     }
                 }
             }
@@ -739,211 +866,255 @@ Item {
     // -- overlays across the track area ------------------------------------
     // Cut objects and the pending selection. Drawn over the rows because a cut is one
     // object across the whole tray, never a per-row gap (spec §2c).
+    // The outer Item is the overlay VIEWPORT: it clips the cut objects, the selection
+    // and the playhead to the track columns, because panned content sliding over the
+    // 74px gutter would break "gutter labels stay fixed" (spec §5). 2px of headroom
+    // above the ruler keeps the duration chips' top edge, which draws 1px proud of
+    // the ruler band.
     Item {
-        id: overlays
         x: root.trackX
-        y: rows.y
+        y: ruler.y - 2
         width: root.trackW
-        height: rows.height
+        height: 2 + ruler.height + rows.height
+        clip: true
 
-        Repeater {
-            model: root.cuts
-            Item {
-                readonly property bool expanded: index === root.expandedCutIndex
-                // While a handle drags, the ghost tracks the pending range.
-                readonly property int c0: expanded && root.dragStart >= 0 ? root.dragStart : modelData.start
-                readonly property int c1: expanded && root.dragEnd >= 0 ? root.dragEnd : modelData.end
-                readonly property real gx0: root.frameToX(c0)
-                readonly property real gx1: root.frameToX(c1)
+        Item {
+            id: overlays
+            x: 0
+            y: 2 + ruler.height
+            width: root.trackW
+            height: rows.height
 
-                // --- collapsed: the 16px seam, one object through every row -------
-                Rectangle {
-                    id: seam
-                    visible: !expanded
-                    x: gx0
-                    y: 0
-                    width: root.seamW
-                    height: overlays.height
-                    radius: 4
-                    color: Theme.bgDeep
-                    border.width: 1
-                    border.color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.5)
+            Repeater {
+                model: root.cuts
+                Item {
+                    readonly property bool expanded: index === root.expandedCutIndex
+                    // While a handle drags, the ghost tracks the pending range.
+                    readonly property int c0: expanded && root.dragStart >= 0 ? root.dragStart : modelData.start
+                    readonly property int c1: expanded && root.dragEnd >= 0 ? root.dragEnd : modelData.end
+                    readonly property real gx0: root.frameToX(c0)
+                    readonly property real gx1: root.frameToX(c1)
 
-                    // The dashed accent stripe down the middle (mock: 3px dash, 4px gap).
-                    Column {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        y: 5
-                        spacing: 4
-                        Repeater {
-                            model: Math.max(1, Math.floor((seam.height - 10 + 4) / 7))
-                            Rectangle { width: 2; height: 3; color: Theme.accent }
-                        }
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        acceptedButtons: Qt.LeftButton | Qt.RightButton
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: function (m) {
-                            if (m.button === Qt.RightButton)
-                                root.restoreCut(index)   // pre-seam behaviour, kept
-                            else
-                                root.expandedCutStart = modelData.start
-                        }
-                    }
-                }
-                // The duration chip over the ruler: unfold hint + removed time.
-                Rectangle {
-                    visible: !expanded
-                    x: gx0 + root.seamW / 2 - width / 2
-                    y: -ruler.height - 1
-                    width: chipRow.width + 12
-                    height: 17
-                    radius: 5
-                    color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.14)
-                    Row {
-                        id: chipRow
-                        anchors.centerIn: parent
-                        spacing: 5
-                        Text {   // nf-fa-arrows_v, standing in for the mock's `unfold_more`
-                            text: "\uf07d"
-                            color: Theme.accent
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fsHint
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                        Text {
-                            text: root.cutSecs(modelData.end - modelData.start)
-                            color: Theme.accent
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fsHint
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.expandedCutStart = modelData.start
-                    }
-                }
-
-                // --- expanded: the frames back in place, ghosted ------------------
-                Rectangle {
-                    visible: expanded
-                    x: gx0
-                    y: 0
-                    width: Math.max(2, gx1 - gx0)
-                    height: overlays.height
-                    color: Qt.rgba(Theme.bgDeep.r, Theme.bgDeep.g, Theme.bgDeep.b, 0.66)
-
-                    // 45° accent hatch at 10% (mock: 5px stripe, 5px gap) -- the same
-                    // "editing object, not content" mark the redact layer uses.
-                    Canvas {
-                        id: hatch
-                        anchors.fill: parent
-                        onPaint: {
-                            var ctx = getContext("2d")
-                            ctx.clearRect(0, 0, width, height)
-                            ctx.strokeStyle = Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.10)
-                            ctx.lineWidth = 5
-                            // 45°: step 10px * sqrt(2) along x keeps 5px on / 5px off.
-                            for (var sx = -height; sx < width + height; sx += 14.14) {
-                                ctx.beginPath()
-                                ctx.moveTo(sx, height)
-                                ctx.lineTo(sx + height, 0)
-                                ctx.stroke()
-                            }
-                        }
-                        onWidthChanged: requestPaint()
-                        onHeightChanged: requestPaint()
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        acceptedButtons: Qt.RightButton
-                        onClicked: root.restoreCut(index)   // pre-seam behaviour, kept
-                    }
-                }
-                // 3px accent edge handles; dragging either edge retimes the cut.
-                Repeater {
-                    model: expanded ? 2 : 0
-                    Item {
-                        readonly property bool leftEdge: index === 0
-                        x: (leftEdge ? gx0 : gx1) - 6
+                    // --- collapsed: the 16px seam, one object through every row -------
+                    Rectangle {
+                        id: seam
+                        visible: !expanded
+                        x: gx0
                         y: 0
-                        width: 12
+                        width: root.seamW
                         height: overlays.height
-                        Rectangle {
-                            x: 4.5
-                            width: 3
-                            height: parent.height
-                            radius: 2
-                            color: Theme.accent
+                        radius: 4
+                        color: Theme.bgDeep
+                        border.width: 1
+                        border.color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.5)
+
+                        // The dashed accent stripe down the middle (mock: 3px dash, 4px gap).
+                        Column {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            y: 5
+                            spacing: 4
+                            Repeater {
+                                model: Math.max(1, Math.floor((seam.height - 10 + 4) / 7))
+                                Rectangle { width: 2; height: 3; color: Theme.accent }
+                            }
                         }
                         MouseArea {
                             anchors.fill: parent
-                            cursorShape: Qt.SizeHorCursor
-                            onPressed: {
-                                root.dragStart = c0
-                                root.dragEnd = c1
-                            }
-                            onPositionChanged: function (m) {
-                                if (!pressed)
-                                    return
-                                var f = root.xToFrame(mapToItem(overlays, m.x, 0).x)
-                                if (leftEdge)
-                                    root.dragStart = Math.max(0, Math.min(f, root.dragEnd - 1))
+                            acceptedButtons: Qt.LeftButton | Qt.RightButton
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: function (m) {
+                                if (m.button === Qt.RightButton)
+                                    root.restoreCut(index)   // pre-seam behaviour, kept
                                 else
-                                    root.dragEnd = Math.min(root.sourceFrames, Math.max(f, root.dragStart + 1))
+                                    root.expandedCutStart = modelData.start
                             }
-                            onReleased: root.commitRetime(root.expandedCutIndex, root.dragStart, root.dragEnd)
+                        }
+                    }
+                    // The duration chip over the ruler: unfold hint + removed time.
+                    Rectangle {
+                        visible: !expanded
+                        x: gx0 + root.seamW / 2 - width / 2
+                        y: -ruler.height - 1
+                        width: chipRow.width + 12
+                        height: 17
+                        radius: 5
+                        color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.14)
+                        Row {
+                            id: chipRow
+                            anchors.centerIn: parent
+                            spacing: 5
+                            Text {   // nf-fa-arrows_v, standing in for the mock's `unfold_more`
+                                text: "\uf07d"
+                                color: Theme.accent
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fsHint
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                            Text {
+                                text: root.cutSecs(modelData.end - modelData.start)
+                                color: Theme.accent
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fsHint
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.expandedCutStart = modelData.start
+                        }
+                    }
+
+                    // --- expanded: the frames back in place, ghosted ------------------
+                    Rectangle {
+                        visible: expanded
+                        x: gx0
+                        y: 0
+                        width: Math.max(2, gx1 - gx0)
+                        height: overlays.height
+                        color: Qt.rgba(Theme.bgDeep.r, Theme.bgDeep.g, Theme.bgDeep.b, 0.66)
+
+                        // 45° accent hatch at 10% (mock: 5px stripe, 5px gap) -- the same
+                        // "editing object, not content" mark the redact layer uses.
+                        Canvas {
+                            id: hatch
+                            anchors.fill: parent
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.clearRect(0, 0, width, height)
+                                ctx.strokeStyle = Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.10)
+                                ctx.lineWidth = 5
+                                // 45°: step 10px * sqrt(2) along x keeps 5px on / 5px off.
+                                for (var sx = -height; sx < width + height; sx += 14.14) {
+                                    ctx.beginPath()
+                                    ctx.moveTo(sx, height)
+                                    ctx.lineTo(sx + height, 0)
+                                    ctx.stroke()
+                                }
+                            }
+                            onWidthChanged: requestPaint()
+                            onHeightChanged: requestPaint()
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            acceptedButtons: Qt.RightButton
+                            onClicked: root.restoreCut(index)   // pre-seam behaviour, kept
+                        }
+                    }
+                    // 3px accent edge handles; dragging either edge retimes the cut.
+                    Repeater {
+                        model: expanded ? 2 : 0
+                        Item {
+                            readonly property bool leftEdge: index === 0
+                            x: (leftEdge ? gx0 : gx1) - 6
+                            y: 0
+                            width: 12
+                            height: overlays.height
+                            Rectangle {
+                                x: 4.5
+                                width: 3
+                                height: parent.height
+                                radius: 2
+                                color: Theme.accent
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.SizeHorCursor
+                                onPressed: {
+                                    root.dragStart = c0
+                                    root.dragEnd = c1
+                                }
+                                onPositionChanged: function (m) {
+                                    if (!pressed)
+                                        return
+                                    var f = root.xToFrame(mapToItem(overlays, m.x, 0).x)
+                                    if (leftEdge)
+                                        root.dragStart = Math.max(0, Math.min(f, root.dragEnd - 1))
+                                    else
+                                        root.dragEnd = Math.min(root.sourceFrames, Math.max(f, root.dragStart + 1))
+                                }
+                                onReleased: root.commitRetime(root.expandedCutIndex, root.dragStart, root.dragEnd)
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Pending selection (spec §2c state 1): the frames it will remove dim under a
-        // bgDeep scrim with 1.5px accent edges -- a preview of the fold, not a wash.
-        Rectangle {
-            visible: root.hasSelection
-            x: root.frameToX(root.selStart)
-            y: 0
-            width: Math.max(3, root.frameToX(root.selEnd) - root.frameToX(root.selStart))
-            height: overlays.height
-            color: Qt.rgba(Theme.bgDeep.r, Theme.bgDeep.g, Theme.bgDeep.b, 0.72)
-            Rectangle { x: 0; width: 1.5; height: parent.height; color: Theme.accent }
-            Rectangle { x: parent.width - 1.5; width: 1.5; height: parent.height; color: Theme.accent }
-        }
-        // The accent cap on the ruler carrying the selection's duration.
-        Rectangle {
-            visible: root.hasSelection
-            x: root.frameToX(root.selStart)
-            y: -ruler.height - 2
-            width: Math.max(3, root.frameToX(root.selEnd) - root.frameToX(root.selStart))
-            height: 16
-            topLeftRadius: 4
-            topRightRadius: 4
-            bottomLeftRadius: 0
-            bottomRightRadius: 0
-            color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.2)
-            // Not clipped: a narrow selection must still show its duration ("shows the
-            // resulting duration", spec §2c), so the label may spill past the cap.
-            Text {
-                anchors.centerIn: parent
-                text: root.cutSecs(root.selEnd - root.selStart)
+            // Pending selection (spec §2c state 1): the frames it will remove dim under a
+            // bgDeep scrim with 1.5px accent edges -- a preview of the fold, not a wash.
+            Rectangle {
+                visible: root.hasSelection
+                x: root.frameToX(root.selStart)
+                y: 0
+                width: Math.max(3, root.frameToX(root.selEnd) - root.frameToX(root.selStart))
+                height: overlays.height
+                color: Qt.rgba(Theme.bgDeep.r, Theme.bgDeep.g, Theme.bgDeep.b, 0.72)
+                Rectangle { x: 0; width: 1.5; height: parent.height; color: Theme.accent }
+                Rectangle { x: parent.width - 1.5; width: 1.5; height: parent.height; color: Theme.accent }
+            }
+            // The accent cap on the ruler carrying the selection's duration.
+            Rectangle {
+                visible: root.hasSelection
+                x: root.frameToX(root.selStart)
+                y: -ruler.height - 2
+                width: Math.max(3, root.frameToX(root.selEnd) - root.frameToX(root.selStart))
+                height: 16
+                topLeftRadius: 4
+                topRightRadius: 4
+                bottomLeftRadius: 0
+                bottomRightRadius: 0
+                color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.2)
+                // Not clipped: a narrow selection must still show its duration ("shows the
+                // resulting duration", spec §2c), so the label may spill past the cap.
+                Text {
+                    anchors.centerIn: parent
+                    text: root.cutSecs(root.selEnd - root.selStart)
+                    color: Theme.accent
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsHint
+                }
+            }
+
+            // Playhead: through the ruler and every row, so the eye can drop from the time
+            // labels straight down to the audio lane.
+            Rectangle {
+                x: root.frameToX(root.frame) - 1
+                y: -ruler.height
+                width: 2
+                height: overlays.height + ruler.height
                 color: Theme.accent
-                font.family: Theme.fontFamily
-                font.pixelSize: Theme.fsHint
             }
         }
+    }
 
-        // Playhead: through the ruler and every row, so the eye can drop from the time
-        // labels straight down to the audio lane.
-        Rectangle {
-            x: root.frameToX(root.frame) - 1
-            y: -ruler.height
-            width: 2
-            height: overlays.height + ruler.height
-            color: Theme.accent
+    // -- wheel over the tray -----------------------------------------------
+    // A WheelHandler on a top-most Item takes only wheel events: the rows' own
+    // MouseAreas (seam clicks, dots, layer bars) keep their clicks, hovers and
+    // cursor shapes. Ctrl+scroll zooms about the CURSOR -- the pointer is what the
+    // user is aiming at -- where the buttons zoom about the playhead; Shift+scroll
+    // and a sideways wheel pan the zoomed view.
+    Item {
+        x: root.trackX
+        y: ruler.y
+        width: root.trackW
+        height: ruler.height + rows.height
+
+        WheelHandler {
+            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+            onWheel: function (ev) {
+                if (ev.modifiers & Qt.ControlModifier) {
+                    // 120 units = one notch = x1.25, matching the buttons' feel.
+                    var factor = Math.pow(1.25, ev.angleDelta.y / 120)
+                    root.setZoomAt(root.zoomX * factor, root.xToFrame(ev.x), ev.x)
+                } else if (ev.modifiers & Qt.ShiftModifier) {
+                    // Shift+scroll pans; most mice keep the delta on y under shift.
+                    root.panX = root.clampPan(root.panX
+                                              - (ev.angleDelta.x || ev.angleDelta.y))
+                } else if (ev.angleDelta.x !== 0) {
+                    // A real horizontal wheel / two-finger sideways scroll.
+                    root.panX = root.clampPan(root.panX - ev.angleDelta.x)
+                }
+            }
         }
     }
 }

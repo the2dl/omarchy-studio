@@ -255,6 +255,37 @@ def test_the_backdrop_actually_paints_and_insets_the_video(bundle, tmp_path):
 
 
 @needs_ffmpeg
+def test_a_gradient_backdrop_paints_its_own_stops_and_paints_them_twice(bundle, tmp_path):
+    """Two things only rendered pixels can prove about `gradients`.
+
+    That the CSS line is right: the first and last stop land exactly ON the two extreme
+    corners, which is the whole point of sizing the line by |W sin| + |H cos| instead of
+    aiming it at two corners.
+
+    And that it is the SAME gradient every time. Any endpoint outside [0, size-1] is
+    silently replaced with a random one, so the shipped `x1=W:y1=H` drew a different
+    backdrop on every export -- six runs, six frames -- with nothing in the log.
+    """
+    bundle.edit.backdrop.enabled = True
+    bundle.edit.backdrop.background = "fog"  # 170 deg, #dcd8d1 -> #b4b0a9
+    bundle.edit.backdrop.shadow = False  # so the corners are the ground and nothing else
+    bundle.edit.webcam.enabled = False
+
+    def corners(path):
+        raw = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1",
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            capture_output=True, check=True,
+        ).stdout
+        return tuple(raw[0:3]), tuple(raw[(H * W - 1) * 3:][:3])
+
+    first = corners(render.render(bundle, tmp_path / "grad.mp4"))
+    assert all(abs(a - b) <= 8 for a, b in zip(first[0], (0xDC, 0xD8, 0xD1))), first[0]
+    assert all(abs(a - b) <= 8 for a, b in zip(first[1], (0xB4, 0xB0, 0xA9))), first[1]
+    assert corners(render.render(bundle, tmp_path / "grad2.mp4")) == first
+
+
+@needs_ffmpeg
 def test_progress_is_reported_and_finishes_at_the_total(bundle, tmp_path):
     seen: list[tuple[int, int]] = []
     render.render(bundle, tmp_path / "p.mp4", progress=lambda d, t: seen.append((d, t)))

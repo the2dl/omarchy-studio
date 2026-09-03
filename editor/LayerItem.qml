@@ -23,6 +23,10 @@ Item {
     // stream.
     property Item contentSource: null
     property bool interactive: true
+    // Preview mode: the export's frame only. The ring, handles, type chip and the
+    // redaction marker hide; the layer's PIXELS -- the blur included -- never change,
+    // because the components above already render export strength in every mode.
+    property bool previewMode: false
 
     signal clicked()
     signal moved(var rect)      // canvas pixels, on release
@@ -36,16 +40,36 @@ Item {
     // Never assigned to directly: a JS assignment to x would destroy the binding and
     // the item would stop tracking the model for the rest of the session. A live drag
     // switches the binding to the local values instead.
+    // Held from the drop until the model actually comes back. Releasing the local
+    // override the moment the mouse came up rendered a frame at the OLD rect -- the new
+    // one is an intent in flight, not applied yet -- so the object visibly snapped back
+    // to where it started and then jumped forward. Reported as a "double bounce", and it
+    // is one: two position changes for one gesture.
+    property bool committing: false
+    readonly property bool showingLive: dragging || committing
+
+    // Called by whoever posted the intent, when the reply lands. The timer is only a
+    // backstop: an op that errors never calls back, and the override must not stick.
+    function commitDone() {
+        committing = false
+        commitTimeout.stop()
+    }
+    Timer {
+        id: commitTimeout
+        interval: 1200
+        onTriggered: root.committing = false
+    }
+
     property bool dragging: false
     property real liveX: 0
     property real liveY: 0
     property real liveW: 0
     property real liveH: 0
 
-    x: dragging ? liveX : rect.x
-    y: dragging ? liveY : rect.y
-    width: dragging ? liveW : rect.width
-    height: dragging ? liveH : rect.height
+    x: showingLive ? liveX : rect.x
+    y: showingLive ? liveY : rect.y
+    width: showingLive ? liveW : rect.width
+    height: showingLive ? liveH : rect.height
     visible: spec.enabled !== false && inRange
     opacity: spec.opacity === undefined ? 1 : spec.opacity
 
@@ -210,15 +234,15 @@ Item {
     // lightens or removes the obscuring -- a preview that ever shows the un-blurred
     // content is a data leak, whatever it looks like.
     //
-    // Suppressed under --selftest: the parity harness grabs the stage and compares it
-    // against the export frame at a half-peak threshold, and the accent label measures
-    // 165/255 grey -- bright enough to register as geometry (it widened the measured
-    // blur silhouette by 257px). The marker is interactive chrome, like the selection
-    // ring; hiding it in headless grabs changes nothing about what the redaction
-    // renders, which is the thing the harness exists to measure.
+    // Suppressed in preview mode, like every other piece of chrome: the parity harness
+    // grabs the stage in preview mode and compares it against the export frame at a
+    // half-peak threshold, and the accent label measures 165/255 grey -- bright enough
+    // to register as geometry (it widened the measured blur silhouette by 257px).
+    // Hiding the marker changes nothing about what the redaction renders, which is the
+    // thing both the harness and a user pressing P are checking.
     readonly property bool isRedaction: spec.type === "blur" || spec.type === "pixelate"
         || (spec.type === "shape" && spec.props && spec.props.redact === true)
-    readonly property bool decorate: isRedaction && Bridge.selftestMs === 0
+    readonly property bool decorate: isRedaction && !previewMode
 
     Canvas {
         id: hatch
@@ -261,7 +285,7 @@ Item {
     Rectangle {
         x: 0; y: 0
         width: root.width; height: root.height
-        visible: root.selected
+        visible: root.selected && !root.previewMode
         color: "transparent"
         border.color: Theme.accent
         border.width: Math.max(1, root.px(1.5))
@@ -271,7 +295,9 @@ Item {
         id: dragArea
         x: 0; y: 0
         width: root.width; height: root.height
-        enabled: root.interactive
+        // previewMode spelled out even though Preview.qml already folds it into
+        // `interactive`: a standalone LayerItem must go inert on its own.
+        enabled: root.interactive && !root.previewMode
         cursorShape: Qt.OpenHandCursor
         property real ox: 0
         property real oy: 0
@@ -298,7 +324,7 @@ Item {
     // this item lives on a scaled stage: a 9px handle authored in canvas pixels would
     // render at 4px on a half-scale stage and be untouchable.
     Repeater {
-        model: root.selected && root.interactive ? 4 : 0
+        model: root.selected && root.interactive && !root.previewMode ? 4 : 0
         delegate: Item {
             required property int index
             // `left`/`top` are FINAL Item anchor properties; shadowing them fails the whole type.
@@ -353,7 +379,7 @@ Item {
     // strength is readable at the box itself). Mock 2a: 4px/8px padding, radius 6,
     // bgFloat plate, accent 10px uppercase at 0.06em.
     Rectangle {
-        visible: root.selected
+        visible: root.selected && !root.previewMode
         x: 0
         // Above the top-left corner, unless the layer touches the canvas top -- the
         // viewport clips, and a chip pushed off the edge is a label nobody can read.
@@ -417,6 +443,8 @@ Item {
         if (!dragging)
             return
         dragging = false
+        committing = true
+        commitTimeout.restart()
         moved({ x: liveX, y: liveY, width: liveW, height: liveH })
     }
 }

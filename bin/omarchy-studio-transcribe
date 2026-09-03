@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Transcribe a recording's audio locally and write transcript.json into the bundle.
+
+Nothing leaves the machine. The first faster-whisper run downloads its model (small is
+~460MB) and that is the only network access this ever makes; whisper.cpp makes none.
+
+Progress goes to stderr and the summary to stdout, so `omarchy-studio-transcribe REC |
+jq` works while the ticker still shows on the terminal.
+
+usage: omarchy-studio-transcribe BUNDLE [--model small] [--language xx]
+                                 [--engine auto|faster-whisper|whisper-cpp] [--force]
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib"))
+
+# The engine lives in the repo's venv, not in the system interpreter, and this script is
+# run by its shebang. Re-exec into the venv when one is there, before anything tries to
+# import faster_whisper -- otherwise a checkout with the engine installed still reports
+# "no local speech-to-text engine found" and sends the user to install it again.
+# OMARCHY_STUDIO_PYTHON overrides, matching the STUDIO_PYTHON convention in bin/.
+from omarchy_studio.interpreter import reexec_into_venv  # noqa: E402
+
+reexec_into_venv(__file__, REPO)
+
+from omarchy_studio import transcribe  # noqa: E402
+from omarchy_studio.project import Bundle, ProjectError  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="omarchy-studio-transcribe", description=__doc__)
+    ap.add_argument("bundle", help="a recording directory containing capture.json")
+    # small is the default because it is the smallest model that gets technical words
+    # and proper nouns right often enough to be worth captioning with; base mangles them
+    # and medium costs several times the wall clock for a marginal gain.
+    ap.add_argument("--model", default="small",
+                    help="whisper model name, or a path to a ggml-*.bin for whisper.cpp "
+                         "(default: small)")
+    ap.add_argument("--language", default=None, metavar="XX",
+                    help="ISO language code; omit to let the engine detect it")
+    ap.add_argument("--engine", default="auto",
+                    choices=["auto", transcribe.FASTER_WHISPER, transcribe.WHISPER_CPP],
+                    help="force an engine instead of taking the best available")
+    ap.add_argument("--force", action="store_true",
+                    help="re-transcribe even if transcript.json already exists")
+    ap.add_argument("--captions", action="store_true",
+                    help="also add (or replace) the caption layer in edit.json, so the "
+                         "recording opens in the editor with its captions already on")
+    a = ap.parse_args(argv)
+
+    try:
+        bundle = Bundle(Path(a.bundle))
+    except ProjectError as e:
+        print(e, file=sys.stderr)
+        return 2
+
+    # Checked before any work so that a machine with no engine says so immediately,
+    # rather than after ffmpeg has spent a minute decoding audio for nobody.
+    try:
+        transcribe.require_engine(a.engine)
+    except transcribe.TranscribeError as e:
+        print(e, file=sys.stderr)
+        return 2
+
+    existing = transcribe.load(bundle)
+    if existing is not None and not a.force:
+        print(f"{transcribe.transcript_path(bundle)} already exists "
+              f"({len(existing.segments)} segments, engine {existing.engine}, "
+              f"model {existing.model}); pass --force to redo it", file=sys.stderr)
+        _summary(existing, bundle)
+        if a.captions:
+            _add_caption_layer(bundle, existing)
+        return 0
+
+    try:
+        t = transcribe.transcribe_bundle(
+            bundle,
+            model=a.model,
+            language=a.language,
+            engine=a.engine,
+            force=a.force,
+            progress=lambda msg: print(msg, file=sys.stderr, flush=True),
+        )
+    except transcribe.TranscribeError as e:
+        print(e, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        # The temp wav is cleaned up by the context manager on the way out; say so, or
+        # an interrupted long run looks like it left something behind.
+        print("\ninterrupted; nothing was written", file=sys.stderr)
+        return 130
+
+    _summary(t, bundle)
+    if a.captions:
+        _add_caption_layer(bundle, t)
+    return 0
+
+
+def _add_caption_layer(bundle, t) -> None:
+    """Put the transcript on the timeline as a caption layer.
+
+    REPLACES any existing one rather than adding a second. Two caption layers draw two
+    plates over each other and read as a rendering bug, and the second transcribe of a
+    recording is the common case -- the first pass is what tells you the model got the
+    product names wrong.
+
+    Hand edits to the CUES themselves are still lost by this, because the layer carries
+    its own copy of the segments on purpose (see captions.py). That is why it is a flag
+    rather than something transcribing does on its own.
+    """
+    from omarchy_studio import captions
+
+    if not t.segments:
+        print("  captions no cues, so no caption layer was added", file=sys.stderr)
+        return
+    layer = captions.caption_layer(t.to_dict() if hasattr(t, "to_dict") else t)
+    existing = [l for l in bundle.edit.layers if l.type == "caption"]
+    bundle.edit.layers = [l for l in bundle.edit.layers if l.type != "caption"] + [layer]
+    bundle.save_edit()
+    verb = "replaced" if existing else "added"
+    print(f"  captions {verb} the caption layer ({len(layer.props['segments'])} cues)")
+
+
+def _summary(t, bundle) -> None:
+    covered = f"{t.segments[0].start:.1f}-{t.segments[-1].end:.1f}s" if t.segments else "-"
+    print(f"{transcribe.transcript_path(bundle)}")
+    print(f"  engine   {t.engine}")
+    print(f"  model    {t.model}")
+    print(f"  language {t.language or 'undetected'}")
+    print(f"  audio    {t.source_stream} (offset {t.offset_s:+.3f}s)")
+    print(f"  segments {len(t.segments)}  covering {covered}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

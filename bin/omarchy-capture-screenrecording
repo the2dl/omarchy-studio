@@ -24,7 +24,7 @@
 # compositor, so it is cheap and a clean 60fps -- and it sees everything, a self-view
 # included. The portal (-w portal) is used for exactly one thing: a self-view that has to
 # sit INSIDE the captured monitor. Hyprland's no_screen_share rule keeps that window out
-# of portal frames (absent, not a black box, with the local screenshare-exclude patch),
+# of portal frames (absent, not a black box, with the omarchy-studio-screenshare plugin),
 # and nothing keeps it out of KMS frames. The portal never says which rectangle of which
 # monitor it handed over, so its geometry is recovered from gsr's own
 # "pipewire:    Size: WxH" line (-v yes) and accepted only when it matches exactly one
@@ -339,7 +339,7 @@ park_window_outside() {
 }
 
 # Everything that must not be in the take, once the backend is known. On the portal
-# backend with the screenshare-exclude patch the compositor keeps these out for us and
+# backend with the omarchy-studio-screenshare plugin the compositor keeps these out for us and
 # they can stay where the user put them; on KMS nothing can, so they are moved or the
 # user is told they will be recorded.
 protect_overlays_from_capture() {

@@ -55,6 +55,26 @@ buffers allocated through GBM and imported with `zwp_linux_dmabuf_v1` remove the
 readback entirely. Single-buffered and fully serialised here (capture -> copy ->
 ready -> capture), so double-buffering is worth something too.
 
+## spike_dmabuf.c -- milestone 1, no readback
+
+GBM-allocated buffers handed to the compositor through `zwp_linux_dmabuf_v1`, two
+of them ping-ponged. The frame never leaves the GPU, and the DRM PRIME fd is what
+an encoder wants anyway -- it maps into VAAPI without a copy.
+
+Same window, same session, back to back:
+
+    shm      5076x2768   40.54 fps
+    dmabuf   5076x2768   59.57 fps      AR24, 2 buffers, 0 failed
+
+Repeats: 55.55, 50.32, 59.34 on the maximised window; 59.78 on a 5072x1356 one.
+
+**Display rate, so window capture can be offered at the same 60 the KMS path
+gives.** The variance is not a ceiling: frames are copied on output commit, and
+Hyprland renders on damage, so a still window simply produces fewer. That is the
+pacing hazard in the list below, and the answer is the recorder's own CFR clock
+repeating the last frame -- which is what gsr does too, and makes a duplicate
+frame mean "nothing changed" rather than "we missed one".
+
 Exclusion verified at the same instant, with the quake console open over the target:
 `grim` of the monitor showed the console and the dim; the toplevel capture showed
 the window alone, clean and undimmed.
@@ -72,8 +92,8 @@ truncation xdph does when it builds its picker list.
 
 ## What is still missing
 
-This is a measurement, not a recorder. Still to build: the DMA-BUF/VAAPI frame
-path, a 60Hz CFR clock repeating the last frame (the compositor only renders on
+These are measurements, not a recorder. Still to build: the VAAPI encode side
+(the frame path itself is proven above), a 60Hz CFR clock repeating the last frame (the compositor only renders on
 damage, so there is no frame while the screen is idle), the `.ts` first-frame
 sidecar `capture.read_gsr_ts` expects, SIGINT/IPC stop parity with gsr, and audio.
 Known hazards: mid-recording resize renegotiates the buffer size against a

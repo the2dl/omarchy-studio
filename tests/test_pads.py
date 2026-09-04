@@ -155,3 +155,77 @@ def test_a_card_in_the_head_pad_renders_before_the_recording(tmp_path):
     assert "tpad=start=30:start_mode=add" in g
     # The card's gate lives in the pad, at output frames 0..30.
     assert "gte(n,0)" in g and "lt(n,30)" in g
+
+
+# --- "make this the start" ---------------------------------------------------
+
+
+@needs_ffmpeg
+def test_moving_a_layer_to_the_intro_creates_the_room_for_it(tmp_path):
+    """One action, not two. The pad grows to hold the layer rather than the layer being
+    clipped into a pad that does not exist yet, because "make this the start" has to
+    work on the first try."""
+    root = tmp_path / "intro"
+    synthetic.make_bundle(root, seconds=2.0, width=320, height=180, camera=False)
+    b = Bundle(root)
+    card = Path(root) / "card.png"
+    card.write_bytes(_png())
+    qmlbridge.apply_op(b, "add_image", {"path": str(card)})
+    img = b.edit.layers[0]
+    assert b.edit.head_pad_frames == 0
+
+    qmlbridge.apply_op(b, "update_layer", {"id": img.id, "pad": "head"})
+    assert img.pad == "head"
+    assert b.edit.head_pad_frames >= len(img.t) > 0
+
+
+@needs_ffmpeg
+def test_moving_it_back_returns_it_to_the_recording(tmp_path):
+    root = tmp_path / "back"
+    synthetic.make_bundle(root, seconds=2.0, width=320, height=180, camera=False)
+    b = Bundle(root)
+    card = Path(root) / "card.png"
+    card.write_bytes(_png())
+    qmlbridge.apply_op(b, "add_image", {"path": str(card)})
+    img = b.edit.layers[0]
+    qmlbridge.apply_op(b, "update_layer", {"id": img.id, "pad": "head"})
+    qmlbridge.apply_op(b, "update_layer", {"id": img.id, "pad": ""})
+    assert img.pad == "" and img.t is None
+
+
+@needs_ffmpeg
+def test_the_camera_cannot_be_moved_into_a_pad(tmp_path):
+    """It is recorded footage and there is none in a pad. Refused rather than accepted
+    and silently rendered as nothing."""
+    from omarchy_studio import layers as layers_mod
+    root = tmp_path / "cam"
+    synthetic.make_bundle(root, seconds=2.0, width=320, height=180)
+    b = Bundle(root)
+    layers_mod.materialize_webcam(b.edit, b.canvas, 60)
+    cam = next(l for l in b.edit.layers if l.type == "webcam")
+    with pytest.raises(qmlbridge.BridgeError):
+        qmlbridge.apply_op(b, "update_layer", {"id": cam.id, "pad": "head"})
+
+
+@needs_ffmpeg
+def test_the_inspector_can_see_which_pad_a_layer_is_in(tmp_path):
+    """Without this the "when" control sits on "In video" for a card that actually
+    plays before the recording -- the editor saying one thing and the export doing
+    another, which is the failure this project treats as the worst kind."""
+    root = tmp_path / "state"
+    synthetic.make_bundle(root, seconds=2.0, width=320, height=180, camera=False)
+    b = Bundle(root)
+    card = Path(root) / "card.png"
+    card.write_bytes(_png())
+    qmlbridge.apply_op(b, "add_image", {"path": str(card)})
+    lid = qmlbridge.project_state(b)["layers"][0]["id"]
+    assert qmlbridge.project_state(b)["layers"][0]["pad"] == ""
+    qmlbridge.apply_op(b, "update_layer", {"id": lid, "pad": "head"})
+    assert qmlbridge.project_state(b)["layers"][0]["pad"] == "head"
+
+
+def _png() -> bytes:
+    import base64
+    return base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )

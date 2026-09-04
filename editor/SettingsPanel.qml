@@ -182,6 +182,55 @@ ScrollView {
         }
 
         // ====================================================================
+        // WHEN a layer plays. Above the per-type inspectors because it applies to
+        // every one of them, and because "make this the start" is a thing people
+        // reach for before they think about the layer's own settings.
+        //
+        // The recording is not the whole timeline any more: head and tail pads are
+        // output-only time where nothing was recorded, so a card can precede or follow
+        // the take rather than only cover it. The camera is excluded -- it is recorded
+        // footage and there is none in a pad.
+        // ====================================================================
+        ColumnLayout {
+            Layout.fillWidth: true
+            visible: root.selLayer !== null && root.selLayer.type !== "webcam"
+            spacing: 7
+
+            C.Caption { text: "when" }
+
+            C.Segmented {
+                Layout.fillWidth: true
+                model: ["Intro", "In video", "Outro"]
+                readonly property var padValues: ["head", "", "tail"]
+                // Bound to the model and never assigned locally, so a rejected change
+                // snaps the chips back rather than lying about what was stored.
+                currentIndex: root.selLayer
+                              ? Math.max(0, padValues.indexOf(root.selLayer.pad || ""))
+                              : 1
+                onActivated: function (i) {
+                    Bridge.op("update_layer",
+                              { id: root.selectedId, pad: padValues[i] })
+                }
+            }
+
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                // Says the constraint rather than letting it be discovered in an
+                // export: a pad is time that was never recorded, so there is no
+                // screen, no camera and no sound in it.
+                text: !root.selLayer || !root.selLayer.pad
+                      ? "Plays over the recording."
+                      : (root.selLayer.pad === "head"
+                         ? "Plays before the recording starts — no video, camera or sound there."
+                         : "Plays after the recording ends — no video, camera or sound there.")
+                color: Theme.text5
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsHint
+            }
+        }
+
+        // ====================================================================
         // Layer inspectors (spec §2b). One visible at a time; ColumnLayout
         // skips the hidden ones entirely.
         // ====================================================================

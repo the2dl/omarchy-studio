@@ -120,6 +120,10 @@ def resolve_layer(layer: Layer, canvas: Canvas, bundle: Bundle) -> dict:
         "z": layer.z,
         "opacity": layer.opacity,
         "fade_frames": layer.fade_frames,
+        # "" | "head" | "tail". Without this the inspector's "when" control could not
+        # show which one a layer is in, and would sit on "In video" for a card that
+        # actually plays before the recording.
+        "pad": layer.pad,
         "enabled": layer.enabled,
         "t": layer.t.to_dict() if layer.t else None,
         "props": dict(layer.props),
@@ -913,6 +917,28 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             # redaction the user asked to follow a window is worth persisting rather than
             # silently dropping, and the UI shows it as pending rather than active.
             layer.props["follow_window"] = bool(args["follow_window"])
+        if "pad" in args:
+            want = str(args["pad"])
+            if want not in ("", "head", "tail"):
+                raise BridgeError(f"unknown pad {want!r}")
+            if layer.type == "webcam":
+                # The camera is recorded footage; there is none in a pad.
+                raise BridgeError("the camera cannot be moved into a pad")
+            if want:
+                # The pad grows to hold the layer rather than the layer being clipped
+                # to a pad that may not exist yet -- "make this the start" has to work
+                # on the first try, with no separate step to create room for it.
+                field = "head_pad_frames" if want == "head" else "tail_pad_frames"
+                length = len(layer.t) if layer.t is not None else _DEFAULT_PAD_FRAMES(tb)
+                setattr(edit, field, max(getattr(edit, field), length))
+                layer.pad = want
+                layer.t = FrameRange(0, length)
+            else:
+                # Back into the recording, over the whole of it: its old source range
+                # was not kept, and guessing one would put it somewhere arbitrary.
+                layer.pad = ""
+                layer.t = None
+
         if "start_ms" in args or "end_ms" in args:
             want = _range_from_ms(tb, args.get("start_ms"), args.get("end_ms"))
             if want is not None and layer.type == "webcam":
@@ -1002,6 +1028,15 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
 
     else:
         raise BridgeError(f"unknown op {op!r}")
+
+
+def _DEFAULT_PAD_FRAMES(tb: Timebase) -> int:
+    """How long a card runs when nothing has said otherwise.
+
+    Three seconds: long enough to read a title, short enough that nobody sits through
+    it wondering whether the video is broken.
+    """
+    return max(1, tb.to_frame(3.0))
 
 
 def _next_z(layers: list[Layer]) -> int:

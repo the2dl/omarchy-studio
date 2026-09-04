@@ -287,13 +287,19 @@ def test_webcam_layer_adapts_the_settings():
 # make it that shape are asserted here rather than left to the eye.
 
 
-def test_rounded_gets_the_square_centre_crop_like_the_circle():
-    # Without it the camera's 16:9 frame is stretched into a square box, and every
-    # face in it is 33% too wide.
+def test_rounded_gets_the_centre_crop_like_the_circle():
+    """Without it the camera's frame is stretched into the box and every face in it is
+    the wrong shape.
+
+    The crop is expressed against the BOX's aspect now rather than hard-coded to a
+    square -- `min(iw,ih*1.000000)` is `min(iw,ih)` for a square box -- because `rect`
+    needs the same treatment and used to go without it.
+    """
     chain = compile_one(
         Layer(id="w", type="webcam", props={"shape": "rounded"}), camera="[cam]"
     ).filter_chain
-    assert "crop=w='min(iw,ih)'" in chain
+    assert "crop=w='min(iw,ih*" in chain
+    assert chain.index("crop=") < chain.index("scale=")
 
 
 def test_rounded_is_the_superellipse_and_not_a_rounded_rectangle():
@@ -492,3 +498,29 @@ def test_two_hundred_layers_still_parse(tmp_path):
     graph, inputs = _build(layers, tmp_path)
     hashes = framehashes(graph, tmp_path, inputs=inputs, frames=3)
     assert len(hashes) == 3
+
+
+def test_no_webcam_shape_stretches_the_camera():
+    """A rect box used to skip the crop and scale the native frame straight into it.
+
+    That is fine only while the box matches the sensor, and it rarely does: the stored
+    w/h are DERIVED for a circle (square in PIXELS, h = w * canvas_w / canvas_h), so
+    switching that camera to `rect` keeps the square box and scales a 4:3 sensor into
+    1:1 -- a face stretched tall. Reported from a real recording: a 716x716 box on a
+    1664x1248 camera.
+
+    Every shape centre-crops to the BOX's aspect now, so a deliberately wide rect is
+    still wide -- it shows a wide crop rather than a squeezed whole frame.
+    """
+    reg = layers_mod.InputRegistry()
+    reg.bind("camera", "[cam]")
+    for shape, w, h, want in (("circle", 716, 716, "1.000000"),
+                              ("rect", 716, 716, "1.000000"),
+                              ("rect", 900, 400, "2.250000"),
+                              ("rounded", 300, 300, "1.000000")):
+        chains, _ = layers_mod._tile_webcam(
+            Layer(id="w", type="webcam", props={"shape": shape}), "w",
+            layers_mod.Rect(0, 0, w, h), reg)
+        assert f"ih*{want}" in chains[0], f"{shape} {w}x{h} does not crop to its box"
+        assert chains[0].index("crop=") < chains[0].index("scale="), \
+            "the crop has to come before the scale or it cannot prevent the stretch"

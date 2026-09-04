@@ -620,15 +620,25 @@ def _tile_webcam(
     cam = inputs.label("camera")
     w, h = int(rect.w), int(rect.h)
     shape = layer.props.get("shape", "circle")
-    # A square centre crop expressed in `crop`'s own expressions, so the compiler stays
-    # pure -- probing the camera file here would make every layer test need media.
-    # `shape=rect` skips it and stretches the native frame into the box instead.
-    side = "min(iw,ih)"
-    pre = (
-        f"crop=w='{side}':h='{side}':x='(iw-{side})/2':y='(ih-{side})/2',"
-        if shape in ("circle", "rounded")
-        else ""
-    )
+    # A centre crop to the BOX's aspect, expressed in `crop`'s own expressions so the
+    # compiler stays pure -- probing the camera file here would make every layer test
+    # need media.
+    #
+    # Every shape, not just the round ones. `rect` used to skip the crop and stretch the
+    # native frame into the box, which is fine only while the box happens to match the
+    # camera. It rarely does: the stored w/h are DERIVED for a circle (square in pixels,
+    # so h = w * canvas_w / canvas_h), and switching that segment to `rect` keeps the
+    # square box -- a 4:3 camera scaled into 716x716, which reads as a face stretched
+    # tall. Nothing in the UI sizes the box to the sensor, and nobody wants a squashed
+    # face, so filling is the right behaviour for all three shapes.
+    #
+    # A deliberately wide rect still works and is still wide: it shows a wide CROP of
+    # the camera rather than a squeezed whole frame, which is what every other tool
+    # does with a fill.
+    aspect = (rect.w / rect.h) if rect.h else 1.0
+    cw = f"min(iw,ih*{aspect:.6f})"
+    ch = f"min(ih,iw/{aspect:.6f})"
+    pre = f"crop=w='{cw}':h='{ch}':x='(iw-{cw})/2':y='(ih-{ch})/2',"
     mirror = "hflip," if layer.props.get("mirror", True) else ""
     chains = [
         f"{cam}{pre}{mirror}scale={w}:{h}:flags=bicubic,setsar=1,format=rgba[{name}_c]"

@@ -559,6 +559,18 @@ def project_state(
             "head_ms": bundle.edit.head_pad_frames * ms_per_frame,
             "tail_ms": bundle.edit.tail_pad_frames * ms_per_frame,
         },
+        # The output timeline, described once HERE and consumed by the editor, rather
+        # than QML deriving it a second time from cuts and pads. A second
+        # implementation of this mapping is the same hazard as a second copy of the
+        # export's easing: the two agree until they do not, and the disagreement shows
+        # up as a preview that is subtly not the video.
+        #
+        # `kept` is the recorded material in output order -- out is where a segment
+        # starts on the output timeline, src where it starts in the recording.
+        "timeline": _timeline_map(bundle),
+        # The pad ground, so the preview paints the colour the export will. As a CSS
+        # hex for QML, where render takes the same value as 0xRRGGBB.
+        "pad_color": "#" + backgrounds.pad_colour(bundle.edit.backdrop)[2:],
         "timebase": {
             "fps_num": tb.fps_num,
             "fps_den": tb.fps_den,
@@ -1037,6 +1049,28 @@ def _DEFAULT_PAD_FRAMES(tb: Timebase) -> int:
     it wondering whether the video is broken.
     """
     return max(1, tb.to_frame(3.0))
+
+
+def _timeline_map(bundle: Bundle) -> dict:
+    """The output timeline: pads at the ends, recorded segments between them."""
+    from . import render as _render
+
+    # The count this module already trusts everywhere else. effective_cutmap would
+    # PROBE for it, and a bundle with no media then raised straight out of
+    # project_state -- the editor failing to open rather than opening empty.
+    cm = _render.effective_cutmap(bundle, _safe_source_frames(bundle))
+    kept = []
+    out = cm.head_pad
+    for k in cm.kept:
+        kept.append({"out": out, "src": k.start, "len": len(k)})
+        out += len(k)
+    return {
+        "output_frames": cm.output_frames,
+        "head": cm.head_pad,
+        "tail": cm.tail_pad,
+        "recorded_frames": cm.kept_frames,
+        "kept": kept,
+    }
 
 
 def _next_z(layers: list[Layer]) -> int:

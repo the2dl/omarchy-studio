@@ -353,3 +353,48 @@ def test_the_layer_list_cards_are_sized_from_their_content():
     sizer = src.index("id: menuSizer")
     col = src.index("id: menuCol")
     assert sizer < col, "menuSizer moved inside the menu it measures"
+
+
+def test_the_playhead_can_reach_a_pad_and_the_editor_shows_it(tmp_path):
+    """The editor was timed in SOURCE frames, so a head pad -- output time where no
+    source frame exists -- was unreachable: the intro was invisible until you exported.
+
+    `--frame` addresses OUTPUT frames, so this parks the playhead inside the pad and
+    reads back what the preview decided. The card itself renders (it is a QML Image);
+    the recorded picture cannot be checked by pixels here because VideoOutput does not
+    produce frames offscreen, so `videoVisible` is a property assertion.
+    """
+    # Real media: with none, there are zero recorded frames and every output frame
+    # past the head pad is legitimately the TAIL pad -- which is correct behaviour and
+    # useless for testing the boundary.
+    root = tmp_path / "pad"
+    synthetic.make_bundle(root, seconds=2.0, width=320, height=180, camera=False)
+    bundle = Bundle(root)
+    bundle.edit.head_pad_frames = 30
+    bundle.save_edit()
+
+    inside = selftest_fields(run_editor(root, "--no-proxy", "--frame", "10").stderr)
+    assert inside["inPad"] is True
+    assert inside["padNow"] == "head"
+    assert inside["videoVisible"] is False, "the recording is showing under the intro"
+    # The timeline's axis runs negative through a head pad.
+    assert inside["timelineFrame"] == 10 - 30
+    assert inside["padFrame"] == 10
+
+    after = selftest_fields(run_editor(root, "--no-proxy", "--frame", "40").stderr)
+    assert after["inPad"] is False
+    assert after["videoVisible"] is True
+    assert after["timelineFrame"] == after["frame"], \
+        "inside the recording the two axes have to agree"
+
+
+def test_without_pads_the_two_axes_are_the_same(tmp_path):
+    """Every existing project has to behave exactly as it did: with no pads, an output
+    frame IS a source frame and the timeline axis is unchanged."""
+    root = synthetic.make_bundle(tmp_path / "nopad", media=False)
+    f = selftest_fields(run_editor(root, "--no-proxy", "--frame", "12").stderr)
+    assert f["inPad"] is False
+    assert f["outFrame"] == 12
+    assert f["timelineFrame"] == 12
+    assert f["frame"] == 12
+    assert f["outputFrames"] == f["frames"]

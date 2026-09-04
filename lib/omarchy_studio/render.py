@@ -117,14 +117,19 @@ class _Graph:
         return ";\n".join(self.chains)
 
 
-def effective_cutmap(bundle: Bundle) -> CutMap:
+def effective_cutmap(bundle: Bundle, total: int | None = None) -> CutMap:
     """The edit's cuts, plus `trim_head_frames` as a leading cut.
 
     A head trim is an excision like any other, so it goes through the same
     split/trim/concat machinery rather than an `-ss` that would renumber frame 0 and
     slide every cut and layer index authored against the untrimmed recording.
+
+    `total` lets a caller supply the frame count it already has. The editor's bridge
+    describes this same map to the UI and must not probe to do it -- a bundle whose
+    media is missing has to answer "no timeline", not raise, or the editor cannot open
+    it at all.
     """
-    total = bundle.source_frames()
+    total = bundle.source_frames() if total is None else total
     ranges = list(bundle.edit.cuts)
     head = int(bundle.edit.trim_head_frames)
     if head > 0:

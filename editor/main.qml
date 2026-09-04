@@ -541,6 +541,13 @@ ApplicationWindow {
             previewMode: app.previewMode,
             previewFit: preview.fit,
             frame: preview.frame,
+            outFrame: preview.outFrame,
+            timelineFrame: preview.timelineFrame,
+            outputFrames: preview.outputFrames,
+            inPad: preview.inPad,
+            padNow: preview.padNow,
+            padFrame: preview.padFrame,
+            videoVisible: zoomedVisible(),
             zoomScale: preview.appliedZoomScale,
             zoomX: preview.appliedZoomX,
             zoomY: preview.appliedZoomY
@@ -551,11 +558,22 @@ ApplicationWindow {
 
     // The self-test needs a specific frame without depending on a decoder having
     // delivered one, so it drives the scrub position directly.
+    // Whether the RECORDED picture is on screen. In a pad it must not be: the export
+    // shows the pad ground there, and a preview showing frame 0 held under a title card
+    // is the editor disagreeing with the video again.
+    function zoomedVisible() {
+        return !preview.inPad
+    }
+
     Connections {
         target: Bridge
         function onStateUpdated() {
+            // OUTPUT frames, so a test can park inside a pad -- the whole point of
+            // the pads being addressable at all. preview.frame is the SOURCE frame and
+            // is held at 0 through a head pad, so comparing against it would re-seek
+            // forever at output frame 0..head.
             var f = parseInt(Bridge.arg("--frame", "-1"))
-            if (f >= 0 && preview.frame !== f)
+            if (f >= 0 && preview.outFrame !== f)
                 preview.seekFrame(f)
         }
     }

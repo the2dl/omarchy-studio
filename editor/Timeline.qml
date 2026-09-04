@@ -43,7 +43,10 @@ Item {
     readonly property var st: Bridge.state
     readonly property int sourceFrames: st.source_frames || 0
     readonly property real msPerFrame: st.timebase ? st.timebase.ms_per_frame : 1000 / 60
-    readonly property int frame: preview ? preview.frame : 0
+    // The shared axis: negative inside the head pad, past sourceFrames in the tail.
+    // Reading preview.frame here pinned the playhead to the first recorded frame for
+    // the whole of an intro, so the card played and the marker did not move.
+    readonly property int frame: preview ? preview.timelineFrame : 0
     readonly property var segments: preview ? preview.zoomSegments : []
     readonly property var cuts: st.cuts || []
 
@@ -160,21 +163,51 @@ Item {
     // not grow with the kept time around it. frameToX then subtracts the pan, so all
     // rows slide together.
     readonly property int seamW: 16
-    readonly property var fold: buildFold(cuts, expandedCutIndex, contentW, sourceFrames)
+    // The output timeline: pads at the ends, recorded material between them. From the
+    // bridge, not re-derived here -- see Preview's note on why this mapping has exactly
+    // one implementation.
+    readonly property var tl: st.timeline || ({ output_frames: 0, head: 0, tail: 0,
+                                                recorded_frames: 0, kept: [] })
+    readonly property int headPad: tl.head || 0
+    readonly property int tailPad: tl.tail || 0
+    readonly property int outputFrames: tl.output_frames || 0
 
-    function buildFold(cs, xi, w, total) {
+    // TIMELINE FRAMES, an axis that extends past the recording at both ends:
+    //
+    //   [-headPad, 0)                    the head pad
+    //   [0, sourceFrames)                the recording, cuts folded as before
+    //   [sourceFrames, +tailPad)         the tail pad
+    //
+    // Deliberately NOT a switch to output frames. Every row here -- cuts, clicks,
+    // layers, camera, selection -- passes source frames to frameToX, and rebasing them
+    // all on output time means converting twenty-odd call sites, each a place to be
+    // silently wrong. On this axis a source frame is still itself, so those rows are
+    // untouched and only the ends are new.
+    readonly property var fold: buildFold(cuts, expandedCutIndex, contentW, sourceFrames,
+                                          headPad, tailPad)
+
+    function buildFold(cs, xi, w, total, head, tail) {
         var pieces = []
         if (total <= 0)
             return pieces
+        head = head || 0
+        tail = tail || 0
         var folded = 0, seams = 0
         for (var i = 0; i < cs.length; ++i)
             if (i !== xi) {
                 seams++
                 folded += cs[i].end - cs[i].start
             }
-        var keep = Math.max(1, total - folded)
+        // Pads share the axis with the recording, so they share its scale -- a second
+        // of intro has to be as wide as a second of video or the ruler lies about
+        // where things are.
+        var keep = Math.max(1, total - folded + head + tail)
         var scale = Math.max(0, w - seams * seamW) / keep
         var x = 0, f = 0
+        if (head > 0) {
+            pieces.push({ f0: -head, f1: 0, x0: 0, x1: head * scale, pad: "head" })
+            x = head * scale
+        }
         for (i = 0; i < cs.length; ++i) {
             if (i === xi)
                 continue        // expanded: its frames are back in place, so no seam
@@ -187,18 +220,29 @@ Item {
             x += seamW
             f = c.end
         }
-        if (f < total)
-            pieces.push({ f0: f, f1: total, x0: x, x1: w })
+        if (f < total) {
+            var lastX = tail > 0 ? x + (total - f) * scale : w
+            pieces.push({ f0: f, f1: total, x0: x, x1: lastX })
+            x = lastX
+        }
+        if (tail > 0)
+            pieces.push({ f0: total, f1: total + tail, x0: x, x1: w, pad: "tail" })
         if (!pieces.length)
             pieces.push({ f0: 0, f1: total, x0: 0, x1: w })
         return pieces
     }
+
+    // The first and last frame the playhead can reach on this axis.
+    readonly property int firstFrame: -headPad
+    readonly property int lastFrame: sourceFrames + tailPad
 
     // Frame -> x in CONTENT space (the zoomed, folded axis, before the pan).
     function foldX(f) {
         var p = fold
         if (!p.length)
             return 0
+        // p[0].f0 is -headPad when there is a head pad, so a negative frame lands
+        // inside the first piece rather than being clamped to its start.
         if (f <= p[0].f0)
             return p[0].x0
         for (var i = 0; i < p.length; ++i)
@@ -218,13 +262,13 @@ Item {
         if (!p.length)
             return 0
         if (x <= p[0].x0)
-            return p[0].f0
+            return p[0].f0            // -headPad, i.e. the very start of the intro
         for (var i = 0; i < p.length; ++i)
             if (x < p[i].x1 || i === p.length - 1)
                 return Math.round(Math.min(p[i].f1, p[i].f0
                        + Math.max(0, x - p[i].x0) / Math.max(0.001, p[i].x1 - p[i].x0)
                          * (p[i].f1 - p[i].f0)))
-        return sourceFrames
+        return lastFrame
     }
 
     // Source frame -> output frame: subtract the cut time before it, so the transport
@@ -298,6 +342,9 @@ Item {
     function commitRetime(index, f0, f1) {
         dragStart = -1
         dragEnd = -1
+        // Cuts remove RECORDED material, so a selection is clamped to the recording
+        // even though the axis now runs either side of it -- there is nothing in a pad
+        // to cut out.
         f0 = Math.max(0, Math.min(f0, sourceFrames - 1))
         f1 = Math.max(f0 + 1, Math.min(f1, sourceFrames))
         Bridge.op("delete_cut", { index: index }, function () {
@@ -543,7 +590,7 @@ Item {
                 root.selStart = anchorFrame
                 root.selEnd = anchorFrame
             } else if (!fromRuler && root.preview) {
-                root.preview.seekFrame(anchorFrame)
+                root.preview.seekTimelineFrame(anchorFrame)
             }
         }
         onPositionChanged: function (m) {
@@ -563,7 +610,7 @@ Item {
                 root.selEnd = Math.max(anchorFrame, f)
             }
             if (!selecting && root.preview) {
-                root.preview.seekFrame(f)
+                root.preview.seekTimelineFrame(f)
             }
         }
         onReleased: function (m) {
@@ -573,7 +620,7 @@ Item {
             }
             // An unmoved press on the ruler is still a seek.
             if (fromRuler && !selecting && root.preview)
-                root.preview.seekFrame(anchorFrame)
+                root.preview.seekTimelineFrame(anchorFrame)
         }
     }
 
@@ -937,7 +984,7 @@ Item {
                             x: -4; y: -4
                             width: 14; height: 14
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: root.preview.seekFrame(modelData.frame)
+                            onClicked: root.preview.seekTimelineFrame(modelData.frame)
                         }
                     }
                 }

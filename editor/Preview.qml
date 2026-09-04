@@ -71,8 +71,114 @@ Item {
     // Scrubbing has to work before the proxy exists, so the frame falls back to a local
     // value when there is nothing to play.
     property int scrubFrame: 0
-    readonly property int frame: hasScreen ? Math.round(screenPlayer.position / msPerFrame) : scrubFrame
-    readonly property bool playing: screenPlayer.playbackState === MediaPlayer.PlayingState
+    // --- the output clock ---------------------------------------------------
+    //
+    // The editor used to be timed in SOURCE frames, with cuts approximated by skipping
+    // over them during playback. Pads broke that: a head pad is output time where no
+    // source frame exists, so there is nothing to skip TO and nothing to derive a
+    // position from. The playhead is therefore an OUTPUT frame now, and the source
+    // frame is derived from it.
+    //
+    // The mapping comes from the bridge (st.timeline), not from cuts re-folded here:
+    // a second implementation of it is the same hazard as a second copy of the
+    // export's easing -- the two agree until they do not, and the disagreement shows
+    // up as a preview that is quietly not the video.
+    readonly property var tl: st.timeline || ({ output_frames: 0, head: 0, tail: 0,
+                                                recorded_frames: 0, kept: [] })
+    readonly property int outputFrames: tl.output_frames || 0
+
+    // Identity when there is no timeline to consult -- a bundle still loading, or one
+    // whose media is missing. The two axes are then the same axis, which is also
+    // exactly what a project with no pads and no cuts should get: unchanged behaviour,
+    // rather than every frame collapsing to zero because no segment contains it.
+    function outputToSource(o) {
+        var k = tl.kept || []
+        if (!k.length)
+            return o
+        for (var i = 0; i < k.length; ++i)
+            if (o >= k[i].out && o < k[i].out + k[i].len)
+                return k[i].src + (o - k[i].out)
+        return -1                     // in a pad: no recorded frame exists here
+    }
+    function sourceToOutput(sf) {
+        var k = tl.kept || []
+        if (!k.length)
+            return sf
+        for (var i = 0; i < k.length; ++i)
+            if (sf >= k[i].src && sf < k[i].src + k[i].len)
+                return k[i].out + (sf - k[i].src)
+        return -1                     // inside a cut
+    }
+    function padAt(o) {
+        // No timeline yet (still loading, or a bundle whose media is missing) means no
+        // pads. Without this the second test read `o >= 0 + 0` and called every frame
+        // of every ordinary recording a tail pad.
+        if (!tl.output_frames)
+            return ""
+        if (o < (tl.head || 0))
+            return "head"
+        if (o >= (tl.head || 0) + (tl.recorded_frames || 0))
+            return "tail"
+        return ""
+    }
+
+    // The playhead, in output frames. While recorded material is playing the media
+    // player owns it; in a pad there is no player to ask, so padClock advances it.
+    property int outFrame: 0
+    readonly property string padNow: padAt(outFrame)
+    readonly property bool inPad: padNow !== ""
+
+    // The playhead on the TIMELINE's axis, where the head pad is negative and the tail
+    // sits past the recording. The timeline keeps its rows in source frames -- see its
+    // buildFold note -- so this is the one value that has to cross between the two.
+    readonly property int timelineFrame: {
+        if (padNow === "head")
+            return outFrame - (tl.head || 0)
+        if (padNow === "tail")
+            return sourceFrames + (outFrame - (tl.head || 0) - (tl.recorded_frames || 0))
+        return frame
+    }
+    function outFrameForTimeline(tf) {
+        if (tf < 0)
+            return Math.max(0, (tl.head || 0) + tf)
+        if (tf >= sourceFrames)
+            return (tl.head || 0) + (tl.recorded_frames || 0) + (tf - sourceFrames)
+        var o = sourceToOutput(tf)
+        return o >= 0 ? o : Math.max(0, Math.min(outFrame, root.outputFrames - 1))
+    }
+
+    // Where the pad sits in its own frames, for gating the layers that live in it.
+    readonly property int padFrame:
+        padNow === "head" ? outFrame
+        : padNow === "tail" ? outFrame - (tl.head || 0) - (tl.recorded_frames || 0)
+        : 0
+
+    // The SOURCE frame, which everything downstream -- zoom, cursor, camera sync,
+    // layer gates -- still speaks. Held at the nearest recorded frame inside a pad so
+    // those consumers never see -1; `inPad` is what the ones that care look at.
+    readonly property int frame: {
+        if (!hasScreen)
+            return scrubFrame
+        var sf = outputToSource(outFrame)
+        if (sf >= 0)
+            return sf
+        return padNow === "head" ? 0 : Math.max(0, root.sourceFrames - 1)
+    }
+    // The TRANSPORT, not the media player's state. In a pad the player is deliberately
+    // paused -- there is nothing recorded to show -- so deriving "playing" from it made
+    // the pad clock's own run condition false and playback stall on the first frame of
+    // a title card. Intent lives here; the players follow it.
+    property bool transport: false
+    readonly property bool playing: transport
+    // The player stopping on its own (end of media) has to put the transport down too,
+    // or the button stays on Pause over a video that is not moving.
+    Connections {
+        target: screenPlayer
+        function onPlaybackStateChanged() {
+            if (screenPlayer.playbackState === MediaPlayer.StoppedState && !root.inPad)
+                root.transport = false
+        }
+    }
 
     // Fit inside the canvas panel with the spec's 46px inset (§1d region 3), not the
     // whole item: the recording floats on the gradient rather than touching the edges.
@@ -154,10 +260,31 @@ Item {
     // click on the timeline in that window must not be silently ignored.
     property real pendingSeekMs: -1
 
+    // The timeline's axis (negative in the head pad). Its rows speak source frames, so
+    // this is where the two coordinate systems meet -- in one function, rather than at
+    // every call site.
+    function seekTimelineFrame(tf) {
+        seekFrame(outFrameForTimeline(tf))
+    }
+
+    // OUTPUT frames. Callers say "put the playhead here on the finished video", which
+    // is the only coordinate that can address a pad at all.
     function seekFrame(f) {
-        var clamped = Math.max(0, sourceFrames > 0 ? Math.min(f, sourceFrames - 1) : f)
-        scrubFrame = clamped
-        var ms = clamped * msPerFrame
+        var last = Math.max(0, root.outputFrames - 1)
+        var clamped = Math.max(0, root.outputFrames > 0 ? Math.min(f, last) : f)
+        outFrame = clamped
+        var sf = outputToSource(clamped)
+        if (sf < 0) {
+            // A pad. The player has nothing to show, so it is parked at the nearest
+            // recorded frame and hidden -- seeking it anywhere else would make the
+            // handoff into the recording jump.
+            scrubFrame = padAt(clamped) === "head" ? 0 : Math.max(0, sourceFrames - 1)
+            if (hasScreen && screenPlayer.seekable)
+                screenPlayer.setPosition(scrubFrame * msPerFrame)
+            return
+        }
+        scrubFrame = sf
+        var ms = sf * msPerFrame
         if (hasScreen && screenPlayer.seekable)
             screenPlayer.setPosition(ms)
         else
@@ -170,21 +297,32 @@ Item {
         if (!hasScreen)
             return
         if (playing) {
+            transport = false
             screenPlayer.pause()
             cameraPlayer.pause()
         } else {
-            screenPlayer.play()
-            // Not into the held span -- see the drift Timer below. The timer starts the
-            // camera the moment the screen clock reaches offsetMs + warmupMs.
-            if (hasCamera && cameraSync.cameraExistsAt(screenPlayer.position))
-                cameraPlayer.play()
+            transport = true
+            if (inPad) {
+                // padClock runs instead; the players would show recorded material
+                // under a card that is meant to precede it.
+                screenPlayer.pause()
+                cameraPlayer.pause()
+            } else {
+                screenPlayer.play()
+                // Not into the held span -- see the drift Timer below. The timer starts
+                // the camera the moment the screen clock reaches offsetMs + warmupMs.
+                if (hasCamera && cameraSync.cameraExistsAt(screenPlayer.position))
+                    cameraPlayer.play()
+            }
         }
     }
 
     function step(delta) {
+        transport = false
         screenPlayer.pause()
         cameraPlayer.pause()
-        seekFrame(frame + delta)
+        // OUTPUT frames, so stepping walks through a pad rather than jumping over it.
+        seekFrame(outFrame + delta)
     }
 
     // The zoom sample for this frame. The track is sampled per frame by the bridge and
@@ -366,6 +504,19 @@ Item {
             fillMode: VideoOutput.Stretch
         }
 
+        // The pad's ground: the backdrop's own colour, matching render._pad_ends. Under
+        // the stage, so a card that does not fill the frame sits on the same colour the
+        // export puts there rather than on whatever the canvas panel happens to be.
+        Rectangle {
+            id: padGround
+            x: stage.x
+            y: stage.y
+            width: root.canvas.width * root.fit
+            height: root.canvas.height * root.fit
+            visible: root.inPad
+            color: root.st.pad_color || "#1b1d24"
+        }
+
         Item {
             id: stage
             x: 0
@@ -445,6 +596,12 @@ Item {
 
                         Item {
                             id: zoomed
+                            // Nothing recorded exists in a pad -- not the screen, not
+                            // the cursor drawn from its events, not the zoom derived
+                            // from its clicks. Hiding the lot is what makes the preview
+                            // agree with the export instead of showing frame 0 held
+                            // under a title card.
+                            visible: !root.inPad
                             // Straight from Zoom.to_qml. transformOrigin is carried in
                             // the payload rather than assumed here.
                             transformOrigin: Item.TopLeft
@@ -489,11 +646,20 @@ Item {
                 // and listed on their own timeline row. Left in, each one rendered as
                 // LayerItem's unknown-type fallback -- an accent box reading
                 // "unsupported layer: webcam" over the video, once per segment.
-                model: (root.st.layers || []).filter(function (l) { return l.type !== "webcam" })
+                // Camera segments are drawn by WebcamOverlay; and a layer only shows
+                // where it lives -- a card in the head pad must not appear over the
+                // recording, and a layer in the recording must not appear over a pad.
+                model: (root.st.layers || []).filter(function (l) {
+                    if (l.type === "webcam")
+                        return false
+                    return (l.pad || "") === root.padNow
+                })
                 LayerItem {
                     id: item
                     spec: modelData
-                    frame: root.frame
+                    // A layer in a pad has its range in PAD frames -- pads have no
+                    // source frames, so its gate cannot be evaluated against one.
+                    frame: (modelData.pad || "") !== "" ? root.padFrame : root.frame
                     contentSource: content
                     selected: root.selectedId === modelData.id
                     interactive: root.tool === "select" && !root.previewMode
@@ -514,7 +680,10 @@ Item {
 
             WebcamOverlay {
                 id: webcam
-                visible: root.camNow !== null
+                // No camera in a pad: it is recorded footage and none was recorded
+                // there. The bridge refuses to put a camera segment in one; this is
+                // the same rule on the drawing side.
+                visible: root.camNow !== null && !root.inPad
                 cam: {
                     var g = root.st.webcam || ({})
                     if (!root.camNow)
@@ -811,6 +980,46 @@ Item {
             screenPlayer.pause()
             cameraPlayer.pause()
             root.seekFrame(root.scrubFrame)
+        }
+    }
+
+    // While the recording is playing, the player is the clock: outFrame follows its
+    // position. In a pad there is no player to follow, so padClock below drives it.
+    Connections {
+        target: screenPlayer
+        function onPositionChanged() {
+            if (root.inPad)
+                return
+            var o = root.sourceToOutput(Math.round(screenPlayer.position / root.msPerFrame))
+            if (o >= 0 && o !== root.outFrame)
+                root.outFrame = o
+        }
+    }
+
+    // A pad has no media, so time there is counted rather than read. Handing off at
+    // the boundary is what makes an intro play THROUGH into the recording instead of
+    // stalling on the last frame of the card.
+    Timer {
+        id: padClock
+        interval: Math.max(16, root.msPerFrame)
+        repeat: true
+        running: root.playing && root.inPad
+        onTriggered: {
+            var next = root.outFrame + 1
+            if (next >= root.outputFrames) {
+                root.transport = false
+                return
+            }
+            if (root.padAt(next) === "") {
+                // Into the recording: seek it and let the player take the clock back.
+                root.seekFrame(next)
+                if (root.hasScreen)
+                    screenPlayer.play()
+                if (root.hasCamera && root.cameraSync.cameraExistsAt(next * root.msPerFrame))
+                    cameraPlayer.play()
+            } else {
+                root.outFrame = next
+            }
         }
     }
 

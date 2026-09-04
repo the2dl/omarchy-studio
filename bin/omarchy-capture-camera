@@ -2,7 +2,7 @@
 
 # omarchy:summary=Record the webcam into a recording bundle as its own stream
 # omarchy:group=capture
-# omarchy:args=start <bundle-dir> [--device=<dev>] [--size=<small|medium|large>] [--shape=<circle|rounded|rect>] [--self-view=<yes|no>] [--outside=<WxH+X+Y>] [--exclude=<yes|no>] | stop | status
+# omarchy:args=start <bundle-dir> [--device=<dev>] [--size=<small|medium|large>] [--shape=<circle|rounded|rect>] [--self-view=<yes|no>] [--outside=<WxH+X+Y>] [--rect=<WxH+X+Y>] [--exclude=<yes|no>] | stop | status
 # omarchy:hidden=true
 #
 # One ffmpeg process opens the camera ONCE and fans it out: cam.mp4 for the editor,
@@ -82,6 +82,7 @@ SIZE="medium"
 SHAPE="circle"
 SELF_VIEW="no"
 OUTSIDE=""
+REQUEST_RECT=""
 # --exclude=yes: the recorder is on the portal backend and the compositor keeps a
 # no_screen_share window out of its frames, so the self-view may sit INSIDE the capture.
 EXCLUDE="no"
@@ -94,7 +95,7 @@ CAM_FPS=30
 CAM_PIXFMT="mjpeg"
 
 usage() {
-  echo "Usage: omarchy-capture-camera start <bundle-dir> [--device=<dev>] [--size=<small|medium|large>] [--shape=<circle|rounded|rect>] [--self-view=<yes|no>] [--outside=<WxH+X+Y>] [--exclude=<yes|no>]" >&2
+  echo "Usage: omarchy-capture-camera start <bundle-dir> [--device=<dev>] [--size=<small|medium|large>] [--shape=<circle|rounded|rect>] [--self-view=<yes|no>] [--outside=<WxH+X+Y>] [--rect=<WxH+X+Y>] [--exclude=<yes|no>]" >&2
   echo "       omarchy-capture-camera stop|status" >&2
   exit 1
 }
@@ -219,6 +220,36 @@ preset_size() {
   *) PRESET_W=$((monitor_height * 2 / 9)) ;;
   esac
   PRESET_H=$PRESET_W
+}
+
+# Puts the self-view exactly where the user left it in the setup bar.
+#
+# WHY THIS EXISTS. The pre-record self-view can be dragged anywhere and resized by its
+# grip, and that rectangle is what the export composites the camera into. The live
+# bubble ignored it and park-spotted to a corner at a preset size, so pressing Record
+# threw away the placement the user had just made -- on screen, mid-take, every time.
+#
+# Only callable when the compositor is hiding the bubble from the capture. On KMS
+# nothing can, so an honoured rect would be a bubble welded into the frames; that case
+# still parks, and the export still puts the camera where the user asked.
+place_at_rect() {
+  [[ $REQUEST_RECT =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]] || return 1
+  local rw=${BASH_REMATCH[1]} rh=${BASH_REMATCH[2]} rx=${BASH_REMATCH[3]} ry=${BASH_REMATCH[4]}
+  ((rw > 0 && rh > 0)) || return 1
+
+  # The monitor under the bubble's CENTRE: `move` in the window rule is relative to the
+  # window's own monitor, and a bubble straddling an edge belongs to the display showing
+  # most of it.
+  local cx=$((rx + rw / 2)) cy=$((ry + rh / 2))
+  local mname mx my mw mh
+  while IFS=$'\t' read -r mname mx my mw mh; do
+    ((cx >= mx && cx < mx + mw && cy >= my && cy < my + mh)) || continue
+    PRESET_W=$rw PRESET_H=$rh
+    PARK_X=$rx PARK_Y=$ry
+    PARK_MON=$mname PARK_MX=$mx PARK_MY=$my
+    return 0
+  done < <(monitors_logical)
+  return 1
 }
 
 # Finds a spot for the self-view that the capture cannot see. Leaves it in PARK_X/PARK_Y
@@ -357,7 +388,14 @@ shape_self_view() {
 }
 
 start_preview() {
-  find_park_spot || return 1
+  # The user's own placement wins wherever it can be honoured. It cannot be on KMS --
+  # see place_at_rect -- and a rect on a monitor that has since gone away falls back to
+  # parking rather than failing the recording over a preference.
+  if [[ $EXCLUDE == "yes" && -n $REQUEST_RECT ]] && place_at_rect; then
+    :
+  else
+    find_park_spot || return 1
+  fi
   if [[ $EXCLUDE == "yes" ]]; then
     apply_self_view_rule || return 1
     SELF_VIEW_TITLE="$EXCLUDED_SELF_VIEW_TITLE"
@@ -694,6 +732,7 @@ start)
     --size=*) SIZE="${arg#*=}" ;;
     --self-view=*) SELF_VIEW="${arg#*=}" ;;
     --outside=*) OUTSIDE="${arg#*=}" ;;
+    --rect=*) REQUEST_RECT="${arg#*=}" ;;
     --shape=*) SHAPE="${arg#*=}" ;;
     --exclude=*) EXCLUDE="${arg#*=}" ;;
     --fps=*) FPS="${arg#*=}" ;;

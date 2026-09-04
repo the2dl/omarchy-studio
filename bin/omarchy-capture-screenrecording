@@ -783,6 +783,12 @@ start_screenrecording() {
     local camera_args=(--size="$WEBCAM_SIZE" --shape="$WEBCAM_SHAPE"
                        --outside="$LOGICAL_GEOMETRY")
     [[ -n $WEBCAM_DEVICE ]] && camera_args+=(--device="$WEBCAM_DEVICE")
+    # Where the user actually left the bubble in the setup bar. The camera process
+    # honours it whenever the compositor is hiding the self-view from the capture, and
+    # parks instead when it is not -- on KMS an honoured rect is a bubble welded into
+    # the take. Either way the EXPORT composites the camera here, because the same
+    # rectangle went into edit.json above.
+    [[ -n ${SETUP_CAMERA_RECT:-} ]] && camera_args+=(--rect="$SETUP_CAMERA_RECT")
     case $self_view_mode in
     park) camera_args+=(--self-view=yes) ;;
     # Both hide the bubble in the compositor; exclude-crop additionally streams the
@@ -792,6 +798,13 @@ start_screenrecording() {
     esac
     if omarchy-capture-camera start "$BUNDLE" "${camera_args[@]}"; then
       trail "camera: started ($self_view_mode self-view)"
+      # Worth its own line because it looks like a bug from the user's chair: they
+      # placed the bubble, and Record moved it. On KMS nothing can hide a window from
+      # the capture, so a bubble left inside the frame would be welded into it -- the
+      # live one is moved clear and the EXPORT still composites the camera where they
+      # put it, from the same rectangle that went into edit.json.
+      [[ $self_view_mode == "park" && -n ${SETUP_CAMERA_RECT:-} ]] &&
+        trail "camera: placement $SETUP_CAMERA_RECT not honoured live (KMS cannot hide the bubble); the export still uses it"
     else
       trail "camera: FAILED to start; the screen recording continues without it"
       omarchy-notification-send -u critical -t 3000 "Webcam not recorded" "The screen recording is running without it"

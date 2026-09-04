@@ -103,29 +103,35 @@ Flags mirror gpu-screen-recorder on purpose: the capture script already branches
 `kms|portal`, and this is meant to be a third value rather than a second way of
 doing everything.
 
-**Measured 35-37 fps, which is SLOWER than the shm spike, and the reason is worth
-recording.** VAAPI on this driver refuses to import a BGRA DRM object:
+**Measured, on this box (Granite Ridge iGPU, DP-1 5120x2880@2x), 6s takes:**
+
+    window            capture only    with encode
+    2526x1372          59.6 fps        59.3 fps
+    2526x2768             --           34.9 fps
+    5076x2768          59.6 fps        25.5 fps
+
+Capture alone holds display rate at any size. Adding the encode costs nothing on a
+small window and most of the rate on a maximised one -- it scales with pixels, so it
+is throughput, not a fixed overhead. A 5076x2768 frame is 14M pixels uploaded and
+HEVC-encoded sixty times a second, on an iGPU also driving a 5K display.
+
+The upload is what a working DMA-BUF import would delete. VAAPI on this driver
+refuses one:
 
     Failed to create surface from DRM object: 2 (resource allocation failed)
     Failed to map frame: -5
 
-Tried with tiled and with linear buffers; the refusal is the format, not the
-modifier. VA surfaces here accept an UPLOAD from BGRA and convert on the GPU, they
-just will not take an import -- so the current path allocates linear, maps the
-buffer, and uploads. That is two copies where the shm spike had one, which is
-exactly why it measures worse than 44.8.
+Tried tiled and linear, ARGB and XRGB (same bytes, only the alpha channel differs --
+VAAPI often accepts the X variant and here it does not). So it is the format class,
+not the modifier or the alpha. Getting past it means importing through EGL or Vulkan
+and converting to NV12 there, which is a real piece of work rather than a flag.
 
-So the standing order of preference is:
+Capture is on wl_shm for that reason. The dmabuf path captures faster (59.6 vs 44.8
+measured with no encoder attached) but only pays off if the encoder can read that
+buffer without a copy, and it cannot -- mapping it back out of the GPU cost more than
+shm's single copy ever did.
 
-    1. dmabuf import   59.6 fps   blocked on the VAAPI import above
-    2. shm             44.8 fps   one copy, and better than what ships today
-    3. map + upload    35-37 fps  what ships today
-
-Fixing (1) is the real work -- EGL/GL or Vulkan import, or a driver path that takes
-RGB surfaces. Falling back to (2) is a smaller change and an immediate win. Neither
-is done.
-
-## What is still missing
+## What is still missing## What is still missing
 
 Still to build: a 60Hz CFR clock repeating the last frame (the compositor only renders on
 damage, so there is no frame while the screen is idle), the `.ts` first-frame

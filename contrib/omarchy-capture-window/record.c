@@ -19,7 +19,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <gbm.h>
+#include <poll.h>
+#include <sys/mman.h>
 #include <wayland-client.h>
 #include <libavcodec/avcodec.h>
 #include <libavfilter/avfilter.h>
@@ -31,7 +32,6 @@
 #include <libavutil/opt.h>
 
 #include "hyprland-toplevel-export-v1-client-protocol.h"
-#include "linux-dmabuf-v1-client-protocol.h"
 
 #define NBUF 3   // one being rendered into, one in flight, one free
 
@@ -45,32 +45,31 @@ static const char *o_ts;          // gsr-compatible first-frame sidecar
 // ---------------------------------------------------------------- wayland
 
 static struct wl_display *dpy;
-static struct zwp_linux_dmabuf_v1 *dmabuf;
+static struct wl_shm *shm;
 static struct hyprland_toplevel_export_manager_v1 *mgr;
-static struct gbm_device *gbm;
-static int drm_fd = -1;
 
 struct buf {
-    struct gbm_bo *bo;
+    void *pix;
+    size_t size;
     struct wl_buffer *wb;
-    int busy;
 };
 static struct buf bufs[NBUF];
 static int nbufs, have_params, allocated;
-static uint32_t FMT, W, H;
+static uint32_t FMT, W, H, STRIDE;
 
 // ---------------------------------------------------------------- ffmpeg
 
 static AVFormatContext *ofmt;
 static AVStream *vstream;
 static AVCodecContext *enc;
-static AVBufferRef *drm_dev, *va_dev, *drm_frames;
+static AVBufferRef *va_dev;
 static AVFilterGraph *graph;
 static AVFilterContext *fsrc, *fsink;
 static AVFrame *drm_frame, *filt_frame;
 static AVPacket *pkt;
 
 static volatile sig_atomic_t stop_now;
+static int consec_fail;
 static int64_t frames_in, frames_out;
 static int64_t first_frame_mono_us, first_frame_real_us;
 static int have_first;
@@ -115,18 +114,12 @@ static void drain(int flush) {
 
 // Wrap a GBM bo as a DRM PRIME AVFrame, push it through the GPU filter chain
 // (hwmap into VAAPI, convert to nv12) and encode whatever comes out.
-static void encode_bo(struct gbm_bo *bo, int64_t pts) {
-    void *map_data = NULL;
-    uint32_t stride = 0;
-    void *src = gbm_bo_map(bo, 0, 0, W, H, GBM_BO_TRANSFER_READ, &stride, &map_data);
-    if (!src) die("gbm_bo_map", 0);
-
-    drm_frame->data[0] = src;
-    drm_frame->linesize[0] = (int)stride;
+static void encode_bo(struct buf *b, int64_t pts) {
+    drm_frame->data[0] = b->pix;
+    drm_frame->linesize[0] = (int)STRIDE;
     drm_frame->pts = pts;
     int r = av_buffersrc_add_frame_flags(fsrc, drm_frame,
                                          AV_BUFFERSRC_FLAG_KEEP_REF);
-    gbm_bo_unmap(bo, map_data);
     if (r < 0) die("buffersrc", r);
 
     while (1) {
@@ -145,12 +138,12 @@ static void shoot(void);
 
 static void on_dmabuf(void *u, struct hyprland_toplevel_export_frame_v1 *f,
                       uint32_t fmt, uint32_t w, uint32_t h) {
-    (void)u; (void)f;
-    FMT = fmt; W = w; H = h; have_params = 1;
+    (void)u;(void)f;(void)fmt;(void)w;(void)h;   // dmabuf offered too; see the README
 }
 static void on_buffer(void *u, struct hyprland_toplevel_export_frame_v1 *f,
-                      uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
-    (void)u;(void)f;(void)a;(void)b;(void)c;(void)d;
+                      uint32_t fmt, uint32_t w, uint32_t h, uint32_t stride) {
+    (void)u; (void)f;
+    FMT = fmt; W = w; H = h; STRIDE = stride; have_params = 1;
 }
 static void on_damage(void *u, struct hyprland_toplevel_export_frame_v1 *f,
                       uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
@@ -186,19 +179,42 @@ static void on_ready(void *u, struct hyprland_toplevel_export_frame_v1 *f,
         first_frame_real_us = real_us();
         have_first = 1;
     }
-    encode_bo(bufs[cur].bo, frames_in++);
+    // Ask for the NEXT frame before encoding this one. Encoding first left the
+    // compositor idle for the whole map/upload/encode and made the buffer ring
+    // pointless -- capture and encode were strictly alternating. Requesting first
+    // means the compositor renders frame N+1 into another buffer while frame N is
+    // still being encoded, which is the only thing NBUF was ever for.
+    int done = cur;
     cur = (cur + 1) % nbufs;
     hyprland_toplevel_export_frame_v1_destroy(f);
     if (!stop_now) shoot();
+    consec_fail = 0;
+    encode_bo(&bufs[done], frames_in++);
 }
+
+// A window that never yields a frame, or stops yielding for good, must not leave the
+// recorder spinning. Asking for a bad address used to loop on `failed` forever with no
+// output and no error -- the process simply never returned.
+#define FAIL_NEVER_STARTED 120   // ~2s at 60Hz: no first frame means no such window
+#define FAIL_GAVE_UP       600   // ~10s: it was there and is not coming back
 
 static void on_failed(void *u, struct hyprland_toplevel_export_frame_v1 *f) {
     (void)u;
-    // The window is hidden, on another workspace, or gone. Repeating the last frame
-    // keeps the timeline honest -- the recording continues, showing what the window
-    // last showed, rather than stalling or ending.
     hyprland_toplevel_export_frame_v1_destroy(f);
-    if (allocated && have_first) encode_bo(bufs[(cur + nbufs - 1) % nbufs].bo, frames_in++);
+    consec_fail++;
+    if (!have_first) {
+        if (consec_fail >= FAIL_NEVER_STARTED)
+            die("that window produced no frames -- check the address with "
+                "`hyprctl clients -j`", 0);
+    } else if (consec_fail >= FAIL_GAVE_UP) {
+        fprintf(stderr, "omarchy-capture-window: window gone; closing the file\n");
+        stop_now = 1;
+        return;
+    }
+    // Hidden, on another workspace, or mid-resize. Repeating the last frame keeps the
+    // timeline honest: the recording continues showing what the window last showed
+    // rather than stalling or ending early.
+    if (allocated && have_first) encode_bo(&bufs[(cur + nbufs - 1) % nbufs], frames_in++);
     if (!stop_now) shoot();
 }
 
@@ -216,46 +232,40 @@ static void shoot(void) {
 
 static void reg(void *u, struct wl_registry *r, uint32_t name, const char *i, uint32_t v) {
     (void)u; (void)v;
-    if (!strcmp(i, zwp_linux_dmabuf_v1_interface.name))
-        dmabuf = wl_registry_bind(r, name, &zwp_linux_dmabuf_v1_interface, 3);
+    if (!strcmp(i, wl_shm_interface.name))
+        shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
     else if (!strcmp(i, hyprland_toplevel_export_manager_v1_interface.name))
         mgr = wl_registry_bind(r, name, &hyprland_toplevel_export_manager_v1_interface, 1);
 }
 static void reg_gone(void *u, struct wl_registry *r, uint32_t n) { (void)u;(void)r;(void)n; }
 static const struct wl_registry_listener reg_l = { reg, reg_gone };
 
-static void params_created(void *u, struct zwp_linux_buffer_params_v1 *p, struct wl_buffer *b) {
-    (void)u;(void)p;(void)b;
-}
-static void params_failed(void *u, struct zwp_linux_buffer_params_v1 *p) { (void)u;(void)p; }
-static const struct zwp_linux_buffer_params_v1_listener params_l = {
-    params_created, params_failed,
-};
-
 // ---------------------------------------------------------------- setup
 
+// wl_shm, not the DMA-BUF the protocol also offers.
+//
+// The dmabuf path is faster to CAPTURE into (59.6 vs 44.8 fps measured, see README)
+// but only pays off if the encoder can read that buffer without a copy -- and VAAPI
+// on this driver refuses to import it: "Failed to create surface from DRM object: 2",
+// with tiled and with linear, as ARGB and as XRGB. So the frame had to be mapped back
+// out of the GPU before uploading, which is a read from write-combined memory and the
+// most expensive step in the whole pipeline.
+//
+// shm skips it: the compositor writes into memory we already hold, and that pointer
+// goes straight to the encoder's upload. One copy instead of two.
 static void alloc_buffers(void) {
+    size_t sz = (size_t)STRIDE * H;
     for (int i = 0; i < NBUF; i++) {
-        // LINEAR is not a default worth arguing with. GBM picks a tiled/DCC-compressed
-        // layout for RENDERING|SCANOUT, and VAAPI refuses to import that: "Failed to
-        // create surface from DRM object: 2 (resource allocation failed)". A linear
-        // buffer costs the compositor some render bandwidth and buys an import that
-        // works, which is the whole pipeline.
-        struct gbm_bo *bo = gbm_bo_create(gbm, W, H, FMT,
-                                          GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
-        if (!bo) bo = gbm_bo_create(gbm, W, H, FMT, GBM_BO_USE_LINEAR);
-        if (!bo) die("gbm_bo_create", 0);
-        int fd = gbm_bo_get_fd(bo);
-        uint64_t mod = gbm_bo_get_modifier(bo);
-        struct zwp_linux_buffer_params_v1 *p = zwp_linux_dmabuf_v1_create_params(dmabuf);
-        zwp_linux_buffer_params_v1_add_listener(p, &params_l, NULL);
-        zwp_linux_buffer_params_v1_add(p, fd, 0, gbm_bo_get_offset(bo, 0),
-                                       gbm_bo_get_stride(bo),
-                                       (uint32_t)(mod >> 32), (uint32_t)mod);
-        bufs[i].wb = zwp_linux_buffer_params_v1_create_immed(p, W, H, FMT, 0);
-        zwp_linux_buffer_params_v1_destroy(p);
+        int fd = memfd_create("omarchy-capture-window", MFD_CLOEXEC);
+        if (fd < 0 || ftruncate(fd, sz) < 0) die("memfd", 0);
+        void *pix = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (pix == MAP_FAILED) die("mmap", 0);
+        struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, sz);
+        bufs[i].wb = wl_shm_pool_create_buffer(pool, 0, W, H, STRIDE, FMT);
+        wl_shm_pool_destroy(pool);
         close(fd);
-        bufs[i].bo = bo;
+        bufs[i].pix = pix;
+        bufs[i].size = sz;
         nbufs++;
     }
 }
@@ -264,19 +274,8 @@ static void setup_pipeline(void) {
     int r;
     alloc_buffers();
 
-    r = av_hwdevice_ctx_create(&drm_dev, AV_HWDEVICE_TYPE_DRM, o_render, NULL, 0);
-    if (r < 0) die("drm hwdevice", r);
-    r = av_hwdevice_ctx_create_derived(&va_dev, AV_HWDEVICE_TYPE_VAAPI, drm_dev, 0);
+    r = av_hwdevice_ctx_create(&va_dev, AV_HWDEVICE_TYPE_VAAPI, o_render, NULL, 0);
     if (r < 0) die("vaapi hwdevice", r);
-
-    drm_frames = av_hwframe_ctx_alloc(drm_dev);
-    if (!drm_frames) die("drm frames ctx", 0);
-    AVHWFramesContext *fc = (AVHWFramesContext *)drm_frames->data;
-    fc->format = AV_PIX_FMT_DRM_PRIME;
-    fc->sw_format = AV_PIX_FMT_BGRA;
-    fc->width = W; fc->height = H;
-    r = av_hwframe_ctx_init(drm_frames);
-    if (r < 0) die("drm frames init", r);
 
     // hwmap into VAAPI, then scale_vaapi for the BGRA -> NV12 the encoder wants.
     // Both stages run on the GPU; the pixels never touch the CPU.
@@ -386,22 +385,39 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGHUP, on_signal);
 
-    drm_fd = open(o_render, O_RDWR | O_CLOEXEC);
-    if (drm_fd < 0) die("open render node", 0);
-    gbm = gbm_create_device(drm_fd);
-    if (!gbm) die("gbm_create_device", 0);
-
     dpy = wl_display_connect(NULL);
     if (!dpy) die("no wayland display", 0);
     struct wl_registry *r = wl_display_get_registry(dpy);
     wl_registry_add_listener(r, &reg_l, NULL);
     wl_display_roundtrip(dpy);
     if (!mgr) die("compositor has no hyprland_toplevel_export_manager_v1", 0);
-    if (!dmabuf) die("compositor has no zwp_linux_dmabuf_v1", 0);
+    if (!shm) die("compositor has no wl_shm", 0);
 
     double t0 = now_s();
     shoot();
-    while (!stop_now && wl_display_dispatch(dpy) != -1) { }
+
+    // A polled loop rather than wl_display_dispatch, because dispatch BLOCKS and an
+    // unknown window handle produces no events at all -- not even `failed`. Asking
+    // for a bad address simply hung forever, with no output and no error. The poll
+    // timeout is also what makes SIGTERM land promptly instead of waiting for the
+    // next frame.
+    while (!stop_now) {
+        while (wl_display_prepare_read(dpy) != 0)
+            wl_display_dispatch_pending(dpy);
+        wl_display_flush(dpy);
+        struct pollfd pfd = { .fd = wl_display_get_fd(dpy), .events = POLLIN };
+        int n = poll(&pfd, 1, 200);
+        if (n > 0) {
+            wl_display_read_events(dpy);
+            wl_display_dispatch_pending(dpy);
+        } else {
+            wl_display_cancel_read(dpy);
+            if (n < 0 && errno != EINTR) break;
+        }
+        if (!have_first && now_s() - t0 > 3.0)
+            die("that window produced no frames in 3s -- check the address with "
+                "`hyprctl clients -j`", 0);
+    }
 
     if (allocated) {
         drain(1);

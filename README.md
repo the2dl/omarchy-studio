@@ -2,6 +2,10 @@
 
 A non-destructive screen recorder for Linux, built for Hyprland.
 
+![A recording playing back in the editor](docs/media/demo.gif)
+
+*Recorded, edited and exported with omarchy-studio.*
+
 Recording is not the hard part — `gpu-screen-recorder` already does that well. The
 hard part is everything after: moving the camera bubble, retiming a zoom, cutting a
 section out, and changing your mind about any of it a week later. So a recording
@@ -38,6 +42,22 @@ screenrecording-2026-09-04_14-22-11/
 - **A teleprompter** that the compositor can keep out of the take.
 - **Export presets** up to native, decided at export rather than at capture, because
   capture keeps every pixel.
+
+## What it looks like
+
+![The editor](docs/media/editor.png)
+
+The editor. Preview on its backdrop, the inspector on the right (zoom, cursor,
+camera, backdrop), and the timeline underneath with a row per track — screen, zoom,
+camera, clicks, audio. Nothing here is applied to the master; it is all `edit.json`
+until you press Export.
+
+![The pre-record setup bar](docs/media/setup.png)
+
+Before recording. Source mode, microphone, system audio, camera shape, the
+teleprompter, and `Re-frame later`. Start is not on the bar — it sits in the middle
+of whatever you picked, so the confirmation is the thing itself rather than a
+thumbnail of it.
 
 ## Requirements
 

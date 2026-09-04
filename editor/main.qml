@@ -199,6 +199,22 @@ ApplicationWindow {
                 onClicked: app.previewMode = !app.previewMode
             }
 
+            // Only for a recording whose window actually moved. A toggle that would
+            // visibly do nothing is worse than no toggle, so `available` gates it
+            // rather than a disabled state: on every other recording this control
+            // does not exist and the bar is exactly as it was.
+            S.GhostToggle {
+                visible: app.st.follow !== undefined && app.st.follow.available === true
+                text: "Follow window"
+                active: app.st.follow !== undefined && app.st.follow.on === true
+                // Flipping this re-crops every frame, so the proxy is rebuilt. Dim
+                // while that runs, for the same reason Preview dims: the state is
+                // real, the playback is not yet.
+                dim: app.proxyBuilding
+                onClicked: Bridge.op("set_follow",
+                                     { follow_window: !(app.st.follow.on === true) })
+            }
+
             // While the proxy builds, Export demotes to text-6 with no fill (spec §2e:
             // the shell is real, only playback is not -- nothing on this bar should
             // outshine the build). It still opens the pane: the render reads the

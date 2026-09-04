@@ -331,7 +331,12 @@ ApplicationWindow {
             camera_device: cameraEntry !== null ? cameraEntry.device : null,
             // Carried so the editor opens the camera where it was placed rather than
             // at the defaults. Null is legal and means "use the defaults".
-            camera_rect: cameraMode > 0 ? cameraRect : null
+            camera_rect: cameraMode > 0 ? cameraRect : null,
+            // Only a window card has an address; a display or a hand-drawn area
+            // resolves to undefined and rides across as null. The target itself is
+            // still just a rectangle -- this says which window that rectangle was
+            // cut from, so the recorder can log where it went afterwards.
+            window: (sel && sel.kind === "window" && sel.address) ? sel.address : null
         }, function (r, ok) {
             if (!ok)
                 return          // rejected config; everything stays up

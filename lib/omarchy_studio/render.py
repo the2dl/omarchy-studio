@@ -48,7 +48,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import backgrounds, cuts, layers as layers_mod, probe
+from . import backgrounds, cuts, follow, layers as layers_mod, probe
 from .geometry import Canvas
 from .project import Bundle, BackdropSettings, Layer, ProjectError
 from .timebase import CutMap, FrameRange, Timebase
@@ -200,9 +200,25 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
     # rectangle inside that stream. Cropping here means every later stage (cuts, zoom,
     # cursor, layers, the canvas itself) sees exactly the frame they asked for, with no
     # second coordinate system anywhere.
+    # When the edit asks to follow the recorded window, the crop's OFFSET becomes an
+    # expression over t instead of a number. Same filter, same position in the graph,
+    # same fixed output size -- so nothing downstream learns that the frame is moving,
+    # which is the only reason panning does not have to be replumbed through zoom,
+    # the cursor and every layer.
+    fplan = follow.for_bundle(bundle)
     crop = capture.crop_rect()
     base_in = "[0:v]"
-    if crop is not None:
+    if fplan is not None and not fplan.static:
+        g.add(
+            f"[0:v]crop={fplan.w}:{fplan.h}:"
+            f"x='{fplan.x_expr()}':y='{fplan.y_expr()}'[cropped]"
+        )
+        base_in = "[cropped]"
+    elif fplan is not None:
+        x, y, w, h = fplan.rect()
+        g.add(f"[0:v]crop={w}:{h}:{x}:{y}[cropped]")
+        base_in = "[cropped]"
+    elif crop is not None:
         x, y, w, h = crop
         g.add(f"[0:v]crop={w}:{h}:{x}:{y}[cropped]")
         base_in = "[cropped]"

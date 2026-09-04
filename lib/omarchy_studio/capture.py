@@ -586,6 +586,11 @@ def main(argv: list[str] | None = None) -> int:
             "SETUP_CAMERA_RECT": (
                 format_geometry(cfg["camera_rect"]) if cfg.get("camera_rect") else ""
             ),
+            # The window this target was cut from, when it was cut from one. The
+            # recorder logs where that window goes, so a window that moves mid-take
+            # is a framing decision the editor can still make rather than a ruined
+            # recording. Empty for a monitor or a hand-drawn area.
+            "SETUP_WINDOW": str(cfg.get("window") or ""),
             "SETUP_COUNTDOWN_S": str(int(cfg.get("countdown") or 0)),
         }
         for k, v in emit.items():
@@ -605,8 +610,19 @@ def main(argv: list[str] | None = None) -> int:
             camera_shape=a.camera_shape,
             source_logical=parse_geometry(a.source_logical) if a.source_logical else None,
         )
+        # The grid gsr actually ENCODES, which is the stream, not the frame. When the
+        # capture records more than it shows -- a region that needs a self-view, a
+        # window whose framing has to stay editable -- the frame can sit well under
+        # h264's 4096 ceiling while the monitor being encoded sits well over it, and
+        # sizing the encoder to the frame would name a codec that cannot encode what
+        # is being handed to it.
         physical = bundle.capture.physical_geometry
-        size = capture_size(physical)
+        encoded = (
+            to_physical(parse_geometry(a.source_logical), a.scale)
+            if a.source_logical
+            else physical
+        )
+        size = capture_size(encoded)
         # Shell-quoted because the caller evals this and the recordings directory is a
         # user path: XDG_VIDEOS_DIR is routinely "~/My Videos".
         emit = {
@@ -618,7 +634,7 @@ def main(argv: list[str] | None = None) -> int:
             "CAPTURE_SIZE": f"{size[0]}x{size[1]}" if size else "0x0",
             # Paired with the size: a grid past h264's ceiling is only capturable at all
             # because the codec was named to match it.
-            "CAPTURE_CODEC": capture_codec(physical),
+            "CAPTURE_CODEC": capture_codec(encoded),
             # Non-empty when the stream is larger than the frame, which is the recorder's
             # signal that it must take the PORTAL: only that backend can hide the
             # self-view, and it is the reason we are streaming more than was asked for.

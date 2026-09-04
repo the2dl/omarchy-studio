@@ -431,6 +431,11 @@ class Edit:
     # survives closing the editor. Capture keeps every pixel; this is where the size is
     # actually decided.
     export_preset: str = DEFAULT_EXPORT_PRESET
+    # Pan the crop to keep the recorded window in frame, using events/window.jsonl.
+    # Default off: turning it on changes the framing of every frame, and that is a
+    # decision the user makes after seeing the take, not one inherited silently.
+    # Ignored -- not an error -- when the bundle has no window track to follow.
+    follow_window: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -446,6 +451,7 @@ class Edit:
             "head_pad_frames": self.head_pad_frames,
             "tail_pad_frames": self.tail_pad_frames,
             "export_preset": self.export_preset,
+            "follow_window": self.follow_window,
         }
 
     @classmethod
@@ -474,6 +480,7 @@ class Edit:
                 if str(d.get("export_preset")) in EXPORT_PRESETS
                 else DEFAULT_EXPORT_PRESET
             ),
+            follow_window=bool(d.get("follow_window", False)),
         )
 
 
@@ -546,6 +553,18 @@ class Bundle:
 
     @property
     def canvas(self) -> Canvas:
+        """The frame everything composes on.
+
+        Following a window changes the crop's SIZE (a window that grew mid-take needs
+        a bigger frame than the one it was picked at), so the canvas has to be asked
+        of the same plan the renderer crops with. Two answers here would put every
+        overlay at the wrong place at once.
+        """
+        from .follow import for_bundle  # local: follow imports this module
+
+        p = for_bundle(self)
+        if p is not None:
+            return Canvas(p.w, p.h)
         return self.capture.canvas
 
     def source_frames(self) -> int:

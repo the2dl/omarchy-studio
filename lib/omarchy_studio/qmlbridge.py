@@ -37,6 +37,7 @@ from dataclasses import replace
 from . import backgrounds
 from . import cursor as _cursor_mod
 from . import events as _events
+from . import follow
 from . import layers as _layers
 from . import zoom as _zoom
 from . import project as project_mod
@@ -553,6 +554,13 @@ def project_state(
         # other setting rather than holding a copy that could drift from the file the
         # renderer actually reads.
         "export_preset": bundle.edit.export_preset,
+        # Following the recorded window. `available` is whether the window ever moved:
+        # a toggle that would visibly do nothing is worse than no toggle, so the pane
+        # only draws the control when there is something to follow.
+        "follow": {
+            "available": follow.has_track(bundle),
+            "on": bundle.edit.follow_window,
+        },
         # Output-only time at each end. `head` shifts every recorded frame later, so
         # the timeline draws the recording starting at head rather than at zero.
         "pads": {
@@ -1028,6 +1036,13 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             elif layer.t.end > span:
                 layer.t = FrameRange(min(layer.t.start, span - 1), span)
 
+    elif op == "set_follow":
+        # The crop's size changes with this (a window that grew mid-take needs a bigger
+        # frame), so the canvas changes, so every overlay's placement is recomputed from
+        # it. Dropping the memoised plan is what makes the next read see the new size.
+        edit.follow_window = bool(args["follow_window"])
+        bundle._follow_cache = None
+
     elif op == "set_export":
         want = str(args["export_preset"])
         if want not in project_mod.EXPORT_PRESETS:
@@ -1187,8 +1202,23 @@ class ProxyBuilder:
             self.on_change(snapshot)
 
     def start(self) -> None:
+        self._cancelled = False
         self._thread = threading.Thread(target=self._run, name="proxy", daemon=True)
         self._thread.start()
+
+    def restart(self) -> None:
+        """Rebuild whatever is no longer valid, cancelling a build in flight.
+
+        Called when an edit changes what the proxy IS rather than what is drawn over
+        it -- today that is the window-follow toggle, which re-crops every frame. The
+        preview has to be re-encoded or it goes on showing the framing the user just
+        changed, which is the one failure this whole design is meant to prevent.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            self.stop()
+            self._thread.join(timeout=2.0)
+        self._procs.clear()
+        self.start()
 
     def stop(self) -> None:
         self._cancelled = True
@@ -1219,7 +1249,9 @@ class ProxyBuilder:
                 progress=i / len(jobs),
                 message=f"preview proxy: {name} ({i + 1}/{len(jobs)})",
             )
-            if proxy_path(self.bundle, name).exists():
+            if self._cancelled:
+                return
+            if self._fresh(name):
                 continue
             try:
                 if not self._delegate(name):
@@ -1239,6 +1271,24 @@ class ProxyBuilder:
             # the shared module is what the rest of the system uses.
             message="; ".join(problems)[:400],
         )
+
+    def _fresh(self, stream: str) -> bool:
+        """Whether the proxy on disk is still the right proxy.
+
+        Existence alone is not the question. A proxy built under a different crop --
+        an older build, or the follow toggle since flipped -- is a file that plays
+        perfectly and shows the wrong thing, so the fingerprint decides. If the
+        module cannot answer, existence is the fallback: rebuilding every launch
+        would be a worse failure than reusing a proxy that is probably fine.
+        """
+        if not proxy_path(self.bundle, stream).exists():
+            return False
+        try:
+            from . import proxy as proxy_mod
+
+            return not proxy_mod.is_stale(self.bundle, stream)
+        except Exception:
+            return True
 
     def _delegate(self, stream: str) -> bool:
         try:
@@ -1570,12 +1620,31 @@ class Session:
             self._redo.clear()
             apply_op(self.bundle, name, args)
             self.dirty = True
+            if name in self.REFRAME_OPS:
+                self._reframe()
             return self.state(include_zoom_track=name in self.ZOOM_OPS)
+
+    # Ops that change the FRAMING, so the proxy has to be re-encoded rather than
+    # merely redrawn. Undo and redo reach the same setting by another road, which is
+    # why _restore rebuilds too rather than this list being consulted there.
+    REFRAME_OPS = frozenset({"set_follow", "reset"})
+
+    def _reframe(self) -> None:
+        self.bundle._follow_cache = None
+        try:
+            self.proxy.restart()
+        except Exception:
+            # A proxy that will not rebuild is a preview problem, not an edit
+            # problem: the edit is already saved and the export reads the master.
+            pass
 
     def _restore(self, snap: dict) -> None:
         snap = {k: v for k, v in snap.items() if k != "_key"}
+        was = self.bundle.edit.follow_window
         self.bundle.edit = Edit.from_dict(snap)
         self.dirty = True
+        if self.bundle.edit.follow_window != was:
+            self._reframe()
 
     def undo(self) -> dict:
         with self.lock:

@@ -71,16 +71,39 @@ class ProxySpec:
     stamp: Path
 
 
+def _crop_for(bundle: Bundle) -> str | None:
+    """The screen proxy's crop filter, or None.
+
+    Following a window makes this an expression over t rather than a rectangle, and
+    it is BAKED IN here on purpose. The alternative -- leaving the proxy uncropped
+    and panning it in the preview -- would be a second implementation of the export's
+    framing, which is the same hazard as a second copy of its easing: the two agree
+    right up until they do not, and the disagreement surfaces as a preview that is
+    subtly not the video. The cost is a proxy rebuild when the toggle flips, which is
+    visible, honest, and already has a progress overlay.
+    """
+    from . import follow
+
+    plan = follow.for_bundle(bundle)
+    if plan is not None and not plan.static:
+        return f"crop={plan.w}:{plan.h}:x='{plan.x_expr()}':y='{plan.y_expr()}'"
+    if plan is not None:
+        x, y, w, h = plan.rect()
+        return f"crop={w}:{h}:{x}:{y}"
+    crop = bundle.capture.crop_rect()
+    if crop is None:
+        return None
+    x, y, w, h = crop
+    return f"crop={w}:{h}:{x}:{y}"
+
+
 def _filter_for(bundle: Bundle, stream: str) -> str:
     """The proxy's filter chain: the frame, brought down to the proxy width."""
     scale = f"scale='min({PROXY_WIDTH},iw)':-2:flags=bicubic"
     if stream != "screen":
         return scale                      # the camera is never cropped
-    crop = bundle.capture.crop_rect()
-    if crop is None:
-        return scale
-    x, y, w, h = crop
-    return f"crop={w}:{h}:{x}:{y},{scale}"
+    crop = _crop_for(bundle)
+    return f"{crop},{scale}" if crop else scale
 
 
 def _spec(bundle: Bundle, stream: str) -> ProxySpec:
@@ -97,7 +120,7 @@ def _spec(bundle: Bundle, stream: str) -> ProxySpec:
     )
 
 
-def _fingerprint(spec: ProxySpec, crop: tuple[int, int, int, int] | None = None) -> dict:
+def _fingerprint(spec: ProxySpec, crop: str | None = None) -> dict:
     st = spec.source.stat()
     return {
         "source": spec.source.name,
@@ -108,7 +131,12 @@ def _fingerprint(spec: ProxySpec, crop: tuple[int, int, int, int] | None = None)
         # The crop is part of what the proxy IS, so a proxy built before one existed --
         # or under a different one -- has to be rebuilt rather than reused. Without this
         # a bundle recorded by an older build keeps showing the whole monitor.
-        "crop": list(crop) if crop else None,
+        #
+        # The filter STRING rather than a rectangle, so that turning window-following
+        # on or off invalidates the proxy too. A follow is a crop that varies with
+        # time; comparing rectangles could not see the difference, and the preview
+        # would keep showing the framing the user just changed.
+        "crop": crop,
     }
 
 
@@ -117,7 +145,7 @@ def is_stale(bundle: Bundle, stream: str = "screen") -> bool:
     if not spec.dest.exists() or not spec.stamp.exists():
         return True
     try:
-        crop = bundle.capture.crop_rect() if stream == "screen" else None
+        crop = _crop_for(bundle) if stream == "screen" else None
         return json.loads(spec.stamp.read_text()) != _fingerprint(spec, crop)
     except (OSError, ValueError):
         return True
@@ -180,7 +208,7 @@ def ensure_proxy(
     # Replace only once ffmpeg has succeeded: a half-written proxy that looks complete
     # would be reused, and the editor would preview a truncated recording.
     tmp.replace(spec.dest)
-    stamp_crop = bundle.capture.crop_rect() if stream == "screen" else None
+    stamp_crop = _crop_for(bundle) if stream == "screen" else None
     spec.stamp.write_text(json.dumps(_fingerprint(spec, stamp_crop), indent=2) + "\n")
     return spec.dest
 

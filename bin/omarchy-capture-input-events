@@ -2,7 +2,7 @@
 
 # omarchy:summary=Record the cursor and click track beside a screen recording
 # omarchy:group=capture
-# omarchy:args=start <events-dir> [--hz=<n>] [--scale=<n>] [--duration=<sec>] [--with-scroll] [--no-clicks] | stop | mark [<label>] | status | sweep
+# omarchy:args=start <events-dir> [--hz=<n>] [--scale=<n>] [--duration=<sec>] [--with-scroll] [--no-clicks] [--window=<addr>] [--window-title=<t>] | stop | mark [<label>] | status | sweep
 # omarchy:examples=omarchy-capture-input-events start ~/Videos/rec-1/events | omarchy-capture-input-events stop
 #
 # Writes events/cursor.bin and events/input.jsonl. Runs alongside
@@ -67,6 +67,8 @@ cmd_start() {
     --duration=*) args+=(--duration "${arg#*=}") ;;
     --with-scroll) args+=(--with-scroll) ;;
     --no-clicks) args+=(--no-clicks) ;;
+    --window=*) args+=(--window "${arg#*=}") ;;
+    --window-title=*) args+=(--window-title "${arg#*=}") ;;
     *) die "unknown option: $arg" ;;
     esac
   done

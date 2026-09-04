@@ -104,6 +104,12 @@ def windows(clients: list[dict], workspace_id: int | None,
             "title": c.get("title") or c.get("class") or "window",
             "cls": c.get("class", ""),
             "x": x, "y": y, "width": w, "height": h,
+            # The window's IDENTITY, alongside the rectangle it happened to occupy.
+            # A window target is a rectangle snapshot: move the window mid-recording and
+            # the take is of the empty desktop it left behind, silently. Carrying the
+            # address is what lets the recorder follow where it actually went, so the
+            # framing can be decided afterwards instead of hoping nothing moved.
+            "address": str(c.get("address") or ""),
             "target": region_target_from_rect(x, y, w, h),
         })
     return out
@@ -225,7 +231,7 @@ def parse_camera_rect(raw: Any) -> dict[str, int] | None:
 def config(target: str, mic: bool, desktop_audio: bool,
            camera: str, camera_device: str | None,
            countdown: int = 3, mic_device: str | None = None,
-           camera_rect: Any = None) -> dict[str, Any]:
+           camera_rect: Any = None, window: str | None = None) -> dict[str, Any]:
     """The one line bin/omarchy-capture-setup prints, validated.
 
     Keys are always all present (the consumer must not need .get defaults):
@@ -243,6 +249,12 @@ def config(target: str, mic: bool, desktop_audio: bool,
                      absolute logical desktop pixels, or null. Null means "use the
                      WebcamSettings defaults" -- the placement is a preference, and a
                      recording must never fail for want of one.
+      window         the Hyprland address of the window this target was cut from,
+                     or null. A region target is a rectangle, and a rectangle does
+                     not move when the window inside it does -- carrying the address
+                     lets the recorder log where the window actually went, so the
+                     framing stays a decision and not a snapshot. Null for a monitor
+                     or a hand-drawn region: there is no window to follow.
       countdown      whole seconds of on-screen countdown AFTER the line printed.
                      When > 0 the line is emitted the moment Start is pressed so
                      capture init can overlap the countdown; every setup surface
@@ -261,6 +273,15 @@ def config(target: str, mic: bool, desktop_audio: bool,
     # whitespace in it is either not a real name or an injection attempt.
     if mic_device is not None and not re.match(r"^[A-Za-z0-9_.:+-]+$", mic_device):
         raise ValueError(f"bad mic_device: {mic_device!r}")
+    # The address is interpolated into a compositor socket command, so it is
+    # constrained to exactly the shape Hyprland emits and nothing else.
+    if window is not None and not re.match(r"^0x[0-9a-f]{1,16}$", window):
+        raise ValueError(f"bad window address: {window!r}")
+    if window is not None and parsed["kind"] != "region":
+        # Only a region target has an outside to re-frame into. Following a window
+        # on a full-monitor or camera target is meaningless, and silently keeping
+        # the address would make the bundle claim a capability it does not have.
+        window = None
     if parsed["kind"] == "camera":
         # Recording the camera full-frame and overlaying it on itself is not a
         # thing; the setup UI disables the overlay row, and this guard makes the
@@ -278,5 +299,6 @@ def config(target: str, mic: bool, desktop_audio: bool,
         "camera": camera,
         "camera_device": camera_device,
         "camera_rect": rect,
+        "window": window,
         "countdown": countdown,
     }

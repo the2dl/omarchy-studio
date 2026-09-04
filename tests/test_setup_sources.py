@@ -182,7 +182,29 @@ def test_config_has_every_key_always():
                   camera="off", camera_device=None)
     assert c == {"target": "monitor:DP-1", "mic": True, "mic_device": None,
                  "desktop_audio": False, "camera": "off", "camera_device": None,
-                 "camera_rect": None, "countdown": 3}
+                 "camera_rect": None, "window": None, "countdown": 3}
+
+
+def test_a_window_pick_carries_which_window_it_was_cut_from():
+    """The target is a rectangle, and a rectangle does not move when the window
+    inside it does. The address is what lets the recorder log where it went."""
+    c = ss.config("region:800x600+10+20", True, False, "off", None, window="0x5f2a")
+    assert c["window"] == "0x5f2a"
+
+
+def test_a_monitor_target_has_no_window_to_follow():
+    """Only a region has an outside to re-frame into; keeping the address on a
+    full-monitor capture would make the bundle claim a capability it lacks."""
+    assert ss.config("monitor:DP-1", True, False, "off", None,
+                     window="0x5f2a")["window"] is None
+
+
+@pytest.mark.parametrize("bad", ["; rm -rf /", "0xZZZ", "5f2a", "0x" + "a" * 40, ""])
+def test_a_bad_window_address_is_refused(bad):
+    """It is compared against compositor output and rides through a shell, so it is
+    constrained to exactly the shape Hyprland emits."""
+    with pytest.raises(ValueError):
+        ss.config("region:800x600+10+20", True, False, "off", None, window=bad)
 
 
 def test_config_carries_the_countdown():

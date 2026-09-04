@@ -54,7 +54,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
-from omarchy_studio.events import CursorSample, CursorWriter, InputWriter  # noqa: E402
+from omarchy_studio.events import (  # noqa: E402
+    CursorSample,
+    CursorWriter,
+    InputWriter,
+    WindowWriter,
+)
 
 TAG = "OMARCHY-STUDIO-INPUT"  # bind description prefix; the sweep matches on this
 BUTTONS = {"272": "left", "273": "right", "274": "middle"}
@@ -434,6 +439,100 @@ class CursorSampler:
         )
 
 
+
+class WindowSampler:
+    """Polls one window's rectangle and streams the changes to window.jsonl.
+
+    A window target records the whole monitor and crops back to the window's rect.
+    That rect is only true for the instant it was picked -- the user is free to move
+    or resize the window mid-take, and today that silently records the desktop the
+    window left behind. This track is what makes the crop a decision the editor
+    makes afterwards rather than one the picker made in advance.
+
+    Polling, not the event socket: `openwindow`/`movewindow` events say a window
+    moved but not to where, so every event would need this same query anyway, and a
+    poll cannot miss a move it never got told about (a tiling reflow caused by an
+    unrelated window has no event addressed to ours).
+    """
+
+    # A window move is a discrete jump a human made, not a continuous signal. 10Hz
+    # puts the jump within a couple of frames of where it happened, which is finer
+    # than the ease the editor will draw over it anyway, and costs one small query
+    # per tick against the cursor track's 120.
+    DEFAULT_HZ = 10.0
+
+    def __init__(self, sock_path: str, address: str) -> None:
+        self.sock_path = sock_path
+        self.address = address
+
+    def _query(self) -> list[dict]:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(1.0)
+            s.connect(self.sock_path)
+            s.sendall(b"j/clients")
+            chunks: list[bytes] = []
+            while True:
+                b = s.recv(65536)
+                if not b:
+                    break
+                chunks.append(b)
+        finally:
+            s.close()
+        return json.loads(b"".join(chunks) or b"[]")
+
+    def sample(self) -> tuple[int, int, int, int] | None:
+        """The window's rect, or None if it no longer exists.
+
+        Hyprland reports a hidden window (another workspace, or minimised) with its
+        last geometry, so `hidden` is treated as gone: continuing to follow a window
+        the user cannot see would pan the frame to a rectangle showing something
+        else entirely.
+        """
+        for c in self._query():
+            if str(c.get("address") or "") != self.address:
+                continue
+            if c.get("hidden"):
+                return None
+            at, size = c.get("at") or [], c.get("size") or []
+            if len(at) < 2 or len(size) < 2:
+                return None
+            w, h = int(size[0]), int(size[1])
+            if w <= 0 or h <= 0:
+                return None
+            return int(at[0]), int(at[1]), w, h
+        return None
+
+    def run(self, writer: WindowWriter, *, hz: float, stop: threading.Event) -> None:
+        """Sample until `stop`. Never raises: this rides alongside a recording that
+        is already running, and losing the ability to re-frame afterwards must not
+        be able to take the take itself down."""
+        period = 1.0 / hz if hz > 0 else 0.1
+        gone_marked = False
+        while True:
+            try:
+                rect = self.sample()
+            except (OSError, ValueError):
+                # A query that failed says nothing about the window -- the socket
+                # was busy. Skipping the tick is right; writing `gone` here would
+                # invent a disappearance the editor would then have to honour.
+                if stop.wait(period):
+                    return
+                continue
+            if rect is None:
+                if not gone_marked:
+                    writer.gone(mono_us())
+                    gone_marked = True
+            else:
+                # A window that comes back (workspace switched away and back) resumes
+                # the track; the `gone` marker already in the file stands as the record
+                # of the gap, and the reader holds the last rect across it.
+                gone_marked = False
+                writer.sample(mono_us(), *rect)
+            if stop.wait(period):
+                return
+
+
 # --- entry point ------------------------------------------------------------
 
 
@@ -446,8 +545,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--duration", type=float, default=None, help="stop after N seconds")
     ap.add_argument("--no-clicks", action="store_true")
     ap.add_argument("--with-scroll", action="store_true")
+    ap.add_argument("--window", default=None, metavar="ADDRESS",
+                    help="also track this Hyprland window's rectangle into "
+                         "window.jsonl, so the crop can follow it in the editor")
+    ap.add_argument("--window-title", default="", help="label for the tracked window")
+    ap.add_argument("--window-hz", type=float, default=WindowSampler.DEFAULT_HZ)
     ap.add_argument("--stats-json", default=None, help="write the rate/jitter report here")
     a = ap.parse_args(argv)
+    if a.window is not None and not re.match(r"^0x[0-9a-f]{1,16}$", a.window):
+        # This is interpolated into nothing and compared as a string, but a bad
+        # address means the caller's plumbing is wrong, and a window track that
+        # silently matches no window is worse than a refusal.
+        ap.error(f"bad --window address: {a.window!r}")
 
     events = Path(a.events_dir)
     events.mkdir(parents=True, exist_ok=True)
@@ -491,6 +600,7 @@ def main(argv: list[str] | None = None) -> int:
             inputs.chapter(t_us, code)
 
     tail: SpoolTail | None = None
+    windows: WindowWriter | None = None
     stats: SampleStats | None = None
     swept: list[str] = []
     try:
@@ -504,6 +614,17 @@ def main(argv: list[str] | None = None) -> int:
             ).start()
         tail = SpoolTail(spool, on_input)
         tail.start()
+
+        if a.window:
+            # Daemon thread: the cursor sampler owns the lifetime, and `stop` is
+            # already set in the finally below before window.close() runs.
+            windows = WindowWriter(events / "window.jsonl")
+            windows.meta(address=a.window, title=a.window_title, hz=a.window_hz)
+            threading.Thread(
+                target=WindowSampler(sock_path, a.window).run,
+                kwargs={"writer": windows, "hz": a.window_hz, "stop": stop},
+                daemon=True,
+            ).start()
 
         # Anchoring metadata. Both clocks are stamped together so these events can be
         # lined up with gsr's -write-first-frame-ts sidecar, which carries the same pair.
@@ -527,6 +648,8 @@ def main(argv: list[str] | None = None) -> int:
             tail.join(timeout=1.0)
             tail.drain()  # a click in the last millisecond is still a click
         cursor.close()
+        if windows is not None:
+            windows.close()
         cleanup()
         spool.unlink(missing_ok=True)
 
@@ -535,6 +658,7 @@ def main(argv: list[str] | None = None) -> int:
         "events": tail.count if tail else 0,
         "cursor_bytes": (events / "cursor.bin").stat().st_size,
         "swept_stale_binds": len(swept),
+        "window_track": a.window or None,
     }
     inputs.meta(t_us=mono_us(), event="end", **report)
     inputs.close()

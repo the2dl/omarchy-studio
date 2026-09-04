@@ -665,6 +665,21 @@ start_screenrecording() {
     fi
   fi
 
+  # A WINDOW target records its monitor too, and for a different reason than the
+  # self-view: gsr cannot follow a window on Wayland (`-w window` is X11 only), so a
+  # window pick is a rectangle frozen at pick time. Move the window afterwards and the
+  # take is of the desktop it left behind, unrecoverably. Keeping the monitor means the
+  # window's own track (events/window.jsonl) can re-frame it at export, and the pixels
+  # to pan into are actually on disk.
+  #
+  # This stays on KMS, so it does NOT cost the portal's 30fps -- only disk. The portal
+  # is still taken when a self-view forces it, and that decision is already made above.
+  if [[ -n ${SETUP_WINDOW:-} && -z $SOURCE_LOGICAL && $target == region:* ]]; then
+    SOURCE_LOGICAL=$(monitor_logical_geometry)
+    [[ -n $SOURCE_LOGICAL ]] ||
+      trail "window: no monitor geometry for $MONITOR_NAME; framing will be fixed"
+  fi
+
   begin_output=$(studio_capture begin \
     --root "$OUTPUT_DIR/screenrecording-$(date +'%Y-%m-%d_%H-%M-%S')" \
     --logical "$LOGICAL_GEOMETRY" \
@@ -682,7 +697,11 @@ start_screenrecording() {
   [[ -n $BUNDLE && -n $CAPTURE_SIZE ]] || return 1
 
   # gsr's -region flag is deprecated in 6.0.1; region geometry goes straight to -w.
-  local capture_args=(-w "${target#*:}" -s "${RESOLUTION:-$CAPTURE_SIZE}")
+  # Unless we are streaming more than the frame, in which case -w is the MONITOR and
+  # the frame is carved back out at export, from SOURCE_CROP.
+  local capture_w="${target#*:}"
+  [[ -n $SOURCE_LOGICAL && -n $MONITOR_NAME ]] && capture_w="$MONITOR_NAME"
+  local capture_args=(-w "$capture_w" -s "${RESOLUTION:-$CAPTURE_SIZE}")
   local capture_backend="kms" verbose_args=()
   local capture_fps="$FRAMERATE"
   if [[ $self_view_mode == "exclude" || $self_view_mode == "exclude-crop" ]]; then
@@ -784,7 +803,12 @@ start_screenrecording() {
   # logical pixels and the video is physical -- the daemon cannot read it off the
   # compositor later without risking a different answer than the one in capture.json.
   if command -v omarchy-capture-input-events >/dev/null; then
-    omarchy-capture-input-events start "$BUNDLE/events" --scale="$MONITOR_SCALE" >>"$LOG_FILE" 2>&1 ||
+    local window_args=()
+    # Only a window pick has an address. The track it produces is what lets the
+    # editor re-frame a window that moved, so it costs one 10Hz query per second
+    # and is worth it exactly when there is a window to lose track of.
+    [[ -n ${SETUP_WINDOW:-} ]] && window_args=(--window="$SETUP_WINDOW")
+    omarchy-capture-input-events start "$BUNDLE/events" --scale="$MONITOR_SCALE" "${window_args[@]}" >>"$LOG_FILE" 2>&1 ||
       echo "input events failed to start" >>"$LOG_FILE"
   fi
 

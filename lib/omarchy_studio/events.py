@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import json
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .project import Capture
@@ -67,6 +67,7 @@ _FLAG_HAS_FIRST = 0x01  # t0_us/x0/y0 hold a real sample rather than placeholder
 _FLAG_FINALIZED = 0x02  # close() ran, so `count` is authoritative
 
 INPUT_SCHEMA = 1
+WINDOW_SCHEMA = 1
 
 
 class EventsError(RuntimeError):
@@ -520,3 +521,144 @@ def map_clicks(
 def clicks_to_frames(clicks: list[Click], capture: Capture, tb: Timebase) -> list[int]:
     """Source-timeline frame index of each click, in input order."""
     return [m.frame for m in map_clicks(clicks, capture, tb)]
+
+
+# --- window track -----------------------------------------------------------
+#
+# A window target is recorded as a monitor plus a rectangle to crop back to. The
+# rectangle is a snapshot of where the window was when the user picked it, and a
+# window is free to move afterwards -- so the crop has to be a track, not a number.
+#
+# Unlike the cursor, a window rect is a step function: it holds still for seconds
+# and then jumps. Sampling it into a fixed-rate binary track would spend thousands
+# of samples restating "it did not move", so this track stores CHANGES, and the
+# reader holds the last value between them. The sampler still polls at a fixed rate;
+# what the rate buys is the resolution of the jump, not a row per tick.
+
+
+@dataclass(frozen=True)
+class WindowSample:
+    t_us: int
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+@dataclass
+class WindowTrack:
+    """Where the followed window was, over the life of the recording.
+
+    `gone_us` is when the window stopped existing (closed, or moved to another
+    workspace), or None if it outlived the recording. It is kept apart from the
+    samples because "the window is gone" and "the window is where it last was"
+    have to stay distinguishable: a follow that keeps panning to a dead window's
+    last rect is a bug, and one that snaps to the origin is a worse one.
+    """
+
+    address: str = ""
+    title: str = ""
+    hz: float = 0.0
+    samples: list[WindowSample] = field(default_factory=list)
+    gone_us: int | None = None
+
+    def rect_at(self, t_us: int) -> tuple[int, int, int, int] | None:
+        """The window's rect at `t_us`, holding the last sample forward.
+
+        None only when the track is empty or `t_us` precedes the first sample --
+        never for a t_us past the end, where the answer is "wherever it last was".
+        A closed window is NOT None either; `gone_us` says that, and the caller
+        decides whether to keep framing the space it left.
+        """
+        if not self.samples or t_us < self.samples[0].t_us:
+            return None
+        lo, hi = 0, len(self.samples) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.samples[mid].t_us <= t_us:
+                lo = mid
+            else:
+                hi = mid - 1
+        s = self.samples[lo]
+        return (s.x, s.y, s.w, s.h)
+
+    @property
+    def moved(self) -> bool:
+        """Whether the window ever changed rect. A track with one sample is the
+        common case -- nothing moved -- and the editor should not offer to animate
+        a crop that would sit perfectly still."""
+        return len(self.samples) > 1
+
+
+class WindowWriter:
+    """Append-only writer for window.jsonl, emitting only on change.
+
+    Line-buffered like InputWriter, for the same reason: the editor may read this
+    while the recording is still going.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._fh = self.path.open("a", buffering=1)
+        self._last: tuple[int, int, int, int] | None = None
+
+    def _emit(self, obj: dict) -> None:
+        self._fh.write(json.dumps(obj, separators=(",", ":")) + "\n")
+
+    def meta(self, *, address: str, title: str, hz: float) -> None:
+        self._emit({"type": "meta", "schema": WINDOW_SCHEMA,
+                    "address": address, "title": title, "hz": round(hz, 3)})
+
+    def sample(self, t_us: int, x: int, y: int, w: int, h: int) -> bool:
+        """Record the rect. Returns whether it was actually written, so a caller
+        can count real motion rather than ticks."""
+        rect = (x, y, w, h)
+        if rect == self._last:
+            return False
+        self._last = rect
+        self._emit({"t_us": int(t_us), "x": x, "y": y, "w": w, "h": h})
+        return True
+
+    def gone(self, t_us: int) -> None:
+        self._emit({"t_us": int(t_us), "type": "gone"})
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+
+    def __enter__(self) -> "WindowWriter":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def read_window_track(path: str | Path) -> WindowTrack:
+    """Parse window.jsonl. A missing file is an empty track, not an error: most
+    recordings have no window to follow, and the editor asks unconditionally."""
+    track = WindowTrack()
+    for ev in read_events(path):
+        kind = ev.get("type")
+        if kind == "meta":
+            track.address = str(ev.get("address") or "")
+            track.title = str(ev.get("title") or "")
+            try:
+                track.hz = float(ev.get("hz") or 0.0)
+            except (TypeError, ValueError):
+                track.hz = 0.0
+            continue
+        if kind == "gone":
+            try:
+                track.gone_us = int(ev["t_us"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            continue
+        try:
+            track.samples.append(WindowSample(
+                int(ev["t_us"]), int(ev["x"]), int(ev["y"]), int(ev["w"]), int(ev["h"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    track.samples.sort(key=lambda s: s.t_us)
+    return track

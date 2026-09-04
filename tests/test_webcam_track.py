@@ -384,3 +384,37 @@ def test_dragging_through_a_neighbour_cannot_create_an_overlap(tmp_path):
                            {"id": mid.id, "start_ms": start * ms, "end_ms": end * ms})
         spans = sorted((l.t.start, l.t.end) for l in b.edit.layers)
         assert all(spans[i][1] <= spans[i + 1][0] for i in range(len(spans) - 1)), spans
+
+
+@needs_ffmpeg
+def test_every_op_can_target_the_implicit_segment(tmp_path):
+    """The full-width block on an untouched track is a real id to the UI and not a
+    stored layer, so anything resolving it by id raised `no layer 'webcam'`.
+
+    This was fixed in set_webcam alone the first time; update_layer and delete_layer
+    kept the hole, and a user hit it by CLICKING the block -- a click carrying a pixel
+    of hand movement commits a drag through update_layer. Materialization happens once
+    at the top of apply_op now, so a fourth op cannot reintroduce it.
+    """
+    for op, extra in (("update_layer", {"start_ms": 0.0, "end_ms": 400.0}),
+                      ("delete_layer", {}),
+                      ("set_webcam", {"shape": "rect"}),
+                      ("update_layer", {"opacity": 0.5})):
+        root = tmp_path / f"implicit-{op}-{len(extra)}"
+        synthetic.make_bundle(root, seconds=3.0, width=320, height=180)
+        b = Bundle(root)
+        seg_id = qmlbridge.project_state(b)["webcam_track"]["segments"][0]["id"]
+        assert b.edit.layers == [], "the implicit segment must not be stored until used"
+        qmlbridge.apply_op(b, op, dict(extra, id=seg_id))   # must not raise
+
+
+@needs_ffmpeg
+def test_looking_at_a_track_does_not_store_it(tmp_path):
+    """The counterpart: reading state must leave edit.json alone, or merely opening a
+    recording would mark it dirty."""
+    root = tmp_path / "readonly"
+    synthetic.make_bundle(root, seconds=2.0, width=320, height=180)
+    b = Bundle(root)
+    for _ in range(3):
+        qmlbridge.project_state(b)
+    assert b.edit.layers == []

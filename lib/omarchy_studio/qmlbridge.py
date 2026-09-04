@@ -234,6 +234,25 @@ def resolve_backdrop(bundle: Bundle) -> dict:
     return d
 
 
+def _materialize_implicit_camera(bundle: Bundle, layer_id: Any) -> None:
+    """Store the implicit camera segment if `layer_id` names it.
+
+    webcam_segments() reports a whole-take segment for a track nobody has split, and
+    deliberately does NOT store it -- opening a recording must not dirty it. That id is
+    real to the timeline, which hands it straight back to the bridge, so it has to
+    become a real layer the moment anything acts on it. No-op for every other id.
+    """
+    if not layer_id or not _camera_is_editable(bundle):
+        return
+    wanted = str(layer_id)
+    if any(l.id == wanted for l in bundle.edit.layers):
+        return
+    total = _safe_source_frames(bundle)
+    if any(s.id == wanted
+           for s in _layers.webcam_segments(bundle.edit, bundle.canvas, total)):
+        _layers.materialize_webcam(bundle.edit, bundle.canvas, total)
+
+
 def _camera_is_editable(bundle: Bundle) -> bool:
     """Whether the camera can be moved at all -- the one rule, stated once.
 
@@ -656,6 +675,14 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         x, y, w, h = _geom(args["rect"], "width", "height")
         return placement_from_rect(x, y, w, h, canvas, args.get("anchor", "top-left"))
 
+    # An untouched camera track is ONE implicit segment that the UI can see and select
+    # but that is not a stored layer, so every op resolving it by id raised
+    # `no layer 'webcam'`. Fixed once here rather than per-op: it was patched in
+    # set_webcam alone and update_layer and delete_layer kept the same hole, which is
+    # what a user hit by clicking the full-width block -- a click carrying a pixel of
+    # movement commits a drag through update_layer.
+    _materialize_implicit_camera(bundle, args.get("id"))
+
     if op == "set_webcam" and args.get("id"):
         # A segment is selected, so the panel is editing THAT segment rather than the
         # whole-take default. Same field names either way, so the panel does not need a
@@ -665,10 +692,6 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             # with no camera at all, could still be given a camera track that the
             # renderer has no stream to fill.
             raise BridgeError("this recording's camera cannot be moved")
-        # Before the lookup: the implicit whole-take segment is a real id to the UI but
-        # not yet a stored layer, so selecting an untouched camera and touching any
-        # control raised `no layer 'webcam'`.
-        _layers.materialize_webcam(edit, canvas, _safe_source_frames(bundle))
         layer = _find_layer(edit.layers, str(args["id"]))
         if layer.type != "webcam":
             raise BridgeError(f"layer {layer.id!r} is not a camera segment")

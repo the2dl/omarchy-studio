@@ -826,11 +826,18 @@ Item {
                             anchors.rightMargin: block.grip
                             cursorShape: pressed ? Qt.ClosedHandCursor : Qt.PointingHandCursor
                             property int grabF: 0
+                            property real grabX: 0
                             property int origF0: 0
                             property int origF1: 0
                             property bool dragged: false
+                            // In PIXELS, not frames. Keyed off the frame delta, a click
+                            // carrying one pixel of hand movement counted as a drag --
+                            // zoomed out, one pixel is several frames -- so selecting a
+                            // segment nudged it instead, and committed the nudge.
+                            readonly property real dragThreshold: 4
                             onPressed: function (mouse) {
                                 grabF = block.frameAt(bodyMa, mouse.x)
+                                grabX = bodyMa.mapToItem(camLane, mouse.x, 0).x
                                 origF0 = block.f0
                                 origF1 = block.f1
                                 dragged = false
@@ -838,9 +845,10 @@ Item {
                             onPositionChanged: function (mouse) {
                                 if (!pressed)
                                     return
-                                var d = block.frameAt(bodyMa, mouse.x) - grabF
-                                if (d === 0 && !dragged)
+                                var nowX = bodyMa.mapToItem(camLane, mouse.x, 0).x
+                                if (!dragged && Math.abs(nowX - grabX) < dragThreshold)
                                     return
+                                var d = block.frameAt(bodyMa, mouse.x) - grabF
                                 dragged = true
                                 var len = origF1 - origF0
                                 var s = Math.max(block.minStart,

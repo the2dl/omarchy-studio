@@ -159,13 +159,41 @@ Rectangle {
         }
     }
 
+    // Measures the widest menu label, so the menu can be as wide as its longest row.
+    // The captions row reports WHY captions are unavailable -- text decided at runtime
+    // -- so no constant written here can be right for it, and "Captions - transcribe
+    // first" ran straight off a card sized for "Redact".
+    //
+    // A hidden column of the same Texts rather than one TextMetrics reassigned in a
+    // loop: writing to a property the binding also reads makes Qt call it a binding
+    // loop, which it warns about and is entitled to re-evaluate oddly. And OUTSIDE the
+    // menu, because a sizer inside the column would be a child whose width the column
+    // measures -- the circle this exists to avoid.
+    Column {
+        id: menuSizer
+        visible: false
+        Repeater {
+            model: menuCol.items
+            Text {
+                required property var modelData
+                text: modelData.label
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsRow
+            }
+        }
+    }
+
     // The add menu (spec §2a: Image, Text, Shape, Redact). A hand-rolled popup rather
     // than Controls' Menu, whose default style fights every token this app has.
     Popup {
         id: addMenu
         x: parent.width - width - 8
         y: header.height - 2
-        width: 150
+        // The widest label sets the width. It was a hard 150 against rows hard-coded
+        // to 140, so "Captions - transcribe first" -- whose text is not fixed, it
+        // reports why captions are unavailable -- ran straight off the card. A label
+        // that changes at runtime cannot be sized by a constant written at build time.
+        width: menuCol.implicitWidth + leftPadding + rightPadding
         padding: 5
         background: Rectangle {
             radius: Theme.radiusRow
@@ -174,18 +202,25 @@ Rectangle {
             border.color: Theme.hairline
         }
         contentItem: Column {
+            id: menuCol
             spacing: 1
+
+            readonly property var items: [
+                { label: "Image…", act: "image" },
+                { label: "Text", act: "text" },
+                { label: "Shape", act: "shape" },
+                { label: "Redact", act: "redact" },
+                { label: root.captionLabel, act: "captions" }
+            ]
+
             Repeater {
-                model: [
-                    { label: "Image…", act: "image" },
-                    { label: "Text", act: "text" },
-                    { label: "Shape", act: "shape" },
-                    { label: "Redact", act: "redact" },
-                    { label: root.captionLabel, act: "captions" }
-                ]
+                model: menuCol.items
                 delegate: Rectangle {
                     required property var modelData
-                    width: 140
+                    // Equal-width rows, sized by the widest of them, so the hover fill
+                    // is a full-width band rather than ragged per row -- the same rule
+                    // Segmented follows for its chips.
+                    width: Math.max(menuSizer.implicitWidth + 20, 140)
                     height: 28
                     radius: Theme.radiusChip
                     color: itemMa.containsMouse ? Theme.fillHover : "transparent"
@@ -554,7 +589,10 @@ Rectangle {
         x: 10
         y: parent.height - height - 12
         width: parent.width - 20
-        height: 86
+        // From the content, not a number. It was a hard 86 chosen for a glyph and two
+        // lines; a third line then had to fit inside it and the card went cramped
+        // instead of growing. Now a line can be added or removed and the card follows.
+        height: dropCol.implicitHeight + 2 * 15
         radius: 11
         color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b,
                        dropArea.containsDrag ? 0.12 : 0.05)
@@ -564,6 +602,7 @@ Rectangle {
         Behavior on color { ColorAnimation { duration: Theme.durFast } }
 
         Column {
+            id: dropCol
             anchors.centerIn: parent
             spacing: 7
             Text {   // nf-fa-image

@@ -19,6 +19,7 @@ These run headless (QT_QPA_PLATFORM=offscreen) and leave no window behind.
 from __future__ import annotations
 
 import json
+import re
 import os
 import subprocess
 import sys
@@ -323,3 +324,32 @@ def test_every_rail_tool_has_a_tooltip():
     assert tips, "the rail model no longer parses; this guard has gone vacuous"
     for tool, tip in tips.items():
         assert tip.strip(), f"rail tool {tool!r} has no tooltip"
+
+
+def test_the_layer_list_cards_are_sized_from_their_content():
+    """Both of these were constants, and both outgrew them.
+
+    The drop panel's height was 86, chosen for a glyph and two lines, so a third line
+    made it cramped rather than making it taller. The add menu's width was 150 against
+    rows pinned to 140, so "Captions — transcribe first" -- whose text is chosen at
+    runtime, since it reports WHY captions are unavailable -- ran off the card.
+
+    A pixel constant cannot be right for content that changes, so this asserts they are
+    expressions rather than asserting any particular number.
+    """
+    src = (REPO / "editor" / "LayerList.qml").read_text()
+
+    drop = re.search(r"id:\s*drop\b.*?radius:", src, re.S)
+    assert drop, "the drop panel no longer parses; this guard has gone vacuous"
+    assert re.search(r"height:\s*dropCol\.implicitHeight", drop.group(0)), \
+        "the drop card is back to a fixed height and will crop its own content"
+
+    menu = re.search(r"id:\s*addMenu\b.*?padding:", src, re.S)
+    assert menu, "the add menu no longer parses; this guard has gone vacuous"
+    assert re.search(r"width:\s*menuCol\.implicitWidth", menu.group(0)), \
+        "the add menu is back to a fixed width and will clip its longest label"
+
+    # The sizer has to stay OUTSIDE the column it measures, or the column measures it.
+    sizer = src.index("id: menuSizer")
+    col = src.index("id: menuCol")
+    assert sizer < col, "menuSizer moved inside the menu it measures"

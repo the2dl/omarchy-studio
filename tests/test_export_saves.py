@@ -129,3 +129,58 @@ def test_a_failed_save_still_lets_the_window_close(session, monkeypatch, capsys)
         assert session.quit_requested.is_set()
     finally:
         srv.shutdown()
+
+
+# --- and it shows you the file when it lands ---------------------------------
+
+
+def _finished(session, returncode: int, monkeypatch, hook=None) -> list:
+    """Drive Exporter._pump against a stub renderer that exits `returncode`."""
+    revealed: list = []
+    monkeypatch.setattr(qmlbridge.reveal_mod, "reveal",
+                        hook or (lambda p: revealed.append(str(p))))
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.returncode = returncode
+            self.stdout = iter(["frame=1\n", "progress=end\n"])
+            self.stderr = _Err()
+
+        def wait(self) -> None:
+            pass
+
+    class _Err:
+        def read(self) -> str:
+            return "boom" if returncode else ""
+
+    session.exporter._proc = FakeProc()
+    session.exporter._set(state="running", output="/tmp/out.mp4")
+    session.exporter._pump(1)
+    return revealed
+
+
+def test_a_finished_export_opens_the_folder(session, monkeypatch):
+    """The convention everywhere else, and the reason it is on by default."""
+    assert _finished(session, 0, monkeypatch) == ["/tmp/out.mp4"]
+    assert session.exporter.snapshot()["state"] == "done"
+
+
+def test_a_failed_export_opens_nothing(session, monkeypatch):
+    assert _finished(session, 1, monkeypatch) == []
+    assert session.exporter.snapshot()["state"] == "error"
+
+
+def test_reveal_can_be_turned_off(session, monkeypatch):
+    """A batch export opening a file manager per file would be an assault."""
+    session.exporter.reveal_on_done = False
+    assert _finished(session, 0, monkeypatch) == []
+    assert session.exporter.snapshot()["state"] == "done"
+
+
+def test_the_export_is_done_before_anything_is_opened(session, monkeypatch):
+    """A file manager that failed to open must not make a finished export look
+    unfinished, so `done` is set first and reveal never touches the state."""
+    seen: list = []
+    _finished(session, 0, monkeypatch,
+              hook=lambda p: seen.append(session.exporter.snapshot()["state"]))
+    assert seen == ["done"]

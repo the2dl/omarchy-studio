@@ -38,6 +38,7 @@ from . import backgrounds
 from . import cursor as _cursor_mod
 from . import events as _events
 from . import follow
+from . import reveal as reveal_mod
 from . import layers as _layers
 from . import zoom as _zoom
 from . import project as project_mod
@@ -1381,6 +1382,11 @@ class Exporter:
 
     MODULE = "omarchy_studio.render"
 
+    # Opening the folder when a render lands is the convention everywhere else and
+    # the reason it is on by default. Off is one attribute away for a caller that is
+    # exporting in a batch, where a file manager per file would be an assault.
+    reveal_on_done = True
+
     def __init__(self, bundle: Bundle, repo_root: Path) -> None:
         self.bundle = bundle
         self.repo_root = repo_root
@@ -1483,7 +1489,14 @@ class Exporter:
         if self.snapshot()["state"] == "cancelled":
             return
         if p.returncode == 0:
-            self._set(state="done", progress=1.0, message=f"wrote {self.snapshot()['output']}")
+            out = self.snapshot()["output"]
+            self._set(state="done", progress=1.0, message=f"wrote {out}")
+            # Show the user the file. Only on success, and only after `done` is set --
+            # a file manager that failed to open must not be able to make a finished
+            # export look unfinished, so reveal() swallows its own failures and this
+            # never touches the state again.
+            if self.reveal_on_done:
+                reveal_mod.reveal(out)
         else:
             tail = [l for l in err.splitlines() if l.strip()][-3:]
             self._set(state="error", message=" / ".join(tail) or f"renderer exited {p.returncode}")

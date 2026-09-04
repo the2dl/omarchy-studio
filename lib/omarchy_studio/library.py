@@ -36,6 +36,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from . import reveal as reveal_mod
+
 # Flat files with these suffixes are clips from the previous recorder. It only ever
 # wrote .mp4, but a hand-remuxed copy should not vanish from the list for its container.
 CLIP_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm"}
@@ -478,10 +480,11 @@ class Session:
                 _spawn(["xdg-open", e["playable"]])
                 return {"ok": True}
             if name == "reveal":
+                # Shared with the exporter's reveal-on-done: one answer to "show me
+                # this file", so the library and the editor cannot open different
+                # file managers on the same machine.
                 e = self._entry(args["path"])
-                p = Path(e["path"])
-                _spawn(["xdg-open", str(p if p.is_dir() else p.parent)])
-                return {"ok": True}
+                return {"ok": True, "how": reveal_mod.reveal(e["path"])}
             if name == "locate":
                 return self._locate(args["path"], args["source"])
             if name == "record":

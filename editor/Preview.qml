@@ -112,6 +112,24 @@ Item {
     // difference between these and the payload is the whole class of bugs where a
     // binding is silently overridden -- anchors.fill on a transformed item does exactly
     // that, with no warning -- so the self-test asserts on these, not on the payload.
+    // The segment covering the playhead, or null when the camera is off here.
+    // Binding the overlay to the GLOBAL setting meant the preview showed one bubble in
+    // one place for the whole take while the export followed the track -- the editor and
+    // the export disagreeing, which is the failure this project treats as the worst kind.
+    //
+    // ON ROOT, not inside `content`. Declared down there, `root.camNow` was undefined at
+    // every use: `visible: undefined !== null` is true, so the bubble stayed on through
+    // the gaps and the merge below always fell back to the global. QML raises nothing
+    // for a missing property on an id that exists -- the selftest's appliedWebcamRect,
+    // which reads the real overlay item, is what caught it.
+    readonly property var camSegments: st.webcam_track ? st.webcam_track.segments : []
+    readonly property var camNow: {
+        for (var i = 0; i < camSegments.length; ++i)
+            if (frame >= camSegments[i].start && frame < camSegments[i].end)
+                return camSegments[i]
+        return null
+    }
+
     readonly property var appliedWebcamRect: ({
         x: webcam.x, y: webcam.y, width: webcam.width, height: webcam.height,
         visible: webcam.visible, shape: webcam.cam.shape || ""
@@ -492,20 +510,6 @@ Item {
                                   function () { if (item) item.commitDone() })
                     }
                 }
-            }
-
-            // The segment covering the playhead, or null when the camera is off here.
-            // Binding this to the GLOBAL setting meant the preview showed one bubble in
-            // one place for the whole take while the export followed the track -- the
-            // editor and the export disagreeing, which is the failure this project
-            // treats as the worst kind.
-            readonly property var camSegments:
-                root.st.webcam_track ? root.st.webcam_track.segments : []
-            readonly property var camNow: {
-                for (var i = 0; i < camSegments.length; ++i)
-                    if (root.frame >= camSegments[i].start && root.frame < camSegments[i].end)
-                        return camSegments[i]
-                return null
             }
 
             WebcamOverlay {

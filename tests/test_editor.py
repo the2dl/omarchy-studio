@@ -27,7 +27,9 @@ from pathlib import Path
 import pytest
 import synthetic
 
+from omarchy_studio import layers as layers_mod
 from omarchy_studio.geometry import Canvas, Placement, Zoom
+from omarchy_studio.timebase import FrameRange
 from omarchy_studio.project import Bundle
 
 REPO = Path(__file__).resolve().parents[1]
@@ -276,3 +278,30 @@ def test_qmldir_declares_both_singletons_and_no_module():
     assert "singleton Theme 1.0 Theme.qml" in lines
     assert "singleton Bridge 1.0 Bridge.qml" in lines
     assert not any(l.startswith("module ") for l in lines)
+
+
+def test_the_overlay_follows_the_camera_track_not_the_global_setting(tmp_path):
+    """The preview must show what the export will render, segment by segment.
+
+    Bound to the global setting it showed one bubble in one place for the whole take
+    while the export followed the track -- and it read as working, because the bubble
+    WAS on screen and WAS in a plausible place. The first fix for this declared its
+    properties inside `content` while reading them as `root.camNow`: QML raises nothing
+    for a missing property on an id that exists, so `visible: undefined !== null` stayed
+    true and the merge silently fell back to the global. This assertion, off the real
+    overlay item, is what caught that.
+    """
+    root = synthetic.make_bundle(tmp_path / "seg", media=False)
+    bundle = Bundle(root)
+    layers_mod.split_webcam(bundle.edit, bundle.canvas, 60, 20)
+    later = next(l for l in bundle.edit.layers if l.t.start == 20)
+    later.t = FrameRange(40, 60)          # leaves frames 20..39 with no camera
+    later.x, later.y = 0.02, 0.70
+    bundle.save_edit()
+
+    inside = selftest_fields(run_editor(root, "--no-proxy", "--frame", "45").stderr)
+    assert inside["webcamRect"]["visible"] is True
+    assert inside["webcamRect"]["x"] == pytest.approx(0.02 * 1280, abs=1.5)
+
+    gap = selftest_fields(run_editor(root, "--no-proxy", "--frame", "30").stderr)
+    assert gap["webcamRect"]["visible"] is False

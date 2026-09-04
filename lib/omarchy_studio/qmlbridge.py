@@ -883,7 +883,14 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             # silently dropping, and the UI shows it as pending rather than active.
             layer.props["follow_window"] = bool(args["follow_window"])
         if "start_ms" in args or "end_ms" in args:
-            layer.t = _range_from_ms(tb, args.get("start_ms"), args.get("end_ms"))
+            want = _range_from_ms(tb, args.get("start_ms"), args.get("end_ms"))
+            if want is not None and layer.type == "webcam":
+                # Two cameras on screen at once is not something the pipeline draws, and
+                # add_webcam_segment already refuses it -- so a trim must not be the one
+                # way in. The timeline clamps as you drag; this makes it true anyway.
+                want = _layers.clamp_webcam_range(
+                    edit, layer, want, _safe_source_frames(bundle))
+            layer.t = want
 
     elif op == "delete_layer":
         victim = _find_layer(edit.layers, args["id"])

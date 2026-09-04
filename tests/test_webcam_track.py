@@ -317,3 +317,70 @@ def test_a_segments_size_follows_its_own_shape_not_the_global_one(tmp_path):
     qmlbridge.apply_op(b, "set_webcam", {"id": seg_id, "size": 0.3})
     seg = b.edit.layers[0]
     assert round(seg.w * 640) == round(seg.h * 360)
+
+
+# --- trimming and moving -----------------------------------------------------
+
+
+def _three(total=90):
+    e = Edit()
+    layers_mod.split_webcam(e, CANVAS, total, 30)
+    layers_mod.split_webcam(e, CANVAS, total, 60)
+    return e
+
+
+def test_a_trim_stops_at_the_previous_segment():
+    """Clamped rather than refused: a drag has an obvious nearest legal position, and
+    refusing on release would snap the segment back and read as being ignored."""
+    e = _three()
+    mid = next(l for l in e.layers if l.t.start == 30)
+    got = layers_mod.clamp_webcam_range(e, mid, FrameRange(5, 60), 90)
+    assert (got.start, got.end) == (30, 60)
+
+
+def test_a_trim_stops_at_the_next_segment():
+    e = _three()
+    mid = next(l for l in e.layers if l.t.start == 30)
+    got = layers_mod.clamp_webcam_range(e, mid, FrameRange(30, 90), 90)
+    assert (got.start, got.end) == (30, 60)
+
+
+def test_a_move_into_a_free_gap_is_left_alone():
+    e = Edit()
+    layers_mod.split_webcam(e, CANVAS, 90, 30)
+    tail = next(l for l in e.layers if l.t.start == 30)
+    layers_mod.drop_webcam_segment(e, tail.id)
+    head = e.layers[0]
+    got = layers_mod.clamp_webcam_range(e, head, FrameRange(40, 70), 90)
+    assert (got.start, got.end) == (40, 70)
+
+
+def test_the_clamp_always_returns_a_legal_range():
+    """FrameRange refuses an inverted range in its constructor, so the clamp can never
+    be handed one -- but it CAN be squeezed by neighbours on both sides, and it still
+    has to produce something FrameRange will accept."""
+    e = _three()
+    mid = next(l for l in e.layers if l.t.start == 30)
+    for want in (FrameRange(31, 32), FrameRange(30, 60), FrameRange(1, 89)):
+        got = layers_mod.clamp_webcam_range(e, mid, want, 90)
+        assert got.end > got.start
+        assert got.start >= 30 and got.end <= 60
+
+
+@needs_ffmpeg
+def test_dragging_through_a_neighbour_cannot_create_an_overlap(tmp_path):
+    """The invariant belongs to the MODEL, not the timeline. add_webcam_segment already
+    refused overlaps, so a trim must not be the one way to make one -- the bridge is
+    driven by scripts and tests as well as by the row."""
+    root = tmp_path / "drag"
+    synthetic.make_bundle(root, seconds=3.0, width=320, height=180)
+    b = Bundle(root)
+    layers_mod.split_webcam(b.edit, b.canvas, 90, 30)
+    layers_mod.split_webcam(b.edit, b.canvas, 90, 60)
+    ms = 1000.0 / b.timebase.fps
+    mid = next(l for l in b.edit.layers if l.t.start == 30)
+    for start, end in ((5, 60), (30, 90), (0, 90)):
+        qmlbridge.apply_op(b, "update_layer",
+                           {"id": mid.id, "start_ms": start * ms, "end_ms": end * ms})
+        spans = sorted((l.t.start, l.t.end) for l in b.edit.layers)
+        assert all(spans[i][1] <= spans[i + 1][0] for i in range(len(spans) - 1)), spans

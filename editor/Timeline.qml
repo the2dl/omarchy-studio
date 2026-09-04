@@ -727,6 +727,7 @@ Item {
                 font.pixelSize: Theme.fsHint
             }
             Rectangle {
+                id: camLane
                 width: root.trackW
                 height: Style.zoomRowH
                 radius: Theme.radiusChip
@@ -763,10 +764,32 @@ Item {
                 Repeater {
                     model: root.camSegments
                     Rectangle {
+                        id: block
                         readonly property bool sel: root.preview && root.preview.selectedId === modelData.id
-                        x: root.frameToX(modelData.start)
+
+                        // While a drag is live the block follows the POINTER, not the
+                        // model: the bridge round-trip is not instant, and snapping back
+                        // to the old range for a frame on every move is the "double
+                        // bounce" the layer items already avoid this way. -1 means "no
+                        // drag in progress, use the model".
+                        property int dragF0: -1
+                        property int dragF1: -1
+                        readonly property int f0: dragF0 >= 0 ? dragF0 : modelData.start
+                        readonly property int f1: dragF1 >= 0 ? dragF1 : modelData.end
+
+                        // A segment cannot cross its neighbours. The model refuses an
+                        // overlapping ADD, but a drag has to refuse it continuously --
+                        // the edge simply stops -- because a drag that silently reverts
+                        // on release reads as the app ignoring you.
+                        readonly property int minStart:
+                            index > 0 ? root.camSegments[index - 1].end : 0
+                        readonly property int maxEnd:
+                            index < root.camSegments.length - 1
+                            ? root.camSegments[index + 1].start : root.sourceFrames
+
+                        x: root.frameToX(f0)
                         y: 4
-                        width: Math.max(6, root.frameToX(modelData.end) - root.frameToX(modelData.start))
+                        width: Math.max(6, root.frameToX(f1) - root.frameToX(f0))
                         height: 18
                         radius: Theme.radiusChip - 2
                         color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, sel ? 0.28 : 0.2)
@@ -774,10 +797,105 @@ Item {
                         border.color: sel ? Theme.accent
                                           : Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.45)
                         Behavior on color { ColorAnimation { duration: Theme.durSlow } }
+
+                        function commit() {
+                            // Cleared in the callback, not here: until the reply lands
+                            // the model still holds the old range.
+                            Bridge.op("update_layer", {
+                                id: modelData.id,
+                                start_ms: block.f0 * root.msPerFrame,
+                                end_ms: block.f1 * root.msPerFrame
+                            }, function () { block.dragF0 = -1; block.dragF1 = -1 })
+                        }
+
+                        // Frames are read back through xToFrame rather than from a pixel
+                        // delta: the ruler FOLDS cut regions away, so the mapping is
+                        // piecewise and a constant px-per-frame is wrong the moment a
+                        // cut exists anywhere left of the segment.
+                        function frameAt(area, mx) {
+                            return root.xToFrame(area.mapToItem(camLane, mx, 0).x)
+                        }
+
+                        readonly property int grip: 6
+
+                        // -- body: slide the segment, keeping its length ---------
                         MouseArea {
+                            id: bodyMa
                             anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.preview.selectedId = parent.sel ? "" : modelData.id
+                            anchors.leftMargin: block.grip
+                            anchors.rightMargin: block.grip
+                            cursorShape: pressed ? Qt.ClosedHandCursor : Qt.PointingHandCursor
+                            property int grabF: 0
+                            property int origF0: 0
+                            property int origF1: 0
+                            property bool dragged: false
+                            onPressed: function (mouse) {
+                                grabF = block.frameAt(bodyMa, mouse.x)
+                                origF0 = block.f0
+                                origF1 = block.f1
+                                dragged = false
+                            }
+                            onPositionChanged: function (mouse) {
+                                if (!pressed)
+                                    return
+                                var d = block.frameAt(bodyMa, mouse.x) - grabF
+                                if (d === 0 && !dragged)
+                                    return
+                                dragged = true
+                                var len = origF1 - origF0
+                                var s = Math.max(block.minStart,
+                                                 Math.min(origF0 + d, block.maxEnd - len))
+                                block.dragF0 = s
+                                block.dragF1 = s + len
+                            }
+                            onReleased: {
+                                if (dragged)
+                                    block.commit()
+                                else
+                                    root.preview.selectedId = block.sel ? "" : modelData.id
+                            }
+                        }
+
+                        // -- edges: trim ------------------------------------------
+                        // Written out twice rather than shared through a Component: a
+                        // Component reparents to its Loader, so `parent.height` and the
+                        // `this` a handler sees both stop meaning what they read as.
+                        // Two short handlers beat one clever one nobody can follow.
+                        MouseArea {
+                            id: headMa
+                            anchors.left: parent.left
+                            anchors.top: parent.top
+                            anchors.bottom: parent.bottom
+                            width: block.grip
+                            cursorShape: Qt.SizeHorCursor
+                            onPositionChanged: function (mouse) {
+                                if (!pressed)
+                                    return
+                                // Never past the previous segment, never within two
+                                // frames of its own tail.
+                                block.dragF0 = Math.max(
+                                    block.minStart,
+                                    Math.min(block.frameAt(headMa, mouse.x), block.f1 - 2))
+                            }
+                            onReleased: if (block.dragF0 >= 0)
+                                            block.commit()
+                        }
+                        MouseArea {
+                            id: tailMa
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.bottom: parent.bottom
+                            width: block.grip
+                            cursorShape: Qt.SizeHorCursor
+                            onPositionChanged: function (mouse) {
+                                if (!pressed)
+                                    return
+                                block.dragF1 = Math.min(
+                                    block.maxEnd,
+                                    Math.max(block.frameAt(tailMa, mouse.x), block.f0 + 2))
+                            }
+                            onReleased: if (block.dragF1 >= 0)
+                                            block.commit()
                         }
                     }
                 }

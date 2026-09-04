@@ -791,3 +791,37 @@ def drop_webcam_segment(edit, layer_id: str) -> bool:
     if not any(l.type == "webcam" for l in edit.layers):
         edit.webcam.enabled = False
     return True
+
+
+def clamp_webcam_range(edit, layer: Layer, want: FrameRange,
+                       total_frames: int) -> FrameRange:
+    """`want`, pulled back inside the gap between this segment's neighbours.
+
+    CLAMPED, not refused, where add_webcam_segment refuses. The difference is what the
+    caller can do about it: a drag has an obvious nearest legal position -- the edge
+    stops against its neighbour -- and refusing on release would snap the segment back
+    and read as the app ignoring the gesture. A fresh segment has no such position, so
+    an overlapping add is a mistake worth reporting.
+
+    Enforced here rather than only in the timeline because the bridge is not the only
+    caller. The row clamps as you drag so nothing ever jumps; this is the backstop that
+    makes the invariant true regardless.
+    """
+    others = [l for l in edit.layers
+              if l.type == "webcam" and l.id != layer.id and l.t is not None]
+    lo, hi = 0, max(1, total_frames)
+    for other in others:
+        if other.t.end <= want.start:
+            lo = max(lo, other.t.end)
+        elif other.t.start >= want.end:
+            hi = min(hi, other.t.start)
+        else:
+            # Straddling a neighbour: keep whichever side the segment came from rather
+            # than guessing, by pinning to the nearer edge.
+            if want.start < other.t.start:
+                hi = min(hi, other.t.start)
+            else:
+                lo = max(lo, other.t.end)
+    start = max(lo, min(want.start, hi - 1))
+    end = min(hi, max(want.end, start + 1))
+    return FrameRange(start, end)

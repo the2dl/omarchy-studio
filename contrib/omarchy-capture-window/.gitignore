@@ -1,3 +1,5 @@
 spike
 *-client-protocol.h
 *-protocol.c
+spike_dmabuf
+omarchy-capture-window

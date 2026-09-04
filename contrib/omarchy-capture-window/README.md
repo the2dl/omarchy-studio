@@ -90,10 +90,44 @@ the window alone, clean and undimmed.
 `handle` is the window's Hyprland address truncated to its low 32 bits -- the same
 truncation xdph does when it builds its picker list.
 
+## record.c -- the recorder
+
+Works end to end: captures one window, encodes h264/hevc through VAAPI, muxes an
+mp4, writes gsr's two-column first-frame sidecar, and finalises on SIGINT/SIGTERM.
+
+    ./omarchy-capture-window -w 0x<address> -o out.mp4 -f 60 \
+        [-k auto|h264_vaapi|hevc_vaapi] [-q QP] [-cursor yes|no] \
+        [-write-first-frame-ts FILE]
+
+Flags mirror gpu-screen-recorder on purpose: the capture script already branches on
+`kms|portal`, and this is meant to be a third value rather than a second way of
+doing everything.
+
+**Measured 35-37 fps, which is SLOWER than the shm spike, and the reason is worth
+recording.** VAAPI on this driver refuses to import a BGRA DRM object:
+
+    Failed to create surface from DRM object: 2 (resource allocation failed)
+    Failed to map frame: -5
+
+Tried with tiled and with linear buffers; the refusal is the format, not the
+modifier. VA surfaces here accept an UPLOAD from BGRA and convert on the GPU, they
+just will not take an import -- so the current path allocates linear, maps the
+buffer, and uploads. That is two copies where the shm spike had one, which is
+exactly why it measures worse than 44.8.
+
+So the standing order of preference is:
+
+    1. dmabuf import   59.6 fps   blocked on the VAAPI import above
+    2. shm             44.8 fps   one copy, and better than what ships today
+    3. map + upload    35-37 fps  what ships today
+
+Fixing (1) is the real work -- EGL/GL or Vulkan import, or a driver path that takes
+RGB surfaces. Falling back to (2) is a smaller change and an immediate win. Neither
+is done.
+
 ## What is still missing
 
-These are measurements, not a recorder. Still to build: the VAAPI encode side
-(the frame path itself is proven above), a 60Hz CFR clock repeating the last frame (the compositor only renders on
+Still to build: a 60Hz CFR clock repeating the last frame (the compositor only renders on
 damage, so there is no frame while the screen is idle), the `.ts` first-frame
 sidecar `capture.read_gsr_ts` expects, SIGINT/IPC stop parity with gsr, and audio.
 Known hazards: mid-recording resize renegotiates the buffer size against a

@@ -456,7 +456,7 @@ Rectangle {
             x: 14
             y: 8
             width: parent.width - 28
-            text: "No layers yet. Add one above, drop an image below, or drag a blur box on the canvas."
+            text: "No layers yet. Add one above, click or drop an image below, or drag a blur box on the canvas."
             color: Theme.text6
             font.family: Theme.fontFamily
             font.pixelSize: Theme.fsHint
@@ -575,10 +575,21 @@ Rectangle {
             }
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "Drop an image"
-                color: Theme.text3
+                // Both ways in, said on the panel itself. Dragging a file between
+                // windows is awkward on a tiling compositor, and a target that only
+                // accepts a drag reads as "no way to add an image" to anyone who does
+                // not already know the + menu above has one.
+                text: dropMa.containsMouse ? "Choose an image…" : "Drop an image"
+                color: dropMa.containsMouse ? Theme.text2 : Theme.text3
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fsCaption
+            }
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: dropMa.containsMouse ? "or drop one here" : "or click to browse"
+                color: Theme.text5
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsHint
             }
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
@@ -587,6 +598,17 @@ Rectangle {
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fsHint
             }
+        }
+
+        MouseArea {
+            id: dropMa
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            // The same dialog the + menu opens, so there is one way images get added
+            // and one place that knows how -- rather than a second path that could
+            // drift from it.
+            onClicked: root.addLayer("image")
         }
 
         DropArea {

@@ -305,3 +305,21 @@ def test_the_overlay_follows_the_camera_track_not_the_global_setting(tmp_path):
 
     gap = selftest_fields(run_editor(root, "--no-proxy", "--frame", "30").stderr)
     assert gap["webcamRect"]["visible"] is False
+
+
+def test_every_rail_tool_has_a_tooltip():
+    """The rail is glyph-only, so a tool without a tip is a button nobody can identify.
+
+    `tip` sat on RailButton as a declared property that nothing rendered while every
+    call site dutifully passed one, which is exactly the shape of thing that stays
+    broken for months. Now that it draws, this keeps the next tool from arriving
+    without one.
+    """
+    import re
+
+    src = (REPO / "editor" / "main.qml").read_text()
+    entries = re.findall(r'\{\s*id:\s*"(\w+)"[^}]*?\}', src)
+    tips = dict(re.findall(r'\{\s*id:\s*"(\w+)",\s*glyph:[^,]+,\s*tip:\s*"([^"]*)"', src))
+    assert tips, "the rail model no longer parses; this guard has gone vacuous"
+    for tool, tip in tips.items():
+        assert tip.strip(), f"rail tool {tool!r} has no tooltip"

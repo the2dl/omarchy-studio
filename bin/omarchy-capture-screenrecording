@@ -717,9 +717,9 @@ start_screenrecording() {
     # calls motion is duplicate frames -- which is what judder IS. At 30 the same path
     # keeps 98%. An honest 30 beats a 60 that is lying about half its frames.
     #
-    # the reference design records 60 and does not face this: macOS excludes windows on the
-    # same fast capture path, so it pays nothing for the self-view. The trade-off is
-    # ours, not theirs, and copying their NUMBER would not copy their RESULT.
+    # macOS recorders hold 60 and never face this: the OS excludes windows on the
+    # same fast capture path, so a self-view costs them nothing. The trade-off is ours
+    # alone, and copying their NUMBER would not copy their RESULT.
     [[ -z $FRAMERATE_EXPLICIT ]] && capture_fps=30
   fi
 

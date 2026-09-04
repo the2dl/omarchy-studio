@@ -8,8 +8,8 @@ whole monitor.
 So a region that wants a self-view records the MONITOR through the portal and carries
 the region as a crop. The renderer crops before anything else, and every stage after it
 sees exactly the frame the user chose. macOS never faces this: it excludes windows on
-the same fast path whatever the capture is, which is why the reference design just shows the
-bubble.
+the same fast path whatever the capture is, so its recorders can simply show the
+bubble where it sits.
 
 The side effect is worth as much as the fix: the whole monitor is on disk, so the
 framing stops being a decision made before recording.

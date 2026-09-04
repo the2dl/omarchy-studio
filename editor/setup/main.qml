@@ -1,9 +1,9 @@
 // The pre-record setup bar: a single-row pill, bottom-centre, holding source MODE
 // (Display / Window / Area / Camera), the mic check, system audio, and the camera
-// overlay shape. Record does NOT live here -- the reference design moved it
-// onto the picked target itself in 2023, so Start is drawn by Overlay.qml in the
-// centre of whatever is selected, where it doubles as confirmation you picked the
-// right thing. This window plus one Overlay per monitor are one qml6 process.
+// overlay shape. Record does NOT live here -- it belongs on the picked target
+// itself, so Start is drawn by Overlay.qml in the centre of whatever is selected,
+// where it doubles as confirmation you picked the right thing. This window plus one
+// Overlay per monitor are one qml6 process.
 //
 // Launched by bin/omarchy-capture-setup, which passes --port/--token for the
 // loopback bridge and positions all windows via Hyprland dispatches keyed on their

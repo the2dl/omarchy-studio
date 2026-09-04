@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """The pre-record entry point: a bottom-centre setup bar plus in-place pick overlays.
 
-The shipping the reference design moved Record OFF the setup surface and onto the picked
-target itself -- an overlay on the chosen display/window/area shows its name,
-resolution and fps with the Start button in the centre, which doubles as proof you
-picked the right monitor. This launcher builds that on Hyprland: one frameless qml6
+Record lives OFF the setup surface and on the picked target itself -- an overlay on
+the chosen display/window/area shows its name, resolution and fps with the Start
+button in the centre, which doubles as proof you picked the right monitor. This
+launcher builds that on Hyprland: one frameless qml6
 bar (mode / mic / camera / system audio) and one transparent full-monitor overlay
 window per output, positioned with the same hl.dsp.window dispatches the self-view
 uses (bin/omarchy-capture-camera).

@@ -1,7 +1,7 @@
 // One transparent, monitor-sized window: the in-place source picker. This is where
-// Record actually lives -- the reference design puts the Start button in the
-// centre of the picked display/window/area with its name, resolution and fps, so
-// the confirmation IS the thing itself, live on screen, not a thumbnail of it.
+// Record actually lives: the Start button sits in the centre of the picked
+// display/window/area with its name, resolution and fps, so the confirmation IS the
+// thing itself, live on screen, not a thumbnail of it.
 //
 // The launcher positions this window over its monitor by title and strips border,
 // shadow, rounding and animations with window rules; everything drawn here sits on

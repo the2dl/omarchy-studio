@@ -472,6 +472,7 @@ def serve(session: SetupSession, port: int) -> ThreadingHTTPServer:
                         mic_device=body.get("mic_device"),
                         camera_rect=body.get("camera_rect"),
                         window=body.get("window"),
+                        full_monitor=body.get("full_monitor", False),
                         countdown=session.countdown,
                     )
                 except ValueError as e:

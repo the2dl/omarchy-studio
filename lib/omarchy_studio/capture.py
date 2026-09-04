@@ -591,6 +591,10 @@ def main(argv: list[str] | None = None) -> int:
             # is a framing decision the editor can still make rather than a ruined
             # recording. Empty for a monitor or a hand-drawn area.
             "SETUP_WINDOW": str(cfg.get("window") or ""),
+            # Opt-in: record the display and carry the selection as a crop, so the
+            # framing stays editable afterwards. Off means capture only what was
+            # selected, which is what picking one window usually MEANS.
+            "SETUP_FULL_MONITOR": "true" if cfg.get("full_monitor") else "false",
             "SETUP_COUNTDOWN_S": str(int(cfg.get("countdown") or 0)),
         }
         for k, v in emit.items():

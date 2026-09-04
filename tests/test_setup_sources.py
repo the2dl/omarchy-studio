@@ -182,7 +182,27 @@ def test_config_has_every_key_always():
                   camera="off", camera_device=None)
     assert c == {"target": "monitor:DP-1", "mic": True, "mic_device": None,
                  "desktop_audio": False, "camera": "off", "camera_device": None,
-                 "camera_rect": None, "window": None, "countdown": 3}
+                 "camera_rect": None, "window": None, "full_monitor": False,
+                 "countdown": 3}
+
+
+def test_recording_more_than_the_selection_is_opt_in():
+    """Picking one window is frequently a decision NOT to record the rest of the
+    screen. Recording it anyway -- onto disk, in the bundle, where an export can
+    reach it -- is not a default anyone should get without asking."""
+    assert ss.config("region:800x600+10+20", True, False, "off",
+                     None)["full_monitor"] is False
+
+
+def test_asking_for_it_gets_it():
+    assert ss.config("region:800x600+10+20", True, False, "off", None,
+                     full_monitor=True)["full_monitor"] is True
+
+
+def test_a_display_capture_has_nothing_more_to_record():
+    """The choice would be between a thing and itself."""
+    assert ss.config("monitor:DP-1", True, False, "off", None,
+                     full_monitor=True)["full_monitor"] is False
 
 
 def test_a_window_pick_carries_which_window_it_was_cut_from():

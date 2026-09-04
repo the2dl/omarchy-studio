@@ -16,6 +16,8 @@ byte-for-byte what it rendered before.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import synthetic
 from ffmpeg_harness import needs_ffmpeg
@@ -23,6 +25,8 @@ from ffmpeg_harness import needs_ffmpeg
 from omarchy_studio import follow, probe, render
 from omarchy_studio.events import WindowSample, WindowTrack, WindowWriter, read_window_track
 from omarchy_studio.project import Bundle, Capture, Stream
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 ANCHOR = synthetic.ANCHOR_US
 
@@ -362,3 +366,33 @@ def test_a_capture_that_is_all_frame_still_picks_from_the_frame(tmp_path, capsys
           "--monitor", "DP-1", "--scale", "2"])
     out = dict(l.split("=", 1) for l in capsys.readouterr().out.splitlines())
     assert out["CAPTURE_CODEC"] == "auto"
+
+
+# --- recording more than the selection is a choice ---------------------------
+
+
+def test_the_recorder_only_widens_the_capture_when_asked(tmp_path):
+    """The guard, read off the script: SETUP_FULL_MONITOR gates it.
+
+    Widening is what makes re-framing possible, and it is also what puts the rest of
+    the screen on disk. Picking one window is frequently a decision not to record the
+    rest, so the recorder must not decide this on the user's behalf.
+    """
+    src = (REPO_ROOT / "bin" / "omarchy-capture-screenrecording").read_text()
+    guard = [l for l in src.splitlines() if "SOURCE_LOGICAL=$(monitor_logical_geometry)" in l]
+    assert len(guard) == 2, "one guard for the self-view, one for re-framing"
+    assert '${SETUP_FULL_MONITOR:-false} == "true"' in src
+    # And the window track is only taken when there is somewhere to pan to.
+    assert '[[ -n ${SETUP_WINDOW:-} && -n $SOURCE_LOGICAL ]]' in src
+
+
+def test_a_selection_only_capture_offers_no_follow_toggle(tmp_path):
+    """`plan` would answer None for it, so a toggle would sit there doing nothing --
+    which is worse than no toggle."""
+    b = _bundle_with_track(tmp_path / "narrow", (0, 200, 100, 300, 200),
+                           (2, 400, 100, 300, 200))
+    b.capture.source_crop = {}          # only the selection was recorded
+    assert follow.has_track(b) is False
+    b.edit.follow_window = True
+    b._follow_cache = None
+    assert follow.for_bundle(b) is None

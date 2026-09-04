@@ -169,6 +169,9 @@ ApplicationWindow {
     // until one reports, which is the "no camera" case and means the editor keeps
     // WebcamSettings' defaults.
     property var cameraRect: null
+    // Record the whole display and carry the selection as a crop, so the framing can
+    // be changed afterwards. Off by default: see the control in SetupBar.
+    property bool fullMonitor: false
 
     readonly property var micEntry: entryFor(sources.mics, micDevice, "name")
     readonly property var cameraEntry: entryFor(sources.cameras, cameraDevice, "device")
@@ -336,7 +339,9 @@ ApplicationWindow {
             // resolves to undefined and rides across as null. The target itself is
             // still just a rectangle -- this says which window that rectangle was
             // cut from, so the recorder can log where it went afterwards.
-            window: (sel && sel.kind === "window" && sel.address) ? sel.address : null
+            window: (sel && sel.kind === "window" && sel.address) ? sel.address : null,
+            // Only meaningful for a window or an area; config drops it for a display.
+            full_monitor: mode !== 0 && fullMonitor
         }, function (r, ok) {
             if (!ok)
                 return          // rejected config; everything stays up

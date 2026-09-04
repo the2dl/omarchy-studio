@@ -152,6 +152,35 @@ Item {
         }
         Rectangle { width: 1; height: 26; color: Theme.hairline }
 
+        // Re-framing. Only for a window or an area: a display capture is already the
+        // whole display, so the choice would be between a thing and itself.
+        //
+        // OFF by default, and the default is the point. On means the whole screen is
+        // recorded and the selection is carried as a crop -- which is what lets the
+        // frame be moved afterwards, and the only way a window that moved can be
+        // followed. It also means everything beside the selection lands on disk, and
+        // picking one window is often precisely a decision NOT to record the rest.
+        // That is not a default anyone should get without asking for it.
+        Row {
+            spacing: 8
+            visible: app.mode !== 0 && app.sel !== null
+            C.Toggle {
+                objectName: "ctl:reframe-toggle"
+                checked: app.fullMonitor
+                onToggled: function (v) { app.fullMonitor = v }
+            }
+            Text {
+                text: "Re-frame later"
+                color: app.fullMonitor ? Theme.text2 : Theme.text4
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fsRow
+            }
+        }
+        Rectangle {
+            width: 1; height: 26; color: Theme.hairline
+            visible: app.mode !== 0 && app.sel !== null
+        }
+
         // The teleprompter. It belongs here rather than in the editor because it is a
         // recording-time tool: the script is read WHILE the take happens, and by the
         // time the editor exists the reading is over. It is also the only surface in

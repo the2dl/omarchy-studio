@@ -262,7 +262,15 @@ def for_bundle(bundle) -> FollowPlan | None:
 def has_track(bundle) -> bool:
     """Whether following is even offerable. The editor asks this to decide whether
     to draw the control at all -- an inert toggle on a recording with nothing to
-    follow is a worse answer than no toggle."""
+    follow is a worse answer than no toggle.
+
+    Two conditions, not one. The window has to have MOVED, and the recording has to
+    have kept the pixels around it: a take that captured only the selected rectangle
+    has nowhere to pan to, so `plan` would answer None and the toggle would sit there
+    doing nothing.
+    """
     from .events import read_window_track
 
+    if not bundle.capture.source_crop:
+        return False
     return read_window_track(track_path(bundle)).moved

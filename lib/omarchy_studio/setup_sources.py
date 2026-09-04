@@ -231,7 +231,8 @@ def parse_camera_rect(raw: Any) -> dict[str, int] | None:
 def config(target: str, mic: bool, desktop_audio: bool,
            camera: str, camera_device: str | None,
            countdown: int = 3, mic_device: str | None = None,
-           camera_rect: Any = None, window: str | None = None) -> dict[str, Any]:
+           camera_rect: Any = None, window: str | None = None,
+           full_monitor: bool = False) -> dict[str, Any]:
     """The one line bin/omarchy-capture-setup prints, validated.
 
     Keys are always all present (the consumer must not need .get defaults):
@@ -255,6 +256,15 @@ def config(target: str, mic: bool, desktop_audio: bool,
                      lets the recorder log where the window actually went, so the
                      framing stays a decision and not a snapshot. Null for a monitor
                      or a hand-drawn region: there is no window to follow.
+      full_monitor   record the whole display and carry the selection as a crop,
+                     rather than capturing only the selected rectangle. False by
+                     default and deliberately: picking one window is often a
+                     PRIVACY choice, and recording the rest of the screen anyway --
+                     onto disk, in the bundle, where an export can reach it -- is not
+                     what the user asked for. True buys the ability to re-frame
+                     afterwards and to follow a window that moves, at the cost of a
+                     master the size of the display. Meaningless for a monitor
+                     target, which is already the whole display.
       countdown      whole seconds of on-screen countdown AFTER the line printed.
                      When > 0 the line is emitted the moment Start is pressed so
                      capture init can overlap the countdown; every setup surface
@@ -277,6 +287,8 @@ def config(target: str, mic: bool, desktop_audio: bool,
     # constrained to exactly the shape Hyprland emits and nothing else.
     if window is not None and not re.match(r"^0x[0-9a-f]{1,16}$", window):
         raise ValueError(f"bad window address: {window!r}")
+    # Same rule as the address: only a region has an outside to keep.
+    full_monitor = bool(full_monitor) and parsed["kind"] == "region"
     if window is not None and parsed["kind"] != "region":
         # Only a region target has an outside to re-frame into. Following a window
         # on a full-monitor or camera target is meaningless, and silently keeping
@@ -300,5 +312,6 @@ def config(target: str, mic: bool, desktop_audio: bool,
         "camera_device": camera_device,
         "camera_rect": rect,
         "window": window,
+        "full_monitor": full_monitor,
         "countdown": countdown,
     }

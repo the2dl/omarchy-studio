@@ -1057,7 +1057,11 @@ Item {
                 root.seekFrame(next)
                 if (root.hasScreen)
                     screenPlayer.play()
-                if (root.hasCamera && root.cameraSync.cameraExistsAt(next * root.msPerFrame))
+                // cameraSync is an ID, not a member of root -- `root.cameraSync` is
+                // undefined and this threw a TypeError at the exact moment an intro
+                // finished and handed over to the recording. Found by qmllint's
+                // missing-property check in seconds; invisible to "it loads".
+                if (root.hasCamera && cameraSync.cameraExistsAt(next * root.msPerFrame))
                     cameraPlayer.play()
             } else {
                 root.outFrame = next

@@ -23,7 +23,11 @@ Rectangle {
     property string selectedId: ""
     // Optional. Supplies the playhead for "lands at the playhead" and the blur tool
     // for placing a redaction by dragging; the list degrades without it.
-    property Item preview: null
+    // Typed, not `Item`. As a bare Item every member reached through it --
+    // preview.timelineFrame, preview.togglePlay(), preview.hasScreen -- was
+    // unresolvable, so qmllint could not tell a real typo from a valid call and
+    // reported nineteen of them as noise. Typed, they are checked.
+    property Preview preview: null
     signal selectLayer(string id)
 
     readonly property var st: Bridge.state

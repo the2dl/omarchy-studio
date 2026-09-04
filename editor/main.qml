@@ -106,8 +106,15 @@ ApplicationWindow {
     // exists on TextInput/TextEdit and nothing else in this chrome.
     function typing() {
         var f = app.activeFocusItem
+        // qmllint disable missing-property
+        // Deliberate duck-typing, and the ONLY missing-property this project allows:
+        // activeFocusItem is an Item, cursorPosition exists on TextInput/TextEdit and
+        // nothing else in this chrome, and the check IS "does this member exist". The
+        // suppression is here rather than in an allowlist beside the linter so it
+        // cannot outlive the reason for it.
         return f !== null && f !== undefined && f.cursorPosition !== undefined
                && f.readOnly !== true
+        // qmllint enable missing-property
     }
 
     // Top bar, 46px (spec §1d region 1): file glyph, name, duration/format in text6,

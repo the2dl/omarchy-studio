@@ -162,6 +162,7 @@ Window {
     Repeater {
         model: !app.counting && app.mode === 1 ? ov.windowsHere() : []
         delegate: Rectangle {
+            id: winRect
             required property var modelData
             x: modelData.x - ov.mon.x
             y: modelData.y - ov.mon.y
@@ -176,7 +177,7 @@ Window {
 
             // Name chip above the rect (or inside its top edge at the screen top).
             Rectangle {
-                visible: parent.picked || winHover.containsMouse
+                visible: winRect.picked || winHover.containsMouse
                 x: 0
                 y: parent.y > 30 ? -28 : 6
                 width: chipText.implicitWidth + 20
@@ -189,7 +190,12 @@ Window {
                     id: chipText
                     anchors.centerIn: parent
                     text: modelData.title + "  ·  " + modelData.width + "×" + modelData.height
-                    color: parent.parent.picked ? Theme.text : Theme.text3
+                    // By id. `parent.parent` is correct today -- Text, chip,
+                    // delegate -- but it is a count of levels that any wrapper silently
+                    // breaks, and to the type system it is a QQuickItem, so `picked`
+                    // could not be checked. Undefined reads as falsy, which here means
+                    // the chip just stops highlighting: a bug that looks like a design.
+                    color: winRect.picked ? Theme.text : Theme.text3
                     font.family: Theme.fontFamily
                     font.pixelSize: Theme.fsCaption
                 }

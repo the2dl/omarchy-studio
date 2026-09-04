@@ -39,7 +39,11 @@ import "controls" as C
 Item {
     id: root
 
-    property Item preview: null
+    // Typed, not `Item`. As a bare Item every member reached through it --
+    // preview.timelineFrame, preview.togglePlay(), preview.hasScreen -- was
+    // unresolvable, so qmllint could not tell a real typo from a valid call and
+    // reported nineteen of them as noise. Typed, they are checked.
+    property Preview preview: null
     readonly property var st: Bridge.state
     readonly property int sourceFrames: st.source_frames || 0
     readonly property real msPerFrame: st.timebase ? st.timebase.ms_per_frame : 1000 / 60
@@ -732,7 +736,11 @@ Item {
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: root.preview.selectedId = parent.parent.sel ? "" : modelData.id
+                                // `block`, by id: parent.parent is a QQuickItem to the
+                                // type system, so `sel` could not be checked and a
+                                // wrong number of parents would read as undefined --
+                                // falsy -- and silently always select.
+                                onClicked: root.preview.selectedId = block.sel ? "" : modelData.id
                             }
                         }
                     }

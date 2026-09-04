@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""The recording's process set, for the shell.
+
+`omarchy-capture-screenrecording` starts the processes and a LATER INVOCATION of it
+stops them, so the stopping shell has none of the variables that knew their pids. It
+went looking by pattern instead -- `pkill -f "^gpu-screen-recorder"` -- which reaches a
+second recording by the same user, anything that merely has the string in its argv, and
+whatever a bundle path's regex metacharacters happen to match.
+
+This records identity at start and verifies it at stop. See supervisor.py for why
+identity is (pid, start time) and not pid.
+
+    omarchy-studio-procs record  <state> <name> <pid> [bundle]
+    omarchy-studio-procs living  <state>                  # names, one per line
+    omarchy-studio-procs pids    <state> [name...]        # pids, one per line
+    omarchy-studio-procs signal  <state> <SIG> [name...]  # names actually signalled
+    omarchy-studio-procs wait    <state> <seconds> [name...]
+    omarchy-studio-procs clear   <state>
+
+Exit status is 0 when something is alive / was signalled / everything exited, 1
+otherwise, so the shell can use it directly in a conditional.
+"""
+from __future__ import annotations
+
+import signal as signal_mod
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+from omarchy_studio import supervisor  # noqa: E402
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    cmd, state = argv[1], argv[2]
+    rest = argv[3:]
+
+    if cmd == "record":
+        if len(rest) < 2:
+            return 2
+        name, pid = rest[0], int(rest[1])
+        bundle = rest[2] if len(rest) > 2 else ""
+        return 0 if supervisor.record(state, name, pid, bundle=bundle) else 1
+
+    if cmd == "living":
+        names = [c.name for c in supervisor.living(state)]
+        print("\n".join(names))
+        return 0 if names else 1
+
+    if cmd == "pids":
+        pids = [str(c.pid) for c in supervisor.living(state)
+                if not rest or c.name in rest]
+        print("\n".join(pids))
+        return 0 if pids else 1
+
+    if cmd == "signal":
+        if not rest:
+            return 2
+        sig = getattr(signal_mod, rest[0], None)
+        if sig is None:
+            print(f"unknown signal {rest[0]}", file=sys.stderr)
+            return 2
+        sent = supervisor.signal_all(state, sig, names=tuple(rest[1:]))
+        print("\n".join(sent))
+        return 0 if sent else 1
+
+    if cmd == "wait":
+        if not rest:
+            return 2
+        return 0 if supervisor.wait_gone(state, float(rest[0]),
+                                         names=tuple(rest[1:])) else 1
+
+    if cmd == "clear":
+        supervisor.clear(state)
+        return 0
+
+    print(f"unknown command {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

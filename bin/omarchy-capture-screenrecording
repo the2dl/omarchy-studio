@@ -87,6 +87,12 @@ SCRIPT_ARGS="$*"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 RECORDING_FILE="/tmp/omarchy-screenrecord-filename"
 BUNDLE_FILE="$RUNTIME_DIR/omarchy-studio-bundle"
+# Which processes belong to THIS recording. The stop path is a second invocation of
+# this script and has none of the variables that knew their pids, so it used to hunt
+# for them by pattern -- `pkill -f "^gpu-screen-recorder"` -- which reaches a second
+# recording by the same user and anything else whose argv merely contains the string.
+# See lib/omarchy_studio/supervisor.py.
+PROCS_FILE="$RUNTIME_DIR/omarchy-studio-procs.json"
 # The stop is a SECOND invocation of this script -- the hotkey just runs it again --
 # so nothing start_screenrecording put in a shell variable is visible to it. That is
 # why the countdown deadline is written to a file: COUNTDOWN_SECONDS was read at stop
@@ -205,6 +211,9 @@ start_webcam_overlay() {
     --title="WebcamOverlay" --wayland-app-id="WebcamOverlay-$WEBCAM_SIZE" \
     --no-border --no-audio --no-osc --osd-level=0 \
     --really-quiet &>/dev/null &
+  # Recorded like gsr: `pkill -f WebcamOverlay` reached any mpv whose argv contained
+  # that string, including a second recording's overlay.
+  omarchy-studio-procs record "$PROCS_FILE" webcam_overlay "$!" >/dev/null 2>&1
 
   # The move has to settle before gpu-screen-recorder starts, or the camera is
   # recorded sliding into its corner.
@@ -221,7 +230,14 @@ start_webcam_overlay() {
 }
 
 cleanup_webcam() {
-  pkill -f "WebcamOverlay" 2>/dev/null
+  # Ours by pid. The pattern only when there was no state file at all -- NOT merely
+  # when no overlay was recorded, which is the normal case for a take without a webcam
+  # and which used to send `pkill -f WebcamOverlay` at the whole process table.
+  if tracked_recording; then
+    omarchy-studio-procs signal "$PROCS_FILE" SIGTERM webcam_overlay >/dev/null 2>&1
+  else
+    pkill -f "WebcamOverlay" 2>/dev/null
+  fi
   rm -f "$REGION_FILE"
 }
 
@@ -625,6 +641,9 @@ start_screenrecording() {
     -ipc "$IPC_SOCKET" "${verbose_args[@]}" \
     -o "$master" "${audio_args[@]}" 2> >(tee -a "$GSR_STDERR" >>"$LOG_FILE") &
   GSR_PID=$!
+  # Identity recorded now, while we still know it. Verified at stop as (pid, start
+  # time), so a recycled pid cannot be mistaken for this process.
+  omarchy-studio-procs record "$PROCS_FILE" gsr "$GSR_PID" "$BUNDLE" >/dev/null 2>&1
 
   # On the portal backend this wait also covers the share picker the first time round.
   while kill -0 $GSR_PID 2>/dev/null && [[ ! -f $master ]]; do
@@ -685,6 +704,9 @@ start_screenrecording() {
     ${capture_backend:+--backend "$capture_backend"} \
     ${LOGICAL_GEOMETRY:+--capture-rect "$LOGICAL_GEOMETRY"} \
     ${MONITOR_NAME:+--monitor "$MONITOR_NAME"} >>"$LOG_FILE" 2>&1 </dev/null &
+  # setsid, so $! is the session leader rather than the HUD itself -- record it anyway:
+  # what matters is that the pid is verified before it is signalled.
+  omarchy-studio-procs record "$PROCS_FILE" hud "$!" >/dev/null 2>&1
 
   # Nothing watched gsr once it was backgrounded and this script returned, so if it
   # died -- crash, kill, a stop that missed it -- the camera ffmpeg and the event
@@ -739,9 +761,19 @@ stop_owned_teleprompter() {
 }
 
 stop_recording_hud() {
+  # The pid is CHECKED before it is signalled, the way stop_owned_teleprompter has
+  # always done it. This one did not: `kill $(cat pidfile)` on a marker that can outlive
+  # the process that wrote it, aimed at whatever process later inherits that number.
+  # Two identical hazards in one file, one guarded and one not.
+  if tracked_recording; then
+    omarchy-studio-procs signal "$PROCS_FILE" SIGTERM hud >/dev/null 2>&1
+  fi
   local pid
-  pid=$(cat "$HUD_PID_FILE" 2>/dev/null) || return 0
-  [[ -n $pid ]] && kill "$pid" 2>/dev/null
+  pid=$(cat "$HUD_PID_FILE" 2>/dev/null) || { rm -f "$HUD_PID_FILE"; return 0; }
+  if [[ -n $pid && -r /proc/$pid/cmdline ]] &&
+    tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null | grep -q "omarchy-recording-hud"; then
+    kill "$pid" 2>/dev/null
+  fi
   rm -f "$HUD_PID_FILE"
   return 0
 }
@@ -761,20 +793,24 @@ stop_screenrecording() {
     # state it is in. A finalize that needs longer is still waited for below, by the
     # process-exit loop, so nothing is truncated by asking impatiently.
     omarchy-studio-ipc "$IPC_SOCKET" stop --timeout 5 >/dev/null || {
-      pkill -SIGINT -f "^gpu-screen-recorder"
+      interrupt_recorder
     }
   else
-    pkill -SIGINT -f "^gpu-screen-recorder" # SIGINT required to save video properly
+    interrupt_recorder # SIGINT required to save video properly
   fi
 
   # This, not the IPC reply, is what guarantees the file is closed. 30s: a 4K finalize
   # is well under a second, but an encoder flushing a long recording under load is not,
   # and killing early is how a video gets truncated.
-  local count=0
-  while pgrep -f "^gpu-screen-recorder" >/dev/null && ((count < 300)); do
-    sleep 0.1
-    count=$((count + 1))
-  done
+  if omarchy-studio-procs pids "$PROCS_FILE" gsr >/dev/null 2>&1; then
+    omarchy-studio-procs wait "$PROCS_FILE" 30 gsr >/dev/null 2>&1
+  else
+    local count=0
+    while pgrep -f "^gpu-screen-recorder" >/dev/null && ((count < 300)); do
+      sleep 0.1
+      count=$((count + 1))
+    done
+  fi
 
   omarchy-capture-camera stop
   # After gsr is down, not before: the HUD's own Stop runs this script, so taking it
@@ -786,10 +822,15 @@ stop_screenrecording() {
   toggle_screenrecording_indicator
   cleanup_webcam
 
-  if pgrep -f "^gpu-screen-recorder" >/dev/null; then
-    pkill -9 -f "^gpu-screen-recorder"
+  if recorder_still_up; then
+    if tracked_recording; then
+      omarchy-studio-procs signal "$PROCS_FILE" SIGKILL gsr >/dev/null 2>&1
+    else
+      pkill -9 -f "^gpu-screen-recorder"
+    fi
     omarchy-notification-send -u critical -t 5000 "Screen recording error" "Recording process had to be force-killed. Video may be corrupted."
     rm -f "$RECORDING_FILE" "$BUNDLE_FILE"
+    omarchy-studio-procs clear "$PROCS_FILE" >/dev/null 2>&1
     return
   fi
 
@@ -825,6 +866,9 @@ stop_screenrecording() {
   echo "$master"
   announce_recording "$master"
   rm -f "$RECORDING_FILE" "$BUNDLE_FILE" "$COUNTDOWN_FILE"
+  # Cleared last: a stale set would make the next `screenrecording_active` say a
+  # recording is running and turn the next keypress into a stop.
+  omarchy-studio-procs clear "$PROCS_FILE" >/dev/null 2>&1
 }
 
 announce_recording() {
@@ -878,8 +922,42 @@ toggle_screenrecording_indicator() {
   omarchy-shell -q omarchy.indicators refresh
 }
 
+# Whether THIS recording was tracked. The distinction that matters is "was there a
+# state file", not "did the supervisor have anything to signal": those are different
+# questions and conflating them is what made the pattern fall back during NORMAL
+# operation rather than only for an old build.
+#
+# It cost a shell to find out. Stopping a --fullscreen take signalled webcam_overlay,
+# which was legitimately absent (no webcam), the `||` fired, and `pkill -f
+# "WebcamOverlay"` killed the terminal that ran it -- because that terminal's own
+# command line happened to contain the string. Which is the entire argument against
+# pattern-matched process control, delivered by the code it was being removed from.
+tracked_recording() {
+  [[ -f $PROCS_FILE ]]
+}
+
+# SIGINT, to the process this recording actually started. gsr needs SIGINT rather than
+# SIGTERM to finalise its file. The pattern is only for a recording started by a build
+# that predates the state file -- without it, upgrading mid-recording would leave a take
+# nothing could stop.
+interrupt_recorder() {
+  if tracked_recording; then
+    omarchy-studio-procs signal "$PROCS_FILE" SIGINT gsr >/dev/null 2>&1
+  else
+    pkill -SIGINT -f "^gpu-screen-recorder"
+  fi
+}
+
+recorder_still_up() {
+  if tracked_recording; then
+    omarchy-studio-procs pids "$PROCS_FILE" gsr >/dev/null 2>&1
+  else
+    pgrep -f "^gpu-screen-recorder" >/dev/null
+  fi
+}
+
 screenrecording_active() {
-  pgrep -f "^gpu-screen-recorder" >/dev/null
+  recorder_still_up
 }
 
 if screenrecording_active; then

@@ -112,26 +112,57 @@ def parse_rect(spec: str) -> tuple[int, int, int, int] | None:
     return (int(m[3]), int(m[4]), int(m[1]), int(m[2])) if m else None
 
 
-def place(address: str, w: int, h: int, *, backend: str = "",
-          capture_rect: str = "", monitor: str = "") -> None:
-    """Bottom centre of the monitor (spec 1c) -- unless the capture would record it.
+# Hyprland modmask bits, for naming the binding that can stop a take when the HUD
+# cannot be on screen to do it.
+_MODS = ((64, "SUPER"), (4, "CTRL"), (8, "ALT"), (1, "SHIFT"))
 
-    A KMS capture reads the DRM scanout BELOW the compositor, so `no_screen_share` does
-    nothing to it. The HUD was found burned into a window recording, Stop button and
-    all. On that backend the pill has to be physically outside the captured rectangle,
-    and the spec's placement is only right when the capture cannot see it anyway.
+
+def stop_binding() -> str:
+    """A human name for a key that stops the recording, or "" if there is none.
+
+    Matched on the bind DESCRIPTION rather than the command, because the command is
+    an absolute path that differs between a packaged install and a working tree,
+    while the description is what the binding was registered as.
     """
+    try:
+        binds = json.loads(hypr("binds", "-j") or "[]")
+    except json.JSONDecodeError:
+        return ""
+    for b in binds:
+        if "screenrecording" not in str(b.get("description", "")).lower():
+            continue
+        key = str(b.get("key") or "")
+        if not key:
+            continue          # a keycode-only bind has no name worth showing
+        mods = [n for bit, n in _MODS if int(b.get("modmask", 0)) & bit]
+        return " + ".join(mods + [key])
+    # A bind with no printable key still stops the take; the user knows which key
+    # they pressed to start it, and saying so beats naming nothing.
+    return "the shortcut you started with" if any(
+        "screenrecording" in str(b.get("description", "")).lower() for b in binds) else ""
+
+
+def place(address: str, w: int, h: int, *, backend: str = "",
+          capture_rect: str = "", monitor: str = "") -> bool:
+    """Returns whether the HUD can be on screen without landing in the take."""
+    # Bottom centre of the monitor (spec 1c) -- unless the capture would record it.
+    #
+    # A KMS capture reads the DRM scanout BELOW the compositor, so `no_screen_share`
+    # does nothing to it. The HUD was found burned into a window recording, Stop
+    # button and all. On that backend the pill has to be physically outside the
+    # captured rectangle, and the spec's placement is only right when the capture
+    # cannot see it anyway.
     try:
         mons = json.loads(hypr("monitors", "-j") or "[]")
     except json.JSONDecodeError:
-        return
+        return True
     mon = None
     if monitor:
         mon = next((m for m in mons if m.get("name") == monitor), None)
     if mon is None:
         mon = next((m for m in mons if m.get("focused")), mons[0] if mons else None)
     if not mon:
-        return
+        return True
     scale = mon.get("scale", 1) or 1
     mx, my = int(mon["x"]), int(mon["y"])
     mw, mh = int(mon["width"] / scale), int(mon["height"] / scale)
@@ -146,11 +177,24 @@ def place(address: str, w: int, h: int, *, backend: str = "",
         elif ry - my >= h + EDGE_GAP:
             y = ry - h - EDGE_GAP                     # above it
         else:
-            # Nowhere to put it. The HUD stays anyway -- a recording with no stop button
-            # is worse than one with a pill in the corner -- but this must not be
-            # discovered in the export instead.
+            # Nowhere to put it. settle() decided the same question one line up --
+            # "Nothing is worth a Stop button in the video" -- and this used to answer
+            # it the other way, keeping the pill and warning. A user recording a
+            # near-fullscreen window got the Stop button welded into their take, which
+            # is the outcome that comment was written to prevent.
+            #
+            # So: leave only if the take can still be stopped without us. A hotkey is
+            # the usual way and it toggles, so the HUD is a convenience there and the
+            # recording is not. With no binding at all the HUD IS the only stop, and
+            # then a spoiled take beats an unstoppable one.
+            key = stop_binding()
+            if key:
+                notify("Recording controls hidden",
+                       f"They would be in this take. Stop with {key}.")
+                return False
             notify("The recording controls will be in this take",
-                   "This capture cannot hide them and there is no room beside it.",
+                   "This capture cannot hide them, there is no room beside it, and "
+                   "no shortcut is bound to stop the recording without them.",
                    "critical")
         x = max(mx, min(x, mx + mw - w))
         y = max(my, min(y, my + mh - h))
@@ -158,6 +202,7 @@ def place(address: str, w: int, h: int, *, backend: str = "",
     subprocess.run(["hyprctl", "dispatch",
                     f"hl.dsp.window.move({{ x = {x}, y = {y}, "
                     f"window = 'address:{address}' }})"], capture_output=True)
+    return True
 
 
 class Session:
@@ -361,9 +406,13 @@ def main(argv: list[str] | None = None) -> int:
                           "rather than recording it.", file=sys.stderr)
                     proc.terminate()
                     return
-                place(c["address"], int(c["size"][0]), int(c["size"][1]),
-                      backend=a.backend, capture_rect=a.capture_rect,
-                      monitor=a.monitor)
+                if not place(c["address"], int(c["size"][0]), int(c["size"][1]),
+                             backend=a.backend, capture_rect=a.capture_rect,
+                             monitor=a.monitor):
+                    # Same rule as the rule_landed branch above, for the same reason.
+                    print("no room for the HUD outside this capture; closing it "
+                          "rather than recording it.", file=sys.stderr)
+                    proc.terminate()
                 return
             time.sleep(0.1)
     threading.Thread(target=settle, daemon=True).start()

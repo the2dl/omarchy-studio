@@ -18,6 +18,7 @@
 // above it, and that is the whole of it.
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Controls.Basic as QC
 import QtQuick.Layouts
 import ".."
 import "../controls" as C
@@ -161,19 +162,95 @@ Item {
         // followed. It also means everything beside the selection lands on disk, and
         // picking one window is often precisely a decision NOT to record the rest.
         // That is not a default anyone should get without asking for it.
+        // A CHECKBOX, not another Toggle. The bar already has three switches on it
+        // (mic, system audio, Script) and they all mean "turn this input on". This
+        // means something else -- how much of the screen goes on disk -- and reading
+        // as a fourth switch is why it was missed entirely. A box that ticks says
+        // "an option about this recording", which is what it is.
         Row {
+            id: reframeRow
             spacing: 8
+            // Only where there is a choice: a display capture is already the whole
+            // display. `sel` because the answer is about a selection that exists.
             visible: app.mode !== 0 && app.sel !== null
-            C.Toggle {
-                objectName: "ctl:reframe-toggle"
-                checked: app.fullMonitor
-                onToggled: function (v) { app.fullMonitor = v }
+
+            Rectangle {
+                id: box
+                width: 16; height: 16
+                anchors.verticalCenter: parent.verticalCenter
+                radius: 4
+                color: app.fullMonitor ? Theme.accent : "transparent"
+                border.width: 1
+                border.color: app.fullMonitor ? Theme.accent
+                            : reframeMa.containsMouse ? Theme.text3 : Theme.text5
+                Behavior on color { ColorAnimation { duration: Theme.durFast } }
+                Text {
+                    anchors.centerIn: parent
+                    text: "\uf00c"            // nf-fa-check
+                    visible: app.fullMonitor
+                    color: Theme.bg
+                    font.family: Theme.fontFamily
+                    font.pixelSize: 10
+                }
             }
             Text {
+                id: reframeLabel
+                anchors.verticalCenter: parent.verticalCenter
                 text: "Re-frame later"
-                color: app.fullMonitor ? Theme.text2 : Theme.text4
+                color: app.fullMonitor ? Theme.text2
+                     : reframeMa.containsMouse ? Theme.text3 : Theme.text4
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fsRow
+            }
+
+            MouseArea {
+                id: reframeMa
+                objectName: "ctl:reframe-toggle"
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: app.fullMonitor = !app.fullMonitor
+            }
+
+            // The label cannot carry the trade-off, and the trade-off is the whole
+            // decision: it costs the rest of the screen going to disk.
+            QC.ToolTip {
+                id: reframeTip
+                objectName: "reframeTip"
+                parent: reframeRow
+                visible: reframeMa.containsMouse
+                text: app.mode === 1
+                    ? "Records the whole display so you can move the frame afterwards, "
+                    + "and follow this window if it moves.\nOff records only the window "
+                    + "you picked \u2014 nothing else reaches the disk."
+                    : "Records the whole display so you can move the frame afterwards.\n"
+                    + "Off records only the area you picked \u2014 nothing else reaches "
+                    + "the disk."
+                delay: 350
+                timeout: -1
+                padding: 0
+                margins: 0
+                y: -height - 10
+                x: -(width - reframeRow.width) / 2
+                background: Rectangle {
+                    color: Theme.bgFloat
+                    radius: Theme.radiusRow - 2
+                    border.width: 1
+                    border.color: Theme.hairline
+                }
+                contentItem: Text {
+                    // reframeTip.text, not parent.text: contentItem's parent is a bare
+                    // QQuickItem, so `parent.text` resolves to undefined and the tip
+                    // renders empty -- silently. qmllint [missing-property] is what
+                    // catches that, which is why it runs in the suite.
+                    text: reframeTip.text
+                    color: Theme.text2
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsRow
+                    leftPadding: 10; rightPadding: 10
+                    topPadding: 7; bottomPadding: 7
+                    lineHeight: 1.25
+                }
             }
         }
         Rectangle {

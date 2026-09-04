@@ -162,45 +162,60 @@ Item {
         // followed. It also means everything beside the selection lands on disk, and
         // picking one window is often precisely a decision NOT to record the rest.
         // That is not a default anyone should get without asking for it.
-        // A CHECKBOX, not another Toggle. The bar already has three switches on it
+        // A CHECKBOX, not another Toggle. The bar already carries three switches
         // (mic, system audio, Script) and they all mean "turn this input on". This
-        // means something else -- how much of the screen goes on disk -- and reading
-        // as a fourth switch is why it was missed entirely. A box that ticks says
-        // "an option about this recording", which is what it is.
-        Row {
+        // one means something else -- how much of the screen reaches the disk -- and
+        // reading as a fourth switch is why it was missed entirely.
+        //
+        // An Item wrapping a Row, not a bare Row, and that distinction shipped as a
+        // bug: a MouseArea with anchors.fill inside a Row is a child the Row also
+        // POSITIONS, so the anchor and the layout fight, the hit area spills past its
+        // own control, and the Script toggle beside it stops being clickable. The Row
+        // positions the visuals; the Item owns the bounds the MouseArea fills.
+        Item {
             id: reframeRow
-            spacing: 8
-            // Only where there is a choice: a display capture is already the whole
-            // display. `sel` because the answer is about a selection that exists.
-            visible: app.mode !== 0 && app.sel !== null
+            // The MODE decides visibility, not the selection. setMode(1) clears `sel`,
+            // so gating on a selection hid this for the whole of choosing a window --
+            // exactly when someone would look for it. It survived review because the
+            // selftest auto-picks a window to make the picked state photographable, so
+            // every screenshot had a selection the real flow never has.
+            visible: app.mode !== 0
+            implicitWidth: reframeContent.implicitWidth
+            implicitHeight: 26
+            Layout.preferredWidth: implicitWidth
+            Layout.preferredHeight: implicitHeight
 
-            Rectangle {
-                id: box
-                width: 16; height: 16
+            Row {
+                id: reframeContent
                 anchors.verticalCenter: parent.verticalCenter
-                radius: 4
-                color: app.fullMonitor ? Theme.accent : "transparent"
-                border.width: 1
-                border.color: app.fullMonitor ? Theme.accent
-                            : reframeMa.containsMouse ? Theme.text3 : Theme.text5
-                Behavior on color { ColorAnimation { duration: Theme.durFast } }
-                Text {
-                    anchors.centerIn: parent
-                    text: "\uf00c"            // nf-fa-check
-                    visible: app.fullMonitor
-                    color: Theme.bg
-                    font.family: Theme.fontFamily
-                    font.pixelSize: 10
+                spacing: 8
+
+                Rectangle {
+                    width: 16; height: 16
+                    anchors.verticalCenter: parent.verticalCenter
+                    radius: 4
+                    color: app.fullMonitor ? Theme.accent : "transparent"
+                    border.width: 1
+                    border.color: app.fullMonitor ? Theme.accent
+                                : reframeMa.containsMouse ? Theme.text3 : Theme.text5
+                    Behavior on color { ColorAnimation { duration: Theme.durFast } }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "\uf00c"            // nf-fa-check
+                        visible: app.fullMonitor
+                        color: Theme.bg
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 10
+                    }
                 }
-            }
-            Text {
-                id: reframeLabel
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Re-frame later"
-                color: app.fullMonitor ? Theme.text2
-                     : reframeMa.containsMouse ? Theme.text3 : Theme.text4
-                font.family: Theme.fontFamily
-                font.pixelSize: Theme.fsRow
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Re-frame later"
+                    color: app.fullMonitor ? Theme.text2
+                         : reframeMa.containsMouse ? Theme.text3 : Theme.text4
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsRow
+                }
             }
 
             MouseArea {
@@ -241,8 +256,7 @@ Item {
                 contentItem: Text {
                     // reframeTip.text, not parent.text: contentItem's parent is a bare
                     // QQuickItem, so `parent.text` resolves to undefined and the tip
-                    // renders empty -- silently. qmllint [missing-property] is what
-                    // catches that, which is why it runs in the suite.
+                    // renders empty -- silently. qmllint [missing-property] catches it.
                     text: reframeTip.text
                     color: Theme.text2
                     font.family: Theme.fontFamily
@@ -255,7 +269,7 @@ Item {
         }
         Rectangle {
             width: 1; height: 26; color: Theme.hairline
-            visible: app.mode !== 0 && app.sel !== null
+            visible: app.mode !== 0
         }
 
         // The teleprompter. It belongs here rather than in the editor because it is a

@@ -32,7 +32,13 @@ Rectangle {
 
     // Front-most first: the bridge sends layers sorted by ascending z (back to front),
     // and this list draws the opposite way up on purpose.
-    readonly property var ordered: (st.layers || []).slice().reverse()
+    // Camera segments are excluded: they are a TRACK, with their own timeline row and
+    // their own inspector, and listing them here as generic layers put unnamed rows
+    // with an empty glyph in the list -- one per segment, growing every time the track
+    // was split.
+    readonly property var ordered: (st.layers || [])
+        .filter(function (l) { return l.type !== "webcam" })
+        .reverse()
 
     implicitWidth: 236
     color: Theme.bgDeep

@@ -82,6 +82,7 @@ class InputRegistry:
         self._args: list[list[str]] = []
         self._labels: dict[str, str] = {}
         self._queues: dict[str, list[str]] = {}
+        self._unconsumed: dict[str, list[str]] = {}
 
     def add(self, args: list[str], key: str | None = None) -> int:
         """Register an ffmpeg input argument group; returns its input index."""
@@ -95,6 +96,7 @@ class InputRegistry:
         """Point a named source at an existing stream label, e.g. the cut camera."""
         self._labels[key] = label
         self._queues.pop(key, None)
+        self._unconsumed[key] = [label]
 
     def bind_fanout(self, key: str, labels: list[str]) -> None:
         """Hand out one label per consumer, in order.
@@ -108,6 +110,7 @@ class InputRegistry:
             raise LayerError(f"bind_fanout({key!r}) needs at least one label")
         self._labels[key] = labels[0]
         self._queues[key] = list(labels)
+        self._unconsumed[key] = list(labels)
 
     def has(self, key: str) -> bool:
         return key in self._labels
@@ -117,13 +120,31 @@ class InputRegistry:
             raise LayerError(f"no source registered under {key!r}")
         queue = self._queues.get(key)
         if queue is None:
-            return self._labels[key]
-        if not queue:
+            label = self._labels[key]
+        elif not queue:
             # More consumers than the split was sized for. Raising beats handing out a
             # label twice, which is exactly the silent wrong-source bug fanout exists
             # to prevent.
             raise LayerError(f"more consumers of {key!r} than the split provides")
-        return queue.pop(0)
+        else:
+            label = queue.pop(0)
+        remaining = self._unconsumed.get(key)
+        if remaining and label in remaining:
+            remaining.remove(label)
+        return label
+
+    def unconsumed(self, key: str) -> list[str]:
+        """Labels bound for `key` that no layer actually read.
+
+        Counting consumers ahead of compiling is a guess, and compile_layer has several
+        early returns -- a range that a cut removes entirely, a rect that rounds to
+        nothing -- that happen BEFORE it asks for a source. ffmpeg rejects the whole
+        graph over one unconnected pad ("Filter 'split' has output 0 unconnected"), so
+        the caller drains whatever is left into a sink. Draining is deliberately not
+        conditioned on WHY a layer skipped: a future skip nobody has thought of yet must
+        not be able to break every export.
+        """
+        return list(self._unconsumed.get(key, []))
 
     @property
     def inputs(self) -> list[list[str]]:
@@ -185,11 +206,15 @@ def webcam_segments(
     describes -- so callers see one shape whether or not the track has been touched.
     An empty list means the camera is off for the whole recording.
     """
+    # The global toggle first, and it outranks the track. render gates the camera INPUT
+    # on this flag, so a track that kept drawing segments while it was off had the
+    # timeline promising a camera the export could not contain. Segments are KEPT, not
+    # discarded -- toggling off and on again gets the same track back.
+    if not edit.webcam.enabled:
+        return []
     explicit = [l for l in edit.layers if l.type == "webcam"]
     if explicit:
         return sorted(explicit, key=lambda l: l.t.start if l.t else 0)
-    if not edit.webcam.enabled:
-        return []
     return [webcam_layer(edit.webcam, canvas, FrameRange(0, max(1, total_frames)))]
 
 
@@ -202,9 +227,12 @@ def materialize_webcam(edit, canvas: Canvas, total_frames: int) -> list[Layer]:
     explicit = [l for l in edit.layers if l.type == "webcam"]
     if explicit:
         return sorted(explicit, key=lambda l: l.t.start if l.t else 0)
+    # The id is NOT rewritten. The timeline hands the implicit segment's id straight to
+    # the bridge, so renaming it here made every control on a freshly-clicked camera
+    # throw `no layer 'webcam'` -- the id the UI was holding stopped existing at the
+    # moment it became real.
     segments = webcam_segments(edit, canvas, total_frames)
     for seg in segments:
-        seg.id = "webcam1"
         edit.layers.append(seg)
     return segments
 
@@ -242,7 +270,21 @@ def add_webcam_segment(
     Overlapping an existing segment is refused -- two cameras on screen at once is not
     a thing this pipeline draws, and silently clipping one would be worse than saying no.
     """
-    segments = materialize_webcam(edit, canvas, total_frames)
+    # Re-arms the camera: emptying the track turns it off (see drop_webcam_segment), so
+    # adding the first segment back has to undo that or the new segment would be stored
+    # and never rendered.
+    #
+    # An emptied track must NOT be materialized on the way, though. Doing so recreated
+    # the implicit whole-take segment, which then overlapped the range being asked for
+    # and refused it -- so the camera, once removed entirely, could never be brought
+    # back. `enabled` being false is exactly the signal that the track was emptied on
+    # purpose rather than never touched.
+    was_off = not edit.webcam.enabled
+    edit.webcam.enabled = True
+    if was_off:
+        segments = [l for l in edit.layers if l.type == "webcam"]
+    else:
+        segments = materialize_webcam(edit, canvas, total_frames)
     for seg in segments:
         if seg.t is not None and seg.t.start < t.end and t.start < seg.t.end:
             return None
@@ -731,3 +773,21 @@ def _squircle_mask(w: int, h: int, n: float = SQUIRCLE_N) -> str:
     ay = f"(abs(Y-{b:.4f}+0.5)/{b:.4f})"
     t = f"pow(pow({ax},{n:.1f})+pow({ay},{n:.1f}),{1.0 / n:.6f})"
     return f"clip(255*({r:.4f}*(1-{t})+0.5),0,255)"
+
+
+def drop_webcam_segment(edit, layer_id: str) -> bool:
+    """Remove one segment; emptying the track turns the camera OFF.
+
+    Without the second half, deleting every segment fell back to the implicit
+    whole-take camera and the head reappeared for the entire recording -- the track
+    could add and move the camera but never remove it, which is the one thing the
+    feature exists for. `enabled` is the tombstone rather than a new schema field, and
+    add_webcam_segment lifts it again.
+    """
+    before = len(edit.layers)
+    edit.layers = [l for l in edit.layers if l.id != layer_id]
+    if len(edit.layers) == before:
+        return False
+    if not any(l.type == "webcam" for l in edit.layers):
+        edit.webcam.enabled = False
+    return True

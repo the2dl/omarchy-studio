@@ -467,7 +467,11 @@ Item {
 
             Repeater {
                 id: layerRepeater
-                model: root.st.layers || []
+                // Camera segments are layers, but they are drawn by WebcamOverlay below
+                // and listed on their own timeline row. Left in, each one rendered as
+                // LayerItem's unknown-type fallback -- an accent box reading
+                // "unsupported layer: webcam" over the video, once per segment.
+                model: (root.st.layers || []).filter(function (l) { return l.type !== "webcam" })
                 LayerItem {
                     id: item
                     spec: modelData
@@ -490,20 +494,54 @@ Item {
                 }
             }
 
+            // The segment covering the playhead, or null when the camera is off here.
+            // Binding this to the GLOBAL setting meant the preview showed one bubble in
+            // one place for the whole take while the export followed the track -- the
+            // editor and the export disagreeing, which is the failure this project
+            // treats as the worst kind.
+            readonly property var camSegments:
+                root.st.webcam_track ? root.st.webcam_track.segments : []
+            readonly property var camNow: {
+                for (var i = 0; i < camSegments.length; ++i)
+                    if (root.frame >= camSegments[i].start && root.frame < camSegments[i].end)
+                        return camSegments[i]
+                return null
+            }
+
             WebcamOverlay {
                 id: webcam
-                cam: root.st.webcam || ({})
+                visible: root.camNow !== null
+                cam: {
+                    var g = root.st.webcam || ({})
+                    if (!root.camNow)
+                        return g
+                    var m = {}
+                    for (var k in g)
+                        m[k] = g[k]
+                    m.rect = root.camNow.rect
+                    m.shape = root.camNow.shape
+                    m.mirror = root.camNow.mirror
+                    m.corner_radius = root.camNow.corner_radius
+                    return m
+                }
                 // Undo the stage's fit so the handles are a constant size on screen.
                 uiScale: root.fit > 0 ? 1 / root.fit : 1
                 selected: root.webcamSelected
                 previewMode: root.previewMode
                 onClicked: {
                     root.webcamSelected = true
-                    root.selectedId = ""
+                    // Selecting the bubble selects the segment it belongs to, so the
+                    // inspector edits the thing that is actually on screen.
+                    root.selectedId = root.camNow ? root.camNow.id : ""
                 }
                 onMoved: function (r) {
-                    Bridge.op("set_webcam", { rect: r },
-                              function () { webcam.commitDone() })
+                    // The segment under the playhead when there is one: dragging wrote
+                    // the global setting, which an explicit track means the export no
+                    // longer reads, so the bubble snapped back on the next state.
+                    var a = { rect: r }
+                    if (root.camNow)
+                        a.id = root.camNow.id
+                    Bridge.op("set_webcam", a, function () { webcam.commitDone() })
                 }
             }
 

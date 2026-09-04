@@ -234,6 +234,16 @@ def resolve_backdrop(bundle: Bundle) -> dict:
     return d
 
 
+def _camera_is_editable(bundle: Bundle) -> bool:
+    """Whether the camera can be moved at all -- the one rule, stated once.
+
+    A burned-in camera is part of the screen pixels and a recording without a camera
+    stream has nothing to place, so neither can carry a camera track. resolve_webcam
+    reports this to the UI; the ops enforce it, because the UI is not the only caller.
+    """
+    return not bundle.capture.camera_burned_in and bundle.capture.camera is not None
+
+
 def resolve_webcam(bundle: Bundle) -> dict:
     """The camera overlay box, plus why the controls may be dead.
 
@@ -584,7 +594,10 @@ def project_state(
                     # width as a fraction of the canvas, height derived.
                     "size": seg.w,
                     "fade_ms": seg.fade_frames * ms_per_frame,
-                    "rect": resolve_placement(seg.placement, canvas),
+                    # resolve_placement wraps its result in a "rect" key; unwrapped so
+                    # this matches the flat shape st.webcam.rect has. Nested, the
+                    # placement grid read r.x as undefined and posted NaN coordinates.
+                    "rect": resolve_placement(seg.placement, canvas)["rect"],
                 }
                 for seg in _layers.webcam_segments(bundle.edit, canvas, total)
             ],
@@ -647,6 +660,15 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         # A segment is selected, so the panel is editing THAT segment rather than the
         # whole-take default. Same field names either way, so the panel does not need a
         # second code path -- only an id to pass when it has one.
+        if not _camera_is_editable(bundle):
+            # Same guard the no-id branch has. Without it a burned-in recording, or one
+            # with no camera at all, could still be given a camera track that the
+            # renderer has no stream to fill.
+            raise BridgeError("this recording's camera cannot be moved")
+        # Before the lookup: the implicit whole-take segment is a real id to the UI but
+        # not yet a stored layer, so selecting an untouched camera and touching any
+        # control raised `no layer 'webcam'`.
+        _layers.materialize_webcam(edit, canvas, _safe_source_frames(bundle))
         layer = _find_layer(edit.layers, str(args["id"]))
         if layer.type != "webcam":
             raise BridgeError(f"layer {layer.id!r} is not a camera segment")
@@ -658,8 +680,11 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
                 pl.x, pl.y, pl.w, pl.h, pl.anchor)
         if "size" in args:
             # Through WebcamSettings.placement so a circle stays square in PIXELS -- the
-            # height is derived, exactly as it is for the whole-take setting.
-            probe = replace(edit.webcam, w=float(args["size"]))
+            # height is derived, exactly as it is for the whole-take setting. The probe
+            # carries THIS SEGMENT'S shape, not the global one: a circular segment under
+            # a rect default came out an ellipse, and vice versa.
+            probe = replace(edit.webcam, w=float(args["size"]),
+                            shape=str(layer.props.get("shape", edit.webcam.shape)))
             pl = probe.placement(canvas)
             layer.w, layer.h = pl.w, pl.h
         for key in ("shape", "corner_radius", "mirror"):
@@ -861,7 +886,13 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             layer.t = _range_from_ms(tb, args.get("start_ms"), args.get("end_ms"))
 
     elif op == "delete_layer":
-        edit.layers.remove(_find_layer(edit.layers, args["id"]))
+        victim = _find_layer(edit.layers, args["id"])
+        if victim.type == "webcam":
+            # Through the model, because emptying the camera track has to turn the
+            # camera OFF rather than fall back to the whole-take default.
+            _layers.drop_webcam_segment(edit, victim.id)
+        else:
+            edit.layers.remove(victim)
 
     elif op == "add_cut":
         r = _range_from_ms(tb, args["start_ms"], args["end_ms"])
@@ -882,6 +913,8 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         edit.cuts = cuts
 
     elif op == "split_webcam":
+        if not _camera_is_editable(bundle):
+            raise BridgeError("this recording's camera cannot be moved")
         at = tb.to_frame(float(args["at_ms"]) / 1000.0)
         if _layers.split_webcam(edit, canvas, _safe_source_frames(bundle), at) is None:
             # Not an error: the playhead sitting on a seam, or outside every segment, is
@@ -890,6 +923,8 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             pass
 
     elif op == "add_webcam_segment":
+        if not _camera_is_editable(bundle):
+            raise BridgeError("this recording's camera cannot be moved")
         t = _range_from_ms(tb, args.get("start_ms"), args.get("end_ms"))
         if t is None:
             raise BridgeError("add_webcam_segment needs a start and an end")

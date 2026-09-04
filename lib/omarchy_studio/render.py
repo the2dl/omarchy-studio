@@ -235,6 +235,16 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
         g.add(frag.filter_chain)
         cur = frag.label_out
 
+    # The count above is a guess made before compiling, and compile_layer skips a layer
+    # -- returning before it ever asks for a source -- when a cut removes its range
+    # entirely or its rect rounds to nothing. Every label left over has to go somewhere:
+    # ffmpeg rejects the ENTIRE graph over one unconnected pad, so a camera segment
+    # sitting inside the recorded countdown took the whole export down with it. This
+    # covers the single-segment case too, where there is no split and the cut camera
+    # label itself would dangle.
+    for orphan in registry.unconsumed("camera"):
+        g.add(f"{orphan}nullsink")
+
     tail = "format=yuv420p"
     if for_proxy and canvas.width > 1920:
         tail = "scale=1920:-2:flags=bicubic," + tail
@@ -429,7 +439,11 @@ def _layer_list(bundle: Bundle, registry: layers_mod.InputRegistry) -> list[Laye
     leave a webcam layer asking the registry for a stream nobody bound.
     """
     layer_list = [_resolve_asset(l, bundle) for l in bundle.edit.layers if l.enabled]
-    has_webcam = any(l.type == "webcam" for l in layer_list)
+    # Against ALL layers, not the enabled ones: a track whose only segment is switched
+    # off is a camera the user turned off for that stretch, and testing the filtered
+    # list read it as "no track at all" and appended the whole-take camera instead --
+    # so disabling the one segment made the head play for the entire recording.
+    has_webcam = any(l.type == "webcam" for l in bundle.edit.layers)
     if registry.has("camera") and not has_webcam:
         layer_list.append(layers_mod.webcam_layer(bundle.edit.webcam, bundle.canvas))
     elif has_webcam and not registry.has("camera"):

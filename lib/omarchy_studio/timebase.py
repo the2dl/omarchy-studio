@@ -151,9 +151,17 @@ class CutMap:
     thing it annotates.
     """
 
-    def __init__(self, cuts: list[FrameRange], total_frames: int) -> None:
+    def __init__(self, cuts: list[FrameRange], total_frames: int,
+                 head_pad: int = 0, tail_pad: int = 0) -> None:
         self.cuts = normalize(cuts)
         self.total_frames = total_frames
+        # Output-only time, before and after everything that was recorded. Cuts can
+        # only ever REMOVE time, so without these the output can never be longer than
+        # the capture and a title card has nowhere to live. Nothing was recorded in a
+        # pad, which is the whole point and also the whole constraint: there is no
+        # camera and no audio there, because none exists.
+        self.head_pad = max(0, int(head_pad))
+        self.tail_pad = max(0, int(tail_pad))
         for c in self.cuts:
             if c.end > total_frames:
                 raise TimebaseError(
@@ -170,15 +178,42 @@ class CutMap:
             self.kept.append(FrameRange(cursor, total_frames))
 
     @property
-    def output_frames(self) -> int:
+    def kept_frames(self) -> int:
+        """Output frames that came from the recording."""
         return sum(len(k) for k in self.kept)
+
+    @property
+    def output_frames(self) -> int:
+        return self.head_pad + self.kept_frames + self.tail_pad
+
+    def remap_pad(self, pad: str, r: FrameRange) -> list[FrameRange]:
+        """Project a range given in PAD frames onto the output timeline.
+
+        A second coordinate space, and deliberately not folded into the first. Layer
+        ranges are source frames so that adding or deleting a cut never slides an
+        annotation off what it annotates -- and a pad has no source frames at all. The
+        alternatives both slide something: negative source indices for the head pad
+        break FrameRange's invariant, and re-basing every layer on output time means
+        growing the intro drags every annotation in the recording along with it.
+        """
+        if pad == "head":
+            span, base = self.head_pad, 0
+        elif pad == "tail":
+            span, base = self.tail_pad, self.head_pad + self.kept_frames
+        else:
+            raise TimebaseError(f"unknown pad {pad!r}")
+        start = max(0, min(r.start, span))
+        end = max(start, min(r.end, span))
+        if end <= start:
+            return []
+        return [FrameRange(base + start, base + end)]
 
     def is_cut(self, source_frame: int) -> bool:
         return any(source_frame in c for c in self.cuts)
 
     def to_output(self, source_frame: int) -> int | None:
         """Output frame index, or None if this source frame was cut away."""
-        offset = 0
+        offset = self.head_pad
         for k in self.kept:
             if source_frame in k:
                 return offset + (source_frame - k.start)
@@ -203,7 +238,7 @@ class CutMap:
         emits a compact gate.
         """
         pieces: list[FrameRange] = []
-        offset = 0
+        offset = self.head_pad
         for k in self.kept:
             hit = r.intersect(k)
             if hit is not None:

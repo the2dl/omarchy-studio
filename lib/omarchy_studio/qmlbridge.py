@@ -547,6 +547,14 @@ def project_state(
         # other setting rather than holding a copy that could drift from the file the
         # renderer actually reads.
         "export_preset": bundle.edit.export_preset,
+        # Output-only time at each end. `head` shifts every recorded frame later, so
+        # the timeline draws the recording starting at head rather than at zero.
+        "pads": {
+            "head": bundle.edit.head_pad_frames,
+            "tail": bundle.edit.tail_pad_frames,
+            "head_ms": bundle.edit.head_pad_frames * ms_per_frame,
+            "tail_ms": bundle.edit.tail_pad_frames * ms_per_frame,
+        },
         "timebase": {
             "fps_num": tb.fps_num,
             "fps_den": tb.fps_den,
@@ -962,6 +970,24 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
                 edit, canvas, _safe_source_frames(bundle), t) is None:
             raise BridgeError("that overlaps a segment the camera is already on for")
 
+    elif op == "set_pads":
+        # Frames, via the timebase, like every other duration in the project -- a pad
+        # measured in ms would drift against the grid the gates are evaluated on.
+        for key, field in (("head_ms", "head_pad_frames"), ("tail_ms", "tail_pad_frames")):
+            if key in args:
+                setattr(edit, field, max(0, tb.to_frame(float(args[key]) / 1000.0)))
+        # A pad that shrinks past a layer living in it would leave that layer with
+        # nothing to sit on, so the layer is clamped rather than left dangling.
+        for layer in edit.layers:
+            if not layer.pad or layer.t is None:
+                continue
+            span = (edit.head_pad_frames if layer.pad == "head"
+                    else edit.tail_pad_frames)
+            if span <= 0:
+                layer.pad, layer.t = "", None
+            elif layer.t.end > span:
+                layer.t = FrameRange(min(layer.t.start, span - 1), span)
+
     elif op == "set_export":
         want = str(args["export_preset"])
         if want not in project_mod.EXPORT_PRESETS:
@@ -979,7 +1005,17 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
 
 
 def _next_z(layers: list[Layer]) -> int:
-    return (max((l.z for l in layers), default=0) + 1) if layers else 1
+    """The z for a newly added layer -- above the other content, below the camera.
+
+    Camera segments sit at 100 and are not in the layer list, so they cannot be
+    reordered against. Counting them here made every new layer land at 101: add a
+    full-frame image, which is exactly what a title card is, and it covered the
+    speaker's own face. The reorder in LayerList already rewrites the stack as 1..n,
+    so ignoring the camera here is also what makes the initial z agree with the one a
+    single drag would produce.
+    """
+    content = [l.z for l in layers if l.type != "webcam"]
+    return (max(content) + 1) if content else 1
 
 
 def _find_layer(layers: list[Layer], layer_id: str) -> Layer:

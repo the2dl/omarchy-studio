@@ -418,3 +418,39 @@ def test_looking_at_a_track_does_not_store_it(tmp_path):
     for _ in range(3):
         qmlbridge.project_state(b)
     assert b.edit.layers == []
+
+
+@needs_ffmpeg
+def test_a_new_layer_lands_under_the_camera(tmp_path):
+    """A full-frame image is exactly what a title card is, and it used to cover the
+    speaker's own face.
+
+    _next_z took max(z)+1 across ALL layers, and camera segments sit at 100, so every
+    new layer arrived at 101 -- on top of the bubble. Camera segments are not in the
+    layer list either, so there was no way to reorder out of it; the only fix was to
+    know the number. LayerList.reorder already rewrites the stack as 1..n, so this also
+    makes the initial z agree with what a single drag would produce.
+    """
+    root = tmp_path / "zorder"
+    synthetic.make_bundle(root, seconds=2.0, width=320, height=180)
+    b = Bundle(root)
+    layers_mod.materialize_webcam(b.edit, b.canvas, 60)
+    card = root / "card.png"
+    card.write_bytes((Path(__file__).parent / "assets" / "card.png").read_bytes()
+                     if (Path(__file__).parent / "assets" / "card.png").exists()
+                     else _one_pixel_png())
+    qmlbridge.apply_op(b, "add_image", {"path": str(card)})
+    qmlbridge.apply_op(b, "add_text", {"rect": {"x": 0, "y": 0, "width": 10, "height": 10}})
+
+    camera_z = max(l.z for l in b.edit.layers if l.type == "webcam")
+    content = [l for l in b.edit.layers if l.type != "webcam"]
+    assert content, "nothing was added"
+    for layer in content:
+        assert layer.z < camera_z, f"{layer.id} would cover the camera"
+
+
+def _one_pixel_png() -> bytes:
+    import base64
+    return base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )

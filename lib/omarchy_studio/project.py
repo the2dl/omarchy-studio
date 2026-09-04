@@ -150,6 +150,10 @@ class Layer:
     id: str
     type: str  # image | text | shape | blur | pixelate | webcam | zoom
     t: FrameRange | None = None  # None means "the whole recording"
+    # "" | "head" | "tail". When set, `t` is frames within THAT PAD rather than source
+    # frames -- a pad has no source frames, so it needs its own coordinate space. See
+    # CutMap.remap_pad for why this is not folded into source time.
+    pad: str = ""
     x: float = 0.0
     y: float = 0.0
     w: float = 1.0
@@ -359,6 +363,11 @@ class Edit:
     cursor: CursorSettings = field(default_factory=CursorSettings)
     normalize_audio: bool = True
     trim_head_frames: int = 0
+    # Output-only time at each end, so a title or end card has somewhere to live. Cuts
+    # can only remove time; these are the only way the output gets longer than the
+    # capture. Nothing recorded exists inside them -- no camera, no audio.
+    head_pad_frames: int = 0
+    tail_pad_frames: int = 0
     # Named by intent, resolved against the canvas at render time -- see
     # render.EXPORT_HEIGHTS. Lives here rather than as a flag-only option so the editor
     # and the CLI cannot disagree about what "export this" means, and so the choice
@@ -377,6 +386,8 @@ class Edit:
             "cursor": asdict(self.cursor),
             "normalize_audio": self.normalize_audio,
             "trim_head_frames": self.trim_head_frames,
+            "head_pad_frames": self.head_pad_frames,
+            "tail_pad_frames": self.tail_pad_frames,
             "export_preset": self.export_preset,
         }
 
@@ -397,6 +408,8 @@ class Edit:
             cursor=CursorSettings.from_dict(d.get("cursor", {})),
             normalize_audio=bool(d.get("normalize_audio", True)),
             trim_head_frames=int(d.get("trim_head_frames", 0)),
+            head_pad_frames=max(0, int(d.get("head_pad_frames", 0))),
+            tail_pad_frames=max(0, int(d.get("tail_pad_frames", 0))),
             # An unknown name (an older bundle, a hand-edited file) falls back rather
             # than raising: a bad preset must not make a recording unopenable.
             export_preset=(

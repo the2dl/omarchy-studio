@@ -382,8 +382,15 @@ def compile_layer(
         )
         return None
 
-    span = layer.t if layer.t is not None else FrameRange(0, cutmap.total_frames)
-    ranges = cutmap.remap(span)
+    if layer.pad:
+        # Pad frames, not source frames: a layer in the head or tail pad lives in
+        # output-only time, where nothing was recorded.
+        span = layer.t if layer.t is not None else FrameRange(
+            0, max(1, cutmap.head_pad if layer.pad == "head" else cutmap.tail_pad))
+        ranges = cutmap.remap_pad(layer.pad, span)
+    else:
+        span = layer.t if layer.t is not None else FrameRange(0, cutmap.total_frames)
+        ranges = cutmap.remap(span)
     if not ranges:
         return None  # the whole layer sits inside a cut
     gate = frame_gate(ranges)

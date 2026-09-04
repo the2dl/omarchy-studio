@@ -194,6 +194,29 @@ def resolve(bd: "BackdropSettings", canvas: "Canvas") -> Background:
     return Background(CUSTOM, "Custom", SOLID, (bd.color,))
 
 
+def pad_colour(bd: "BackdropSettings") -> str:
+    """One flat colour for the head/tail pads, as an ffmpeg colour string.
+
+    The backdrop's own colour, so a card that does not fill the frame sits on the same
+    ground the recording does rather than on a black band nothing else in the project
+    uses. A gradient collapses to its first stop: tpad takes one colour, and the pad is
+    behind a card rather than a surface in its own right.
+
+    The default is the backdrop's default colour rather than black for the same reason
+    -- it is what the rest of the project would have drawn there.
+    """
+    colour = (bd.color or "").strip()
+    if not is_color(colour):
+        return DEFAULT_PAD_COLOUR
+    # ffmpeg takes 0xRRGGBB; the project stores CSS hex.
+    return "0x" + colour.lstrip("#")
+
+
+# The backdrop's own default, so an untouched project pads with the colour it would
+# have used behind a backdrop rather than with a black nobody chose.
+DEFAULT_PAD_COLOUR = "0x1b1d24"
+
+
 # --- gradient geometry ------------------------------------------------------
 
 

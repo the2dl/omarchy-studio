@@ -129,7 +129,9 @@ def effective_cutmap(bundle: Bundle) -> CutMap:
     head = int(bundle.edit.trim_head_frames)
     if head > 0:
         ranges.append(FrameRange(0, min(head, total)))
-    return CutMap(ranges, total)
+    return CutMap(ranges, total,
+                  head_pad=bundle.edit.head_pad_frames,
+                  tail_pad=bundle.edit.tail_pad_frames)
 
 
 def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
@@ -202,6 +204,7 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
     if cam_aligned:
         registry.bind("camera", labels[cam_aligned])
 
+    cur = _pad_ends(g, cur, cutmap, edit, tb)
     cur = _cursor(g, cur, bundle, cutmap, registry)
 
     zf = zoom_filter(_segments(bundle, cutmap), canvas, tb)
@@ -262,6 +265,22 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
     maps = ["-map", "[vout]"]
     if has_audio:
         aout = labels[audio_label]
+        if cutmap.head_pad > 0 or cutmap.tail_pad > 0:
+            # Silence for the pads, and the HEAD delay is what keeps the recording's
+            # audio under its own picture: pad the video without delaying the audio and
+            # every word lands `head_pad` frames early for the whole export.
+            #
+            # Nothing was recorded in a pad, so there is nothing else it could be. A
+            # card you talk over is a different thing entirely -- an image covering the
+            # first seconds of the real recording, where the audio is real.
+            secs = tb.fps_den / tb.fps_num
+            steps = []
+            if cutmap.head_pad > 0:
+                steps.append(f"adelay=all=1:delays={cutmap.head_pad * secs * 1000.0:.3f}")
+            if cutmap.tail_pad > 0:
+                steps.append(f"apad=pad_dur={cutmap.tail_pad * secs:.3f}")
+            g.add(f"{aout}{','.join(steps)}[apadded]")
+            aout = "[apadded]"
         if edit.normalize_audio:
             # loudnorm AFTER the cut: it measures the material it is normalizing, and a
             # cut that removes a loud passage changes the right answer.
@@ -280,6 +299,29 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
         head_trim_seconds=head_trim,
         input_specs=registry.inputs,
     )
+
+
+def _pad_ends(g: _Graph, cur: str, cutmap: CutMap, edit, tb: Timebase) -> str:
+    """Output-only frames at the head and tail, so a card has somewhere to live.
+
+    Applied to the base straight after the cut chain and BEFORE the cursor, the zoom
+    and the layers -- all of which are gated in output frames that already include the
+    head offset, so padding first is what makes those gates land where they say.
+
+    The ground is the backdrop's own colour, so a title card that does not fill the
+    frame sits on the same colour as the recording does rather than on a black band
+    nothing else in the project uses.
+    """
+    if cutmap.head_pad <= 0 and cutmap.tail_pad <= 0:
+        return cur
+    colour = backgrounds.pad_colour(edit.backdrop)
+    parts = []
+    if cutmap.head_pad > 0:
+        parts.append(f"start={cutmap.head_pad}:start_mode=add")
+    if cutmap.tail_pad > 0:
+        parts.append(f"stop={cutmap.tail_pad}:stop_mode=add")
+    g.add(f"{cur}tpad={':'.join(parts)}:color={colour}[padded]")
+    return "[padded]"
 
 
 def _align_camera(g: _Graph, label: str, offset: int, warmup: int = 0) -> str:

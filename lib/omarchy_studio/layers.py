@@ -38,8 +38,9 @@ from __future__ import annotations
 import re
 import warnings
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
-from .exprs import escape_drawtext, fade_filters, frame_gate
+from .exprs import escape_drawtext, escape_filter_value, fade_filters, frame_gate
 from .geometry import DEFAULT_REDACT, Canvas, Rect, ffmpeg_blur, ffmpeg_pixelate
 from .project import Layer, WebcamSettings
 from .timebase import CutMap, FrameRange, Timebase
@@ -397,6 +398,17 @@ def compile_layer(
     # The ramp runs over the layer's OUTPUT extent; remap already merged the pieces.
     ramp_span = FrameRange(ranges[0].start, ranges[-1].end)
 
+    if layer.type == "image" and not layer.props.get("path"):
+        # SKIPPED, not raised. render._resolve_asset empties `path` when the asset name
+        # escapes the bundle, and an unrenderable layer must not take the whole export
+        # down with it -- the same rule this function follows for a range a cut removed.
+        warnings.warn(
+            f"image layer {layer.id!r} has no asset inside the bundle; skipping it",
+            UnsupportedLayer,
+            stacklevel=2,
+        )
+        return None
+
     if layer.type in _REDACT_TYPES:
         return _compile_redaction(layer, name, canvas, gate, lin)
     return _compile_overlay(layer, name, canvas, cutmap, tb, inputs, gate, ramp_span, lin)
@@ -482,9 +494,12 @@ def _tile_image(
     inputs: InputRegistry,
     static: bool,
 ) -> tuple[list[str], str]:
-    path = layer.props.get("path") or layer.props.get("asset")
+    # `path` only: falling back to the raw `asset` name here would reintroduce the
+    # unconfined input that _resolve_asset exists to prevent, for any caller that
+    # reaches compile_layer without going through it.
+    path = layer.props.get("path")
     if not path:
-        raise LayerError(f"image layer {layer.id!r} has no props['path']")
+        raise LayerError(f"image layer {layer.id!r} has no usable props['path']")
     args = ["-i", str(path)] if static else [
         "-loop", "1",
         "-framerate", f"{tb.fps_num}/{tb.fps_den}",
@@ -503,6 +518,26 @@ def _tile_image(
     return ([f"[{idx}:v]format=rgba,{scale},setsar=1[{name}_s]"], f"[{name}_s]")
 
 
+def safe_fontfile(value: object) -> str:
+    """A font path that cannot end the filter, and that must actually be a font file.
+
+    Both halves matter. Escaping alone would still let a project point at any file on
+    disk; requiring an existing regular file alone would still let ':' and ',' through
+    and append filters. The default is used when the value is missing or does not
+    resolve, so a project referring to a font this machine does not have renders in the
+    default face rather than failing to export.
+    """
+    raw = str(value) if value else ""
+    if raw:
+        try:
+            path = Path(raw)
+            if path.is_file():
+                return escape_filter_value(str(path))
+        except (OSError, ValueError):
+            pass
+    return escape_filter_value(DEFAULT_FONTFILE)
+
+
 def _tile_text(
     layer: Layer, name: str, rect: Rect, cutmap: CutMap, tb: Timebase, static: bool
 ) -> tuple[list[str], str]:
@@ -510,7 +545,7 @@ def _tile_text(
     w, h = int(rect.w), int(rect.h)
     size = font_px(layer.props.get("font_px"), rect)
     color = _hexcol(layer.props.get("color", "white"))
-    fontfile = layer.props.get("fontfile", DEFAULT_FONTFILE)
+    fontfile = safe_fontfile(layer.props.get("fontfile"))
     box_rgb, box_alpha = split_color(layer.props.get("box_color", "black@0.0"))
     box_rgb = _hexcol(box_rgb)
     radius = radius_px(layer.props.get("radius", 0.0), rect)
@@ -678,10 +713,39 @@ def _color_source(
     rate = "r=1:d=1" if static else (
         f"r={tb.fps_num}/{tb.fps_den}:d={_output_seconds(cutmap, tb):.6f}"
     )
-    return f"color=c={color}:s={w}x{h}:{rate},format=rgba{label}"
+    # safe_color again at the point of use, not only at the callers: this is the last
+    # place a colour becomes graph text, and a future caller that forgets would
+    # reintroduce filter injection here rather than somewhere obvious.
+    return f"color=c={safe_color(color)}:s={w}x{h}:{rate},format=rgba{label}"
+
+
+# ffmpeg's own colour vocabulary: #rgb / #rrggbb / 0xRRGGBB, an optional @alpha, or one
+# of its named colours. Anything else is refused rather than escaped, because a colour
+# is a CLOSED SET -- escaping would merely pass nonsense to ffmpeg to interpret later,
+# while a crafted one ("white,drawtext=textfile=/home/you/.ssh/id_ed25519") ended the
+# filter and appended another. Confirmed: that read a file into the exported video.
+_COLOUR_RE = re.compile(
+    r"^(?:#[0-9A-Fa-f]{3,8}|0x[0-9A-Fa-f]{3,8}|[A-Za-z][A-Za-z0-9]{0,31})"
+    r"(?:@(?:0|1|0?\.[0-9]{1,6}|1\.0+))?$"
+)
+_SAFE_COLOUR_FALLBACK = "white"
+
+
+def safe_color(c: object, fallback: str = _SAFE_COLOUR_FALLBACK) -> str:
+    """A colour token that cannot end the filter it sits in.
+
+    Falls back rather than raising: a bad colour in someone's project should render in
+    the wrong colour, not refuse to export. The SECURITY property is that whatever comes
+    back matches _COLOUR_RE and so contains no ':' ',' '\\' or quote.
+    """
+    text = str(c) if c is not None else ""
+    if not _COLOUR_RE.match(text):
+        return fallback
+    return text
 
 
 def _hexcol(c: str) -> str:
+    c = safe_color(c)
     return "0x" + c.lstrip("#") if c.startswith("#") else c
 
 

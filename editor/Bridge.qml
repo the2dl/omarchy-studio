@@ -35,6 +35,26 @@ QtObject {
         return fallback
     }
 
+    // The token arrives in a FILE whose path is on the command line, not as the value
+    // itself. /proc/<pid>/cmdline is world-readable on Linux -- verified on this
+    // machine, no hidepid -- so a token on argv is legible to every local user, and the
+    // bridges it guards can stop a recording, rewrite the teleprompter mid-take, and
+    // (the HUD's `discard`) rmtree the bundle out of ~/Videos. The file is 0600 inside
+    // the 0700 XDG_RUNTIME_DIR, so its contents cross no user boundary; the path being
+    // public costs nothing.
+    function readTokenFile(path) {
+        if (!path)
+            return ""
+        var xhr = new XMLHttpRequest()
+        try {
+            xhr.open("GET", "file://" + path, false)   // sync: nothing may run before it
+            xhr.send()
+            return (xhr.responseText || "").trim()
+        } catch (e) {
+            return ""
+        }
+    }
+
     function url(path) {
         return "http://127.0.0.1:" + port + path
     }
@@ -166,7 +186,9 @@ QtObject {
 
     Component.onCompleted: {
         port = parseInt(arg("--port", "0"))
-        token = arg("--token", "")
+        // --token is still read as a fallback so an older launcher keeps working, but
+        // nothing in this tree passes it any more.
+        token = readTokenFile(arg("--token-file", "")) || arg("--token", "")
         bundle = arg("--bundle", "")
         selftestMs = parseInt(arg("--selftest", "0"))
         loadTheme()

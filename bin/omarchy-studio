@@ -100,10 +100,18 @@ def main(argv: list[str] | None = None) -> int:
 
     env = dict(os.environ)
     env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
+    token_file = qmlbridge.write_token_file(session.token)
+    # Qt refuses XMLHttpRequest on file:// unless this is set, and reading the token
+    # file is the one local read the editor does. Scoped to this child rather than
+    # exported: the QML it enables the read for is this app's own, shipped on disk
+    # beside the binary, and the alternative -- the token on the command line, where
+    # /proc hands it to every local user -- is strictly worse.
+    env["QML_XHR_ALLOW_FILE_READ"] = "1"
     argvq = [
         QML6, "-I", str(EDITOR), str(EDITOR / "main.qml"), "--",
         "--port", str(server.server_port),
-        "--token", session.token,
+        # The token's PATH, never its value: /proc/<pid>/cmdline is world-readable.
+        "--token-file", str(token_file),
         "--bundle", str(bundle.root),
     ]
     if a.selftest:

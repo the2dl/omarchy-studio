@@ -22,7 +22,8 @@ DAEMON="$ROOT/daemon/input_recorder.py"
 PYTHON="${OMARCHY_STUDIO_PYTHON:-$ROOT/.venv/bin/python}"
 [[ -x $PYTHON ]] || PYTHON="$(command -v python3)"
 
-STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/omarchy-studio"
+# 0700, or a private directory: this holds recording state, and /tmp is shared.
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp/omarchy-studio-$(id -u)}/omarchy-studio"
 STATE_FILE="$STATE_DIR/input-events.state"
 LOG_FILE="$STATE_DIR/input-events.log"
 

@@ -136,3 +136,39 @@ def escape_drawtext(s: str) -> str:
     the graph out verbatim rather than joining chains on newlines.
     """
     return "".join(_DRAWTEXT_ESCAPES.get(ch, ch) for ch in s)
+
+
+# --- untrusted values inside a filtergraph -----------------------------------
+#
+# escape_drawtext covers the TEXT BODY, and it holds. What it does not cover is every
+# other value interpolated around it -- fontfile, fontcolor, box colours, the colour of
+# a `color=` source. Those went in raw, and a `,` in one of them ENDS THE FILTER and
+# starts a new one, which makes a crafted edit.json able to append filters of its own:
+#
+#   fontfile = "<real font>:text=X,drawtext=textfile=/home/you/.ssh/id_ed25519,..."
+#
+# drawtext's `textfile=` renders a file's contents into the frame, so that is an
+# arbitrary file read painted into the exported video -- which the victim then shares.
+# Confirmed end to end against ffmpeg n9.0.1: a canary file's contents came back out of
+# the exported MP4.
+#
+# Two defences, and the choice between them is not stylistic:
+#   * A COLOUR is a closed vocabulary, so it is VALIDATED and rejected. Escaping a
+#     colour would let nonsense through to ffmpeg to be interpreted later.
+#   * A PATH cannot be enumerated, so it is escaped AND constrained by the caller to a
+#     place the project controls.
+
+_FILTER_VALUE_SPECIAL = ":,'[];="
+
+
+def escape_filter_value(s: str) -> str:
+    """Escape a value going into a filter option, so it cannot end the filter.
+
+    Backslash first, or the escapes added below get escaped again.
+    """
+    out = s.replace("\\", "\\\\")
+    for ch in _FILTER_VALUE_SPECIAL:
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+

@@ -23,7 +23,30 @@
 
 set -uo pipefail
 
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+# A private runtime directory, never bare /tmp.
+#
+# `${XDG_RUNTIME_DIR:-/tmp}` put every state file this program owns -- including the
+# supervisor's process set, whose (pid, start time) pairs are TRUSTED and signalled --
+# into a world-writable directory whenever the variable was unset. XDG_RUNTIME_DIR is
+# 0700 and per-user; the fallback is made to match rather than to be convenient. It is
+# created 0700 and refused if it already exists owned by anyone else.
+omarchy_runtime_dir() {
+  if [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR ]]; then
+    printf '%s' "$XDG_RUNTIME_DIR"
+    return 0
+  fi
+  local fallback="/tmp/omarchy-studio-$(id -u)"
+  mkdir -p -m 700 "$fallback" 2>/dev/null
+  if [[ -d $fallback && -O $fallback ]]; then
+    chmod 700 "$fallback" 2>/dev/null
+    printf '%s' "$fallback"
+    return 0
+  fi
+  # Someone else owns it: fall back to a fresh private directory rather than sharing.
+  mktemp -d "/tmp/omarchy-studio-XXXXXX"
+}
+
+RUNTIME_DIR="$(omarchy_runtime_dir)"
 PID_FILE="$RUNTIME_DIR/omarchy-studio-camera.pid"
 PREVIEW_PID_FILE="$RUNTIME_DIR/omarchy-studio-camera-preview.pid"
 FIFO="$RUNTIME_DIR/omarchy-studio-camera.fifo"
@@ -567,7 +590,22 @@ await_camera_frames() {
 # name check means a shell whose arguments merely mention it is never a target.
 fanout_pids() {
   local pid
-  for pid in $(pgrep -f "mkvtimestamp_v2 [^ ]*/media/cam\.tsv" 2>/dev/null); do
+  # The PID FILE first, verified. It was written and then never used to signal
+  # anything, while the pattern below did all the work -- and the pattern's `[^ ]*`
+  # cannot cross a SPACE, so a bundle under "~/My Videos" (which capture.py's own
+  # comment says is routine) matched nothing: stop signalled no one, the ffmpeg kept
+  # /dev/video0 open with the webcam light on, and cam.mp4 grew without end. That is
+  # the exact symptom the recorder records as previously observed.
+  pid=$(cat "$PID_FILE" 2>/dev/null)
+  if [[ -n $pid && $(ps -o comm= -p "$pid" 2>/dev/null) == "ffmpeg" ]]; then
+    echo "$pid"
+    return 0
+  fi
+  # Fallback for a camera started before the pid file was trustworthy. `.*` not
+  # `[^ ]*`, so a path with spaces still matches; -u so another account's process is
+  # never a candidate; and the comm check still means a shell that merely mentions the
+  # string is not one either.
+  for pid in $(pgrep -u "$(id -u)" -f "mkvtimestamp_v2 .*/media/cam\.tsv" 2>/dev/null); do
     [[ $(ps -o comm= -p "$pid" 2>/dev/null) == "ffmpeg" ]] && echo "$pid"
   done
 }
@@ -578,12 +616,12 @@ stop_preview() {
   alive "$pid" && kill -- "-$pid" 2>/dev/null
   rm -f "$PREVIEW_PID_FILE"
 
-  for pid in $(pgrep -f "$SELF_VIEW_MARKER" 2>/dev/null); do
+  for pid in $(pgrep -u "$(id -u)" -f "$SELF_VIEW_MARKER" 2>/dev/null); do
     [[ $(ps -o comm= -p "$pid" 2>/dev/null) == "mpv" ]] && kill "$pid" 2>/dev/null
   done
   # -x -f: the whole command line must be exactly this, so no wrapper shell that merely
   # mentions the FIFO can be caught by it.
-  pkill -x -f "cat $FIFO" 2>/dev/null
+  pkill -u "$(id -u)" -x -f "cat $FIFO" 2>/dev/null
 }
 
 stop_camera() {

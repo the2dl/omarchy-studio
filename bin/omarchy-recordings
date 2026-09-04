@@ -25,7 +25,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 
-from omarchy_studio import library  # noqa: E402
+from omarchy_studio import library, qmlbridge  # noqa: E402
 
 QML6 = "/usr/bin/qml6"
 EDITOR = REPO / "editor"
@@ -54,11 +54,13 @@ def main(argv: list[str] | None = None) -> int:
 
     env = dict(os.environ)
     env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
+    env["QML_XHR_ALLOW_FILE_READ"] = "1"
     qml = EDITOR / "library" / ("MenuDropdown.qml" if a.dropdown else "Recordings.qml")
     argvq = [
         QML6, "-I", str(EDITOR), str(qml), "--",
         "--port", str(server.server_port),
-        "--token", session.token,
+        # The token's PATH, never its value: /proc/<pid>/cmdline is world-readable.
+        "--token-file", str(qmlbridge.write_token_file(session.token)),
     ]
     if a.selftest:
         argvq += ["--selftest", str(a.selftest)]

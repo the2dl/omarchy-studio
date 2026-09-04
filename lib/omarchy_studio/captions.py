@@ -46,7 +46,8 @@ from .geometry import Rect
 # colour source or the hex-colour form drifts from the one every other tile uses, and
 # the drift is invisible until someone diffs rendered frames. `layers` imports this
 # module lazily, at its dispatch site, so this direction of the cycle is the safe one.
-from .layers import DEFAULT_FONTFILE, _color_source, _hexcol, split_color
+from .layers import (DEFAULT_FONTFILE, _color_source, _hexcol, safe_color,
+                     safe_fontfile, split_color)
 from .project import Layer
 from .timebase import CutMap, FrameRange, Timebase
 
@@ -215,7 +216,9 @@ def style_for(props: dict, rect: Rect) -> CaptionStyle:
     return CaptionStyle(
         font_px=size,
         color=_hexcol(str(props.get("color", DEFAULT_COLOR))),
-        fontfile=str(props.get("fontfile", DEFAULT_FONTFILE)),
+        # Same treatment as a text layer: captions reuse the identical prop spelling,
+        # so they inherited the identical filter-injection hole.
+        fontfile=safe_fontfile(props.get("fontfile")),
         box_color=str(props.get("box_color", DEFAULT_BOX_COLOR)),
         box_pad=max(0, box_pad),
         max_lines=max_lines,
@@ -406,7 +409,7 @@ def caption_tile(
         draws.append(
             f"drawtext=fontfile={style.fontfile}"
             f":text='{escape_drawtext(cue.text)}'"
-            f":fontsize={style.font_px}:fontcolor={style.color}{box}"
+            f":fontsize={style.font_px}:fontcolor={safe_color(style.color)}{box}"
             # text_align centres each wrapped line within the block; x/y then centre the
             # block in the tile, which is `_tile_text`'s expression unchanged, so a
             # one-line caption lands on the same pixel a text layer of the same string

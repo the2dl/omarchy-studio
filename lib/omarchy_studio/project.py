@@ -334,6 +334,22 @@ class BackdropSettings:
             self.background = backgrounds.CUSTOM
 
 
+# An hour of pad at 60fps. A pad is output-only time and its length went straight into
+# `-frames:v`, unbounded: `{"tail_pad_frames": 10000000000}` in an edit.json asked
+# ffmpeg for ten billion frames, which encodes until the disk is full. A title card is
+# seconds long; an hour is already absurd and still finite.
+MAX_PAD_FRAMES = 60 * 60 * 60
+
+
+def _clamp_pad(value: object) -> int:
+    """A pad length that cannot turn an export into a disk-fill."""
+    try:
+        frames = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(frames, MAX_PAD_FRAMES))
+
+
 # The export sizes, named by intent. Heights, because that is how the names read; the
 # width follows the canvas aspect. `native` is the capture's own grid.
 #
@@ -408,8 +424,8 @@ class Edit:
             cursor=CursorSettings.from_dict(d.get("cursor", {})),
             normalize_audio=bool(d.get("normalize_audio", True)),
             trim_head_frames=int(d.get("trim_head_frames", 0)),
-            head_pad_frames=max(0, int(d.get("head_pad_frames", 0))),
-            tail_pad_frames=max(0, int(d.get("tail_pad_frames", 0))),
+            head_pad_frames=_clamp_pad(d.get("head_pad_frames", 0)),
+            tail_pad_frames=_clamp_pad(d.get("tail_pad_frames", 0)),
             # An unknown name (an older bundle, a hand-edited file) falls back rather
             # than raising: a bad preset must not make a recording unopenable.
             export_preset=(

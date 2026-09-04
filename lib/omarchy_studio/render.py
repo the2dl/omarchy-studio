@@ -533,9 +533,31 @@ def _resolve_asset(layer: Layer, bundle: Bundle) -> Layer:
     Edit on disk must keep the portable name.
     """
     name = layer.props.get("asset")
-    if layer.type != "image" or not name or layer.props.get("path"):
+    if layer.type != "image":
         return layer
-    return replace(layer, props={**layer.props, "path": str(bundle.assets_dir / name)})
+
+    # The asset name is CONFINED to the bundle, and `path` is always recomputed from it
+    # rather than trusted.
+    #
+    # Both halves were exploitable. `props["path"]` was honoured verbatim when present,
+    # so a crafted edit.json could hand ffmpeg any path -- or any PROTOCOL, since no
+    # -protocol_whitelist is set: "http://..." makes the export fetch a URL from the
+    # victim's host, "/etc/shadow" reads whatever the user can read. And the asset name
+    # was joined to assets_dir without normalising, so "../../../../etc/passwd"
+    # resolved straight out of the bundle -- pathlib does not collapse "..".
+    #
+    # A layer whose asset escapes the bundle is dropped rather than repaired: there is
+    # no correct file to substitute, and rendering something else under an attacker's
+    # chosen name would be worse than rendering nothing.
+    if not name:
+        return replace(layer, props={**layer.props, "path": ""})
+    assets = bundle.assets_dir.resolve()
+    try:
+        resolved = (assets / str(name)).resolve()
+        resolved.relative_to(assets)
+    except (OSError, ValueError):
+        return replace(layer, props={**layer.props, "path": ""})
+    return replace(layer, props={**layer.props, "path": str(resolved)})
 
 
 # --- backdrop ---------------------------------------------------------------

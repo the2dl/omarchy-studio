@@ -283,13 +283,35 @@ def test_an_image_layers_asset_is_resolved_against_the_bundle(tmp_path):
     assert json.loads(b.edit_path.read_text())["layers"][0]["props"] == {"asset": "logo.png"}
 
 
-def test_an_explicit_image_path_still_wins_over_an_asset_name(tmp_path):
+def test_an_explicit_image_path_cannot_override_the_asset_name(tmp_path):
+    """`props["path"]` used to win, and that WAS a vulnerability.
+
+    Nothing legitimate sets it -- add_image copies the file into assets/ and stores only
+    the portable `asset` name; `path` is a render-time field. But it was honoured
+    verbatim when present, so a crafted edit.json handed ffmpeg any path it liked. With
+    no -protocol_whitelist that is not just an arbitrary local read: "http://..." makes
+    an export fetch a URL from the victim's machine.
+    """
     b = _tiny(tmp_path, "rec")
     b.edit.layers.append(
         Layer(id="i1", type="image", x=0.1, y=0.1, w=0.2, h=0.2,
               props={"path": "/somewhere/else.png", "asset": "logo.png"})
     )
-    assert "/somewhere/else.png" in render.build_graph(b).inputs
+    inputs = render.build_graph(b).inputs
+    assert "/somewhere/else.png" not in inputs
+    assert str(b.assets_dir / "logo.png") in inputs
+
+
+def test_an_asset_name_cannot_escape_the_bundle(tmp_path):
+    """pathlib does not collapse "..", so the name was joined to assets_dir and resolved
+    straight out of the bundle. A layer whose asset escapes is dropped rather than
+    repaired: there is no correct file to substitute."""
+    b = _tiny(tmp_path, "rec")
+    b.edit.layers.append(
+        Layer(id="i1", type="image", x=0.1, y=0.1, w=0.2, h=0.2,
+              props={"asset": "../../../../../../etc/passwd"})
+    )
+    assert not any("/etc/passwd" in a for a in render.build_graph(b).inputs)
 
 
 @pytest.mark.parametrize("block", [None, 0.012, 0.05, 24, 40])

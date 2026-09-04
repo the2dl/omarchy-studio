@@ -318,14 +318,20 @@ def test_the_wrap_width_follows_the_font_size():
 
 
 def test_style_prop_names_match_a_text_layer():
+    # A REAL font path. `fontfile` is validated now -- it must resolve to an existing
+    # file -- because a fontfile is interpolated into the graph and a ',' in it ended
+    # the drawtext and appended another with `textfile=`, reading a file into the
+    # exported video. "/tmp/x.ttf" does not exist, so it correctly falls back and the
+    # assertion below would be testing the fallback rather than the prop.
+    real_font = DEFAULT_FONTFILE
     layer = caption(
         segs((0.0, 1.0, "hi")),
-        font_px=20, color="#ff3b30", fontfile="/tmp/x.ttf", box_color="#101820@0.9",
+        font_px=20, color="#ff3b30", fontfile=real_font, box_color="#101820@0.9",
     )
     chain = compile_one(layer).filter_chain
     assert "fontsize=20" in chain
     assert "fontcolor=0xff3b30" in chain
-    assert "fontfile=/tmp/x.ttf" in chain
+    assert f"fontfile={real_font}" in chain
     assert "boxcolor=0x101820@0.9" in chain
 
 

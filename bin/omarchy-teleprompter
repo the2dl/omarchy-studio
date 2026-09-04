@@ -258,9 +258,13 @@ def main(argv: list[str] | None = None) -> int:
 
     env = dict(os.environ)
     env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
+    env["QML_XHR_ALLOW_FILE_READ"] = "1"
+    # The token's PATH, never its value. /state here rewrites the script the speaker is
+    # reading, mid-recording.
+    token_file = qmlbridge.write_token_file(token)
     proc = subprocess.Popen(
         [QML6, "-I", str(REPO / "editor"), str(PROMPTER_QML), "--",
-         "--port", str(server.server_port), "--token", token,
+         "--port", str(server.server_port), "--token-file", str(token_file),
          "--theme", json.dumps(theme_tokens())],
         env=env)
     PID_FILE.write_text(str(os.getpid()))

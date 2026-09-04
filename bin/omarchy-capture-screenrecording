@@ -84,8 +84,39 @@ COUNTDOWN_UNTIL_US=0
 STOPPED_DELIBERATELY="false"
 SCRIPT_ARGS="$*"
 
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
-RECORDING_FILE="/tmp/omarchy-screenrecord-filename"
+# A private runtime directory, never bare /tmp.
+#
+# `${XDG_RUNTIME_DIR:-/tmp}` put every state file this program owns -- including the
+# supervisor's process set, whose (pid, start time) pairs are TRUSTED and signalled --
+# into a world-writable directory whenever the variable was unset. XDG_RUNTIME_DIR is
+# 0700 and per-user; the fallback is made to match rather than to be convenient. It is
+# created 0700 and refused if it already exists owned by anyone else.
+omarchy_runtime_dir() {
+  if [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR ]]; then
+    printf '%s' "$XDG_RUNTIME_DIR"
+    return 0
+  fi
+  local fallback="/tmp/omarchy-studio-$(id -u)"
+  mkdir -p -m 700 "$fallback" 2>/dev/null
+  if [[ -d $fallback && -O $fallback ]]; then
+    chmod 700 "$fallback" 2>/dev/null
+    printf '%s' "$fallback"
+    return 0
+  fi
+  # Someone else owns it: fall back to a fresh private directory rather than sharing.
+  mktemp -d "/tmp/omarchy-studio-XXXXXX"
+}
+
+RUNTIME_DIR="$(omarchy_runtime_dir)"
+# In the per-user runtime dir, not /tmp. This was the one state file left in a
+# world-writable directory while everything beside it used XDG_RUNTIME_DIR. Another
+# account could pre-create the path -- it does not exist between recordings, so the
+# window is every idle moment -- and the recorder would then write the master's path
+# through their file, or through a symlink to somewhere else. fs.protected_symlinks and
+# fs.protected_regular are on here and block the worst of it, but those are the
+# machine's settings and not this program's to rely on; what is left even with them is
+# another user permanently denying the path.
+RECORDING_FILE="$RUNTIME_DIR/omarchy-screenrecord-filename"
 BUNDLE_FILE="$RUNTIME_DIR/omarchy-studio-bundle"
 # Which processes belong to THIS recording. The stop path is a second invocation of
 # this script and has none of the variables that knew their pids, so it used to hunt
@@ -101,7 +132,7 @@ PROCS_FILE="$RUNTIME_DIR/omarchy-studio-procs.json"
 COUNTDOWN_FILE="$RUNTIME_DIR/omarchy-studio-countdown-until-us"
 IPC_SOCKET="$RUNTIME_DIR/omarchy-studio-gsr.sock"
 REGION_FILE="$RUNTIME_DIR/omarchy-screenrecord-region"
-LOG_FILE=$([[ ${OMARCHY_SCREENRECORD_DEBUG:-false} == "true" ]] && echo "/tmp/omarchy-screenrecord.log" || echo "/dev/null")
+LOG_FILE=$([[ ${OMARCHY_SCREENRECORD_DEBUG:-false} == "true" ]] && echo "$RUNTIME_DIR/omarchy-screenrecord.log" || echo "/dev/null")
 # A one-line-per-event breadcrumb trail, always on, separate from the verbose debug log.
 # It exists because "I pressed Record and nothing happened" was unanswerable: the
 # verbose log is opt-in and defaults to /dev/null, so a failed recording left no trace
@@ -118,15 +149,15 @@ trail() {
 }
 # gsr's stderr, always kept for the current recording: the portal backend's geometry is
 # read out of it, so it cannot go to /dev/null the way the debug log can.
-GSR_STDERR="${XDG_RUNTIME_DIR:-/tmp}/omarchy-studio-gsr.err"
+GSR_STDERR="$RUNTIME_DIR/omarchy-studio-gsr.err"
 # Where gsr keeps the portal's restore token. The share picker appears once per monitor;
 # afterwards the token (persisted by xdg-desktop-portal, survives reboots while an output
 # of that name exists) skips it.
 PORTAL_TOKEN_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gpu-screen-recorder/restore_token"
-HUD_PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-studio-hud.pid"
+HUD_PID_FILE="$RUNTIME_DIR/omarchy-studio-hud.pid"
 # Only set when the setup bar's Script toggle raised the prompter, so a prompter the
 # user started themselves is never taken away from them.
-PROMPTER_OWNED_FILE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-studio-teleprompter.owned-by-recording"
+PROMPTER_OWNED_FILE="$RUNTIME_DIR/omarchy-studio-teleprompter.owned-by-recording"
 
 # The one place cursor capture is decided. gsr burns the cursor into the frame and
 # magnifies it softly under zoom; the fix is a synthetic cursor rendered from the event
@@ -235,8 +266,8 @@ cleanup_webcam() {
   # and which used to send `pkill -f WebcamOverlay` at the whole process table.
   if tracked_recording; then
     omarchy-studio-procs signal "$PROCS_FILE" SIGTERM webcam_overlay >/dev/null 2>&1
-  else
-    pkill -f "WebcamOverlay" 2>/dev/null
+  elif legacy_fallback_ok; then
+    pkill -u "$(id -u)" -f "WebcamOverlay" 2>/dev/null
   fi
   rm -f "$REGION_FILE"
 }
@@ -806,7 +837,7 @@ stop_screenrecording() {
     omarchy-studio-procs wait "$PROCS_FILE" 30 gsr >/dev/null 2>&1
   else
     local count=0
-    while pgrep -f "^gpu-screen-recorder" >/dev/null && ((count < 300)); do
+    while pgrep -u "$(id -u)" -f "^gpu-screen-recorder" >/dev/null && ((count < 300)); do
       sleep 0.1
       count=$((count + 1))
     done
@@ -826,7 +857,7 @@ stop_screenrecording() {
     if tracked_recording; then
       omarchy-studio-procs signal "$PROCS_FILE" SIGKILL gsr >/dev/null 2>&1
     else
-      pkill -9 -f "^gpu-screen-recorder"
+      pkill -u "$(id -u)" -9 -f "^gpu-screen-recorder"
     fi
     omarchy-notification-send -u critical -t 5000 "Screen recording error" "Recording process had to be force-killed. Video may be corrupted."
     rm -f "$RECORDING_FILE" "$BUNDLE_FILE"
@@ -936,6 +967,17 @@ tracked_recording() {
   [[ -f $PROCS_FILE ]]
 }
 
+# Whether the pattern fallbacks may run at all. They exist for ONE case -- a recording
+# started by a build that predates the state file -- and that case is only possible if
+# a recorder is actually running while no state file exists. Idle is not that case: the
+# state file is removed at the end of every stop, so a cancelled start (Escape at the
+# picker, a failed launch) reached cleanup with no state file and fell straight through
+# to `pkill -f WebcamOverlay` against the whole process table. That matched, in testing,
+# an editor holding a file whose NAME contained the string.
+legacy_fallback_ok() {
+  ! tracked_recording && pgrep -u "$(id -u)" -f "^gpu-screen-recorder" >/dev/null
+}
+
 # SIGINT, to the process this recording actually started. gsr needs SIGINT rather than
 # SIGTERM to finalise its file. The pattern is only for a recording started by a build
 # that predates the state file -- without it, upgrading mid-recording would leave a take
@@ -944,7 +986,7 @@ interrupt_recorder() {
   if tracked_recording; then
     omarchy-studio-procs signal "$PROCS_FILE" SIGINT gsr >/dev/null 2>&1
   else
-    pkill -SIGINT -f "^gpu-screen-recorder"
+    pkill -u "$(id -u)" -SIGINT -f "^gpu-screen-recorder"
   fi
 }
 
@@ -952,7 +994,7 @@ recorder_still_up() {
   if tracked_recording; then
     omarchy-studio-procs pids "$PROCS_FILE" gsr >/dev/null 2>&1
   else
-    pgrep -f "^gpu-screen-recorder" >/dev/null
+    pgrep -u "$(id -u)" -f "^gpu-screen-recorder" >/dev/null
   fi
 }
 

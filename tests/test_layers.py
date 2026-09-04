@@ -244,9 +244,16 @@ def test_a_faded_image_is_looped_for_the_output_duration():
     assert args[args.index("-t") + 1] == "0.800000"
 
 
-def test_image_without_a_path_is_an_error():
-    with pytest.raises(LayerError):
-        compile_one(Layer(id="i", type="image", props={}))
+def test_image_without_a_usable_path_is_skipped_not_fatal():
+    """It used to raise, which took the whole export down with it.
+
+    render._resolve_asset now empties `path` when the asset name escapes the bundle --
+    a crafted edit.json could otherwise point ffmpeg at any file or URL -- and an
+    unrenderable layer must not stop the export, the same rule this compiler already
+    follows for a range a cut removed entirely.
+    """
+    with pytest.warns(UnsupportedLayer):
+        assert compile_one(Layer(id="i", type="image", props={})) is None
 
 
 def test_webcam_needs_a_bound_camera_stream():

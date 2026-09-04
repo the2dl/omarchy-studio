@@ -26,6 +26,22 @@ ApplicationWindow {
     property int port: 0
     property string token: ""
 
+    // The token arrives in a FILE whose path is on the command line, not as the value.
+    // /proc/<pid>/cmdline is world-readable on Linux, so a token on argv is legible to
+    // every local user; the file is 0600 inside the 0700 XDG_RUNTIME_DIR.
+    function readTokenFile(path) {
+        if (!path)
+            return ""
+        var xhr = new XMLHttpRequest()
+        try {
+            xhr.open("GET", "file://" + path, false)
+            xhr.send()
+            return (xhr.responseText || "").trim()
+        } catch (e) {
+            return ""
+        }
+    }
+
     function arg(name, fallback) {
         var a = Qt.application.arguments
         for (var i = 0; i < a.length - 1; ++i)
@@ -96,7 +112,7 @@ ApplicationWindow {
 
     Component.onCompleted: {
         win.port = parseInt(arg("port", "0"))
-        win.token = arg("token", "")
+        win.token = readTokenFile(arg("token-file", "")) || arg("token", "")
         var tokens = arg("theme", "")
         if (tokens !== "")
             Theme.load(tokens)

@@ -20,6 +20,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import tempfile
 import re
 import secrets
 import signal
@@ -1344,10 +1345,27 @@ class Exporter:
         with self._lock:
             return dict(self.status)
 
+    def _output_path(self, output: str | None) -> Path:
+        """Where the render is written.
+
+        Deliberately NOT confined to the bundle: the export pane offers a native Save
+        dialog and choosing a destination is the feature. Confining it would trade a
+        real capability for very little, because after the token moved off the argv
+        (see `Session`) the only callers that can reach this endpoint are processes
+        already running as the user -- and such a process can write files directly
+        without asking an exporter to do it.
+
+        The cross-user reachability that made an arbitrary output path genuinely
+        dangerous is fixed where it was caused, not papered over here.
+        """
+        if not output:
+            return self.bundle.root / f"{self.bundle.root.name}.mp4"
+        return Path(str(output))
+
     def start(self, output: str | None = None) -> dict:
         if self._proc and self._proc.poll() is None:
             raise BridgeError("an export is already running")
-        out = Path(output) if output else self.bundle.root / f"{self.bundle.root.name}.mp4"
+        out = self._output_path(output)
         self._set(state="running", progress=0.0, message="starting renderer", output=str(out))
         argv = [sys.executable, "-c", _RUNNER, self.MODULE, str(self.bundle.root), str(out)]
         try:
@@ -1418,6 +1436,32 @@ class Exporter:
         else:
             tail = [l for l in err.splitlines() if l.strip()][-3:]
             self._set(state="error", message=" / ".join(tail) or f"renderer exited {p.returncode}")
+
+
+def write_token_file(token: str) -> Path:
+    """Put the session token in a 0600 file and return its path.
+
+    NOT on the child's command line. /proc/<pid>/cmdline is world-readable on Linux --
+    no hidepid on a default install -- so a token passed as `--token <value>` is legible
+    to every local user on the machine, including ones with no business near this
+    session. The bridges it guards are not read-only: the recording HUD's `discard`
+    finalises a take and rmtree's the bundle, the teleprompter's /state rewrites the
+    script mid-recording, and /op edits the project.
+
+    XDG_RUNTIME_DIR is 0700 and per-user, so a 0600 file inside it is reachable only by
+    this user (and root, which is already game over). The PATH may be public; only the
+    contents matter. Falls back to a private temp dir when the runtime dir is unset
+    rather than dropping the file somewhere shared.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    directory = Path(runtime) if runtime else Path(tempfile.mkdtemp(prefix="omarchy-studio-"))
+    fd, name = tempfile.mkstemp(prefix="omarchy-studio-token-", dir=str(directory))
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, token.encode())
+    finally:
+        os.close(fd)
+    return Path(name)
 
 
 def _child_env(repo_root: Path) -> dict:
@@ -1545,7 +1589,11 @@ class _Handler(BaseHTTPRequestHandler):
         tok = self.headers.get("X-Studio-Token", "")
         if not tok and "?" in self.path:
             tok = self.path.split("?", 1)[1].partition("token=")[2].partition("&")[0]
-        return secrets.compare_digest(tok, self.session.token)
+        # On BYTES, not str. compare_digest raises TypeError for a non-ASCII str, so
+        # an unauthenticated client could crash the request thread -- and print a
+        # traceback -- just by sending a header with an accent in it.
+        return secrets.compare_digest(tok.encode("utf-8", "surrogateescape"),
+                                      self.session.token.encode("utf-8"))
 
     def _send(self, obj: Any, code: int = 200) -> None:
         body = json.dumps(obj).encode()

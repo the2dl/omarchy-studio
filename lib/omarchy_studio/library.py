@@ -534,8 +534,11 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
     def _authorized(self) -> bool:
+        # Bytes: compare_digest raises TypeError on a non-ASCII str, which an
+        # unauthenticated client can send at will.
         return secrets.compare_digest(
-            self.headers.get("X-Studio-Token", ""), self.session.token)
+            self.headers.get("X-Studio-Token", "").encode("utf-8", "surrogateescape"),
+            self.session.token.encode("utf-8"))
 
     def _send(self, obj: Any, code: int = 200) -> None:
         body = json.dumps(obj).encode()

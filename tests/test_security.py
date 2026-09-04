@@ -141,3 +141,35 @@ def test_a_pad_cannot_ask_for_ten_billion_frames():
     encoded until the disk filled."""
     assert Edit.from_dict({"tail_pad_frames": 10_000_000_000}).tail_pad_frames <= 60 * 60 * 60
     assert Edit.from_dict({"head_pad_frames": "nonsense"}).head_pad_frames == 0
+
+
+# --- the token file's own hygiene --------------------------------------------
+
+
+def test_the_token_file_is_private_and_swept(tmp_path, monkeypatch):
+    """A file per launch, forever, is a defect even when none of them leaks.
+
+    Moving the token off argv introduced exactly that: 68 files piled up in the runtime
+    directory in a day of testing, each holding a token for a session that had ended.
+    Launchers unlink their own; this sweep is the backstop for a crash or a kill -9.
+    """
+    import os
+    import stat
+    import time as _time
+
+    from omarchy_studio import qmlbridge
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    path = qmlbridge.write_token_file("a-token")
+    assert path.parent == tmp_path
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600, "the token file is not private"
+    assert path.read_text() == "a-token"
+
+    # A file older than any plausible session is collected on the next write.
+    stale = tmp_path / "omarchy-studio-token-ancient"
+    stale.write_text("old")
+    old = _time.time() - 48 * 60 * 60
+    os.utime(stale, (old, old))
+    qmlbridge.write_token_file("another")
+    assert not stale.exists(), "a stale token file survived the sweep"
+    assert path.exists(), "the sweep removed a token file that is still in use"

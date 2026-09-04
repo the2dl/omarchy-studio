@@ -577,6 +577,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         proc.terminate()
         proc.wait()
+    # This launch's token file; its child has read it long since.
+    token_file.unlink(missing_ok=True)
     session.meter.stop()
     session.done.set()   # unblock print_on_done if the window died without posting
     server.shutdown()

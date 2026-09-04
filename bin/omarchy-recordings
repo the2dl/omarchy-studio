@@ -82,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         proc.terminate()
         rc = proc.wait()
+    # This launch's token file; its child has read it long since.
+    token_file.unlink(missing_ok=True)
     session.quit_requested.set()
     server.shutdown()
     return rc

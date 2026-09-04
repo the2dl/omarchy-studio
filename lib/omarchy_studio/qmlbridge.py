@@ -21,6 +21,7 @@ import inspect
 import json
 import os
 import tempfile
+import time
 import re
 import secrets
 import signal
@@ -1438,6 +1439,33 @@ class Exporter:
             self._set(state="error", message=" / ".join(tail) or f"renderer exited {p.returncode}")
 
 
+_TOKEN_PREFIX = "omarchy-studio-token-"
+# Older than any plausible session. A launcher removes its own file when its child
+# exits; this is only for the ones a crash or a kill -9 left behind.
+_TOKEN_STALE_SECONDS = 24 * 60 * 60
+
+
+def _sweep_stale_token_files(directory: Path) -> None:
+    """Remove token files nothing is using any more.
+
+    Every launch writes one and, until this existed, nothing ever removed it: 68 had
+    piled up in the runtime directory during one day of testing. Each is 0600 in a 0700
+    directory so none of them leaked, but a file per launch forever is a defect, and
+    they hold tokens for sessions that ended.
+    """
+    try:
+        entries = list(directory.glob(_TOKEN_PREFIX + "*"))
+    except OSError:
+        return
+    now = time.time()
+    for entry in entries:
+        try:
+            if now - entry.stat().st_mtime > _TOKEN_STALE_SECONDS:
+                entry.unlink()
+        except OSError:
+            continue          # someone else's, or gone already: not ours to insist on
+
+
 def write_token_file(token: str) -> Path:
     """Put the session token in a 0600 file and return its path.
 
@@ -1455,6 +1483,7 @@ def write_token_file(token: str) -> Path:
     """
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     directory = Path(runtime) if runtime else Path(tempfile.mkdtemp(prefix="omarchy-studio-"))
+    _sweep_stale_token_files(directory)
     fd, name = tempfile.mkstemp(prefix="omarchy-studio-token-", dir=str(directory))
     try:
         os.fchmod(fd, 0o600)

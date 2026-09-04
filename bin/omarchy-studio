@@ -146,6 +146,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         proc.terminate()
         rc = proc.wait()
+    # This launch's token file, whose child has long since read it. Without this a
+    # file accumulated per launch forever -- 68 of them in one day of testing.
+    token_file.unlink(missing_ok=True)
     session.quit_requested.set()
     session.proxy.stop()
     session.exporter.cancel()

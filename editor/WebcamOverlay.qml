@@ -74,12 +74,16 @@ Item {
     height: showingLive ? liveH : rect.height
     visible: cam.enabled === true
 
-    // The export's shapes, reproduced rather than approximated. layers._tile_webcam does
-    // two things for circle and rounded: a SQUARE centre crop of the camera, then a
-    // stretch into the box. Preserving the aspect against the box instead would crop
-    // differently the moment the box is not square -- which the default 0.22x0.22 on a
-    // 16:9 canvas already is.
-    readonly property bool squareCrop: cam.shape === "circle" || cam.shape === "rounded"
+    // The export's shapes, reproduced rather than approximated -- this is the twin of
+    // layers._tile_webcam and has to move with it.
+    //
+    // It does ONE thing for every shape now: a centre crop of the camera to the BOX's
+    // aspect, then a scale into the box. It used to special-case the round ones and let
+    // `rect` stretch, which is what put a 4:3 sensor into a 716x716 square and made
+    // every face in a rect camera tall. Fixing the renderer alone left this half
+    // stretching, so the editor showed something the export would not produce -- the
+    // failure this file's own comment exists to prevent.
+    readonly property bool squareCrop: true
 
     Item {
         id: clipBox
@@ -97,30 +101,26 @@ Item {
 
         VideoOutput {
             id: camOut
-            // Laid out as a SQUARE and then squashed into the box, which is the crop the
-            // filtergraph takes: PreserveAspectCrop into a square item is the centre
-            // square of the camera frame, and the scale is the stretch that follows it.
+            // Laid out at the BOX's size and filled by cropping, which is exactly what
+            // the filtergraph does: crop the camera to this rectangle's aspect, then
+            // scale. No stretch anywhere, for any shape.
             x: 0; y: 0
-            width: root.squareCrop ? root.side : root.width
-            height: root.squareCrop ? root.side : root.height
-            fillMode: root.squareCrop ? VideoOutput.PreserveAspectCrop : VideoOutput.Stretch
+            width: root.width
+            height: root.height
+            fillMode: VideoOutput.PreserveAspectCrop
             transform: [
                 // The export's hflip, in the same place in the chain: before the scale.
                 Scale {
                     origin.x: camOut.width / 2
                     xScale: root.cam.mirror ? -1 : 1
-                },
-                Scale {
-                    xScale: root.squareCrop ? root.width / root.side : 1
-                    yScale: root.squareCrop ? root.height / root.side : 1
                 }
             ]
         }
     }
 
-    // The square the camera is cropped to before it is stretched into the box. Its exact
-    // value cancels out; it only has to be big enough that the downscale is the one that
-    // loses detail, not this.
+    // Kept for the masks, which are drawn against the tile. The camera itself is no
+    // longer laid out as a square and squashed: it is sized to the box and filled by
+    // cropping, which is what the filtergraph does.
     readonly property real side: Math.max(width, height, 2)
 
     // circle: the ellipse INSCRIBED in the tile, which is what layers._circle_mask draws.

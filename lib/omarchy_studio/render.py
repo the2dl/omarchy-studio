@@ -210,6 +210,16 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
         cur = "[zoomed]"
 
     layer_list = _layer_list(bundle, registry)
+
+    # One camera, several segments: ffmpeg consumes a labelled pad exactly once, so N
+    # webcam layers need N copies of it. Without the split the second segment silently
+    # rendered the SCREEN inside its mask -- a bubble full of desktop, no error anywhere.
+    cam_consumers = sum(1 for l in layer_list if l.type == "webcam")
+    if cam_aligned and cam_consumers > 1:
+        outs = [f"[cam_seg{i}]" for i in range(cam_consumers)]
+        g.add(f"{labels[cam_aligned]}split={cam_consumers}{''.join(outs)}")
+        registry.bind_fanout("camera", outs)
+
     if edit.backdrop.enabled:
         cur = _backdrop(g, cur, canvas, tb, edit.backdrop)
     elif layer_list:

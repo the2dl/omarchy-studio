@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .exprs import escape_drawtext, fade_filters, frame_gate
 from .geometry import DEFAULT_REDACT, Canvas, Rect, ffmpeg_blur, ffmpeg_pixelate
@@ -81,6 +81,7 @@ class InputRegistry:
     def __init__(self) -> None:
         self._args: list[list[str]] = []
         self._labels: dict[str, str] = {}
+        self._queues: dict[str, list[str]] = {}
 
     def add(self, args: list[str], key: str | None = None) -> int:
         """Register an ffmpeg input argument group; returns its input index."""
@@ -93,6 +94,20 @@ class InputRegistry:
     def bind(self, key: str, label: str) -> None:
         """Point a named source at an existing stream label, e.g. the cut camera."""
         self._labels[key] = label
+        self._queues.pop(key, None)
+
+    def bind_fanout(self, key: str, labels: list[str]) -> None:
+        """Hand out one label per consumer, in order.
+
+        ffmpeg consumes a labelled pad EXACTLY ONCE. Two webcam segments both reading
+        the camera's label produced no error and no camera: the second reference fell
+        through to the screen, so the second bubble showed the desktop inside its mask.
+        The caller emits a `split` and passes its outputs here.
+        """
+        if not labels:
+            raise LayerError(f"bind_fanout({key!r}) needs at least one label")
+        self._labels[key] = labels[0]
+        self._queues[key] = list(labels)
 
     def has(self, key: str) -> bool:
         return key in self._labels
@@ -100,7 +115,15 @@ class InputRegistry:
     def label(self, key: str) -> str:
         if key not in self._labels:
             raise LayerError(f"no source registered under {key!r}")
-        return self._labels[key]
+        queue = self._queues.get(key)
+        if queue is None:
+            return self._labels[key]
+        if not queue:
+            # More consumers than the split was sized for. Raising beats handing out a
+            # label twice, which is exactly the silent wrong-source bug fanout exists
+            # to prevent.
+            raise LayerError(f"more consumers of {key!r} than the split provides")
+        return queue.pop(0)
 
     @property
     def inputs(self) -> list[list[str]]:
@@ -134,6 +157,116 @@ def timebase_chain(label_in: str, tb: Timebase, label_out: str) -> str:
     first makes the two grids the same object.
     """
     return f"{label_in}fps={tb.fps_num}/{tb.fps_den},setsar=1{label_out}"
+
+
+# --- the webcam track -------------------------------------------------------
+#
+# The camera is a TRACK OF SEGMENTS, not a keyframed curve, and that is a decision
+# rather than a shortcut. What people ask for is "head on for the intro, gone for the
+# middle, back at the end" -- a clip operation. A curve would need a new interpolated
+# representation plus a second copy of the export's easing, and the editor and the
+# export disagreeing about easing is the worst class of bug this project has had. Fades
+# (Layer.fade_frames, already generic) supply the polish that motion would otherwise be
+# reached for. A segment can grow a start and end position later and animate between
+# them without any of this changing.
+#
+# Segments live in edit.layers as ordinary `webcam` layers, which render._layer_list
+# already prefers over Edit.webcam. So a take nobody has touched stays ONE static
+# setting and one toggle, and only becomes segments the first time it is split -- the
+# simple case never pays for the complicated one.
+
+
+def webcam_segments(
+    edit, canvas: Canvas, total_frames: int
+) -> list[Layer]:
+    """The camera's segments in time order.
+
+    Explicit layers when they exist, otherwise the single implicit one that Edit.webcam
+    describes -- so callers see one shape whether or not the track has been touched.
+    An empty list means the camera is off for the whole recording.
+    """
+    explicit = [l for l in edit.layers if l.type == "webcam"]
+    if explicit:
+        return sorted(explicit, key=lambda l: l.t.start if l.t else 0)
+    if not edit.webcam.enabled:
+        return []
+    return [webcam_layer(edit.webcam, canvas, FrameRange(0, max(1, total_frames)))]
+
+
+def materialize_webcam(edit, canvas: Canvas, total_frames: int) -> list[Layer]:
+    """Promote the implicit whole-take camera into a real segment, in place.
+
+    Called before any edit that needs something to act ON. Idempotent: a track that is
+    already explicit is returned untouched.
+    """
+    explicit = [l for l in edit.layers if l.type == "webcam"]
+    if explicit:
+        return sorted(explicit, key=lambda l: l.t.start if l.t else 0)
+    segments = webcam_segments(edit, canvas, total_frames)
+    for seg in segments:
+        seg.id = "webcam1"
+        edit.layers.append(seg)
+    return segments
+
+
+def split_webcam(
+    edit, canvas: Canvas, total_frames: int, at_frame: int
+) -> Layer | None:
+    """Cut the segment under `at_frame` in two. Returns the new right-hand half.
+
+    A split exactly on a boundary is a no-op rather than an error: the playhead sitting
+    on a seam is a normal place for it to be, and refusing would make the button feel
+    broken at the one position a user is most likely to try it from.
+    """
+    segments = materialize_webcam(edit, canvas, total_frames)
+    for seg in segments:
+        if seg.t is None or not (seg.t.start < at_frame < seg.t.end):
+            continue
+        right = replace(seg, id=_next_webcam_id(edit.layers),
+                        t=FrameRange(at_frame, seg.t.end),
+                        props=dict(seg.props))
+        seg.t = FrameRange(seg.t.start, at_frame)
+        edit.layers.append(right)
+        return right
+    return None
+
+
+def add_webcam_segment(
+    edit, canvas: Canvas, total_frames: int, t: FrameRange
+) -> Layer | None:
+    """A segment in a gap, styled like its nearest neighbour.
+
+    Inheriting the neighbour's look rather than the global default is what makes
+    "bring my head back at the end" one action: the head that comes back is the head
+    that left, in the same shape and size, and only its position is worth changing.
+    Overlapping an existing segment is refused -- two cameras on screen at once is not
+    a thing this pipeline draws, and silently clipping one would be worse than saying no.
+    """
+    segments = materialize_webcam(edit, canvas, total_frames)
+    for seg in segments:
+        if seg.t is not None and seg.t.start < t.end and t.start < seg.t.end:
+            return None
+    template = min(
+        segments,
+        key=lambda s: abs((s.t.start if s.t else 0) - t.start),
+        default=None,
+    )
+    if template is not None:
+        fresh = replace(template, id=_next_webcam_id(edit.layers), t=t,
+                        props=dict(template.props))
+    else:
+        fresh = webcam_layer(edit.webcam, canvas, t)
+        fresh.id = _next_webcam_id(edit.layers)
+    edit.layers.append(fresh)
+    return fresh
+
+
+def _next_webcam_id(existing: list[Layer]) -> str:
+    used = {l.id for l in existing}
+    n = 1
+    while f"webcam{n}" in used:
+        n += 1
+    return f"webcam{n}"
 
 
 def webcam_layer(

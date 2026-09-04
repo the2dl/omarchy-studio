@@ -51,10 +51,14 @@ Item {
     // front-most first (spec §2a "list = z-order"), so the timeline reverses it to
     // agree with the list rather than with the paint order.
     readonly property var layerRows: {
-        var a = (st.layers || []).slice()
+        // Camera segments are layers, but they have their own row below -- listing them
+        // here as well drew every one of them twice.
+        var a = (st.layers || []).filter(function (l) { return l.type !== "webcam" })
         a.reverse()
         return a
     }
+
+    readonly property var camSegments: st.webcam_track ? st.webcam_track.segments : []
 
     // The pending selection, in frames. A ruler drag or a right-button drag on the
     // rows marks a range; Cut (or a second C) turns it into a removed range.
@@ -701,6 +705,79 @@ Item {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
                             onClicked: root.preview.selectedZoomIndex = sel ? -1 : index
+                        }
+                    }
+                }
+            }
+        }
+
+        // camera: the segments the head is on for. A track of clips, not a curve --
+        // see layers.webcam_segments for why. An empty stretch is the head being off,
+        // which is the whole point of the row, so the lane's own background IS the
+        // "camera off" state and gets no block drawn over it.
+        Row {
+            visible: root.camSegments.length > 0 || (root.st.webcam_track ? root.st.webcam_track.explicit : false)
+            width: parent.width
+            spacing: 12
+            C.Caption {
+                width: Style.gutterWidth
+                text: "camera"
+                color: Theme.accent
+                anchors.verticalCenter: parent.verticalCenter
+                font.pixelSize: Theme.fsHint
+            }
+            Rectangle {
+                width: root.trackW
+                height: Style.zoomRowH
+                radius: Theme.radiusChip
+                color: Theme.fillSubtle
+                clip: true
+
+                // A click on bare lane brings the head BACK for that stretch, which is
+                // the other half of the ask ("...and back at the end"). The range runs
+                // to the next segment or the end of the recording, so one click is
+                // enough and the result can then be trimmed like any other segment.
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: function (mouse) {
+                        var f = root.xToFrame(mouse.x)
+                        for (var i = 0; i < root.camSegments.length; ++i) {
+                            var s = root.camSegments[i]
+                            if (f >= s.start && f < s.end)
+                                return          // the block's own handler owns this
+                        }
+                        var end = root.sourceFrames
+                        for (var j = 0; j < root.camSegments.length; ++j)
+                            if (root.camSegments[j].start > f)
+                                end = Math.min(end, root.camSegments[j].start)
+                        if (end - f < 2)
+                            return
+                        Bridge.op("add_webcam_segment", {
+                            start_ms: f * root.msPerFrame,
+                            end_ms: end * root.msPerFrame
+                        })
+                    }
+                }
+
+                Repeater {
+                    model: root.camSegments
+                    Rectangle {
+                        readonly property bool sel: root.preview && root.preview.selectedId === modelData.id
+                        x: root.frameToX(modelData.start)
+                        y: 4
+                        width: Math.max(6, root.frameToX(modelData.end) - root.frameToX(modelData.start))
+                        height: 18
+                        radius: Theme.radiusChip - 2
+                        color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, sel ? 0.28 : 0.2)
+                        border.width: sel ? 1.5 : 1
+                        border.color: sel ? Theme.accent
+                                          : Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.45)
+                        Behavior on color { ColorAnimation { duration: Theme.durSlow } }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.preview.selectedId = parent.sel ? "" : modelData.id
                         }
                     }
                 }

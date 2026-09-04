@@ -30,6 +30,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
+from dataclasses import replace
+
 from . import backgrounds
 from . import cursor as _cursor_mod
 from . import events as _events
@@ -560,6 +562,33 @@ def project_state(
         },
         "edit": bundle.edit.to_dict(),
         "webcam": resolve_webcam(bundle),
+        # The camera track, so the timeline can draw it. Always at least the implicit
+        # whole-take segment, so the row is never mysteriously empty on a recording
+        # whose camera is plainly on; `explicit` tells the UI whether acting on a
+        # segment will first materialize the track.
+        "webcam_track": {
+            "explicit": any(l.type == "webcam" for l in bundle.edit.layers),
+            "segments": [
+                {
+                    "id": seg.id,
+                    "start": seg.t.start if seg.t else 0,
+                    "end": seg.t.end if seg.t else total,
+                    "start_ms": (seg.t.start if seg.t else 0) * ms_per_frame,
+                    "end_ms": (seg.t.end if seg.t else total) * ms_per_frame,
+                    "enabled": seg.enabled,
+                    "shape": seg.props.get("shape", bundle.edit.webcam.shape),
+                    "mirror": bool(seg.props.get("mirror", bundle.edit.webcam.mirror)),
+                    "corner_radius": float(
+                        seg.props.get("corner_radius", bundle.edit.webcam.corner_radius)),
+                    # The size control's value, same meaning as resolve_webcam's:
+                    # width as a fraction of the canvas, height derived.
+                    "size": seg.w,
+                    "fade_ms": seg.fade_frames * ms_per_frame,
+                    "rect": resolve_placement(seg.placement, canvas),
+                }
+                for seg in _layers.webcam_segments(bundle.edit, canvas, total)
+            ],
+        },
         "backdrop": resolve_backdrop(bundle),
         "cursor": resolve_cursor(bundle),
         # Whether there is anything to caption WITH. Only the count and a flag, never
@@ -614,7 +643,32 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         x, y, w, h = _geom(args["rect"], "width", "height")
         return placement_from_rect(x, y, w, h, canvas, args.get("anchor", "top-left"))
 
-    if op == "set_webcam":
+    if op == "set_webcam" and args.get("id"):
+        # A segment is selected, so the panel is editing THAT segment rather than the
+        # whole-take default. Same field names either way, so the panel does not need a
+        # second code path -- only an id to pass when it has one.
+        layer = _find_layer(edit.layers, str(args["id"]))
+        if layer.type != "webcam":
+            raise BridgeError(f"layer {layer.id!r} is not a camera segment")
+        if "enabled" in args:
+            layer.enabled = bool(args["enabled"])
+        if "rect" in args:
+            pl = rect_arg()
+            layer.x, layer.y, layer.w, layer.h, layer.anchor = (
+                pl.x, pl.y, pl.w, pl.h, pl.anchor)
+        if "size" in args:
+            # Through WebcamSettings.placement so a circle stays square in PIXELS -- the
+            # height is derived, exactly as it is for the whole-take setting.
+            probe = replace(edit.webcam, w=float(args["size"]))
+            pl = probe.placement(canvas)
+            layer.w, layer.h = pl.w, pl.h
+        for key in ("shape", "corner_radius", "mirror"):
+            if key in args:
+                layer.props[key] = args[key]
+        if "fade_ms" in args:
+            layer.fade_frames = max(0, tb.to_frame(float(args["fade_ms"]) / 1000.0))
+
+    elif op == "set_webcam":
         if bundle.capture.camera_burned_in:
             raise BridgeError("the camera is burned into this recording and cannot be edited")
         cam = edit.webcam
@@ -826,6 +880,22 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             raise BridgeError(f"no cut at index {i}")
         del cuts[i]
         edit.cuts = cuts
+
+    elif op == "split_webcam":
+        at = tb.to_frame(float(args["at_ms"]) / 1000.0)
+        if _layers.split_webcam(edit, canvas, _safe_source_frames(bundle), at) is None:
+            # Not an error: the playhead sitting on a seam, or outside every segment, is
+            # a normal place for it to be, and raising would make the button read as
+            # broken exactly where a user is most likely to press it.
+            pass
+
+    elif op == "add_webcam_segment":
+        t = _range_from_ms(tb, args.get("start_ms"), args.get("end_ms"))
+        if t is None:
+            raise BridgeError("add_webcam_segment needs a start and an end")
+        if _layers.add_webcam_segment(
+                edit, canvas, _safe_source_frames(bundle), t) is None:
+            raise BridgeError("that overlaps a segment the camera is already on for")
 
     elif op == "set_export":
         want = str(args["export_preset"])

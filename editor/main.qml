@@ -435,6 +435,17 @@ ApplicationWindow {
         onActivated: if (!app.previewMode && preview.selectedId !== "")
                          Bridge.op("delete_layer", { id: preview.selectedId })
     }
+    // Split the camera segment under the playhead, which is how a head that is on for
+    // the whole take becomes one that goes away. Deleting the right-hand half is then
+    // the second half of the gesture, and Delete above already does that.
+    //
+    // Not guarded by previewMode the way Delete is: a split adds a seam rather than
+    // removing anything, so doing it with no visible selection loses nothing.
+    Shortcut {
+        sequence: "S"
+        onActivated: if (!app.typing())
+                         Bridge.op("split_webcam", { at_ms: preview.frame * preview.msPerFrame })
+    }
     // The typing() guards: a plain letter or Ctrl+Z in an inspector text field belongs
     // to the field. Qt's ShortcutOverride usually arbitrates this, but the guard makes
     // it a rule rather than platform behaviour.

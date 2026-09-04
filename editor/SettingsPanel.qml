@@ -21,7 +21,24 @@ ScrollView {
     id: root
 
     readonly property var st: Bridge.state
-    readonly property var cam: st.webcam || ({})
+    // The segment's own values when one is selected, the whole-take setting otherwise.
+    // `editable` and the badge reasons stay global: a burned-in recording is burned in
+    // whichever segment is selected.
+    readonly property var cam: {
+        var g = st.webcam || ({})
+        if (!camSeg)
+            return g
+        var m = {}
+        for (var k in g)
+            m[k] = g[k]
+        m.rect = camSeg.rect
+        m.shape = camSeg.shape
+        m.mirror = camSeg.mirror
+        m.corner_radius = camSeg.corner_radius
+        m.size = camSeg.size
+        m.enabled = camSeg.enabled
+        return m
+    }
     readonly property var zoom: st.edit ? st.edit.zoom : ({})
     readonly property var backdrop: st.backdrop || ({})
     readonly property real msPerFrame: st.timebase ? st.timebase.ms_per_frame : 1000 / 60
@@ -29,6 +46,28 @@ ScrollView {
     property string selectedId: ""
     property Item preview: null
     signal selectLayer(string id)
+
+    // The selected CAMERA segment, if the selection is one. When it is, the webcam
+    // controls edit that segment instead of the whole-take default -- same controls,
+    // same field names, one extra id on the way out. Without this the panel would show
+    // the global values while writing to the segment, which is the kind of quiet
+    // disagreement that makes people distrust the whole inspector.
+    readonly property var camTrack: st.webcam_track ? st.webcam_track.segments : []
+    readonly property var camSeg: {
+        for (var i = 0; i < camTrack.length; ++i)
+            if (camTrack[i].id === selectedId)
+                return camTrack[i]
+        return null
+    }
+    readonly property string camSegId: camSeg ? camSeg.id : ""
+
+    // One writer for every webcam control, so a segment can never be edited by some
+    // controls and the global setting by others.
+    function camOp(args) {
+        if (root.camSegId !== "")
+            args.id = root.camSegId
+        Bridge.op("set_webcam", args)
+    }
 
     readonly property int selZoom: preview ? preview.selectedZoomIndex : -1
     readonly property var selSeg: preview && selZoom >= 0 && selZoom < preview.zoomSegments.length
@@ -361,7 +400,7 @@ ScrollView {
                 C.Toggle {
                     visible: root.camEditable
                     checked: root.cam.enabled === true
-                    onToggled: function (v) { Bridge.op("set_webcam", { enabled: v }) }
+                    onToggled: function (v) { root.camOp({ enabled: v }) }
                 }
             }
 
@@ -408,7 +447,7 @@ ScrollView {
                 C.Toggle {
                     checked: root.cam.mirror === true
                     enabled: root.camEditable
-                    onToggled: function (v) { Bridge.op("set_webcam", { mirror: v }) }
+                    onToggled: function (v) { root.camOp({ mirror: v }) }
                 }
                 Text {
                     text: "Mirror"
@@ -434,7 +473,7 @@ ScrollView {
                 // as `rect` lit no chip at all.
                 currentIndex: root.shapeValues.indexOf(root.cam.shape)
                 onActivated: function (i) {
-                    Bridge.op("set_webcam", { shape: root.shapeValues[i] })
+                    root.camOp({ shape: root.shapeValues[i] })
                 }
             }
 
@@ -465,7 +504,7 @@ ScrollView {
                                                       : root.canvas.width - w - m
                     var y = row === 0 ? m : row === 1 ? (root.canvas.height - h) / 2
                                                       : root.canvas.height - h - m
-                    Bridge.op("set_webcam", { rect: { x: x, y: y, width: w, height: h } })
+                    root.camOp({ rect: { x: x, y: y, width: w, height: h } })
                 }
             }
 
@@ -482,7 +521,7 @@ ScrollView {
                 modelValue: root.cam.size === undefined ? 0.14 : root.cam.size
                 display: Math.round(liveValue * 100) + "% of frame"
                 enabled: root.camEditable
-                onCommitted: function (v) { Bridge.op("set_webcam", { size: v }) }
+                onCommitted: function (v) { root.camOp({ size: v }) }
             }
 
             Text {

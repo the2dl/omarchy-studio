@@ -131,3 +131,65 @@ def test_an_uncropped_bundle_renders_exactly_as_before(tmp_path):
     synthetic.make_bundle(root, seconds=1.0, width=640, height=360, camera=False)
     g = render.build_graph(Bundle(root)).graph
     assert "crop=" not in g.split("[base]")[0]
+
+
+# --- the proxy ---------------------------------------------------------------
+
+
+@needs_ffmpeg
+def test_the_proxy_shows_the_frame_not_the_stream(tmp_path):
+    """The editor is meant to be the export's twin.
+
+    Without this it is the twin of the raw STREAM: a window capture recorded the whole
+    monitor through the portal, and the editor played all of it inside a canvas sized
+    for the window -- which reads exactly like "I picked a window and it recorded the
+    entire screen", because that is what you are looking at.
+    """
+    from omarchy_studio import proxy
+    root = tmp_path / "px"
+    synthetic.make_bundle(root, seconds=1.0, width=1280, height=720, camera=False)
+    b = Bundle(root)
+    b.capture.source_crop = {"x": 100, "y": 60, "width": 800, "height": 400}
+    built = proxy.ensure_proxy(b, "screen")
+    assert _dims(built) == (800, 400)
+
+
+@needs_ffmpeg
+def test_a_proxy_built_before_the_crop_existed_is_rebuilt(tmp_path):
+    """The crop is part of what the proxy IS, so a bundle recorded by an older build --
+    or one whose crop changed -- must not keep showing the whole monitor."""
+    from omarchy_studio import proxy
+    root = tmp_path / "stale"
+    synthetic.make_bundle(root, seconds=1.0, width=1280, height=720, camera=False)
+    b = Bundle(root)
+    proxy.ensure_proxy(b, "screen")
+    assert not proxy.is_stale(b, "screen")
+
+    b.capture.source_crop = {"x": 100, "y": 60, "width": 800, "height": 400}
+    assert proxy.is_stale(b, "screen"), "the crop is not part of the proxy's identity"
+    assert _dims(proxy.ensure_proxy(b, "screen")) == (800, 400)
+
+
+@needs_ffmpeg
+def test_the_camera_proxy_is_never_cropped(tmp_path):
+    """The crop describes where the SCREEN's frame sits in its stream. Applying it to
+    the camera would carve a rectangle out of someone's face."""
+    from omarchy_studio import proxy
+    root = tmp_path / "cam"
+    synthetic.make_bundle(root, seconds=1.0, width=640, height=360)
+    b = Bundle(root)
+    b.capture.source_crop = {"x": 10, "y": 10, "width": 200, "height": 100}
+    cam = proxy.ensure_proxy(b, "camera")
+    assert _dims(cam) != (200, 100)
+
+
+def _dims(path) -> tuple[int, int]:
+    """ffprobe directly: omarchy_studio.probe memoises by PATH, and a proxy is rewritten
+    at the same path, so a cached answer describes the file that used to be there."""
+    import subprocess
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True).stdout.strip()
+    w, h = out.split(",")[:2]
+    return int(w), int(h)

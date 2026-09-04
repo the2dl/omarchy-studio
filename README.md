@@ -2,10 +2,6 @@
 
 A non-destructive screen recorder for Linux, built for Hyprland.
 
-![A recording playing back in the editor](docs/media/demo.gif)
-
-*Recorded, edited and exported with omarchy-studio.*
-
 Recording is not the hard part — `gpu-screen-recorder` already does that well. The
 hard part is everything after: moving the camera bubble, retiming a zoom, cutting a
 section out, and changing your mind about any of it a week later. So a recording

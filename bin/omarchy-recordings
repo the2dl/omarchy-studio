@@ -56,11 +56,14 @@ def main(argv: list[str] | None = None) -> int:
     env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
     env["QML_XHR_ALLOW_FILE_READ"] = "1"
     qml = EDITOR / "library" / ("MenuDropdown.qml" if a.dropdown else "Recordings.qml")
+    # Bound to a name, because the cleanup at the end of main() unlinks it. Written
+    # inline in the argv list, that cleanup referenced a variable that never existed.
+    token_file = qmlbridge.write_token_file(session.token)
     argvq = [
         QML6, "-I", str(EDITOR), str(qml), "--",
         "--port", str(server.server_port),
         # The token's PATH, never its value: /proc/<pid>/cmdline is world-readable.
-        "--token-file", str(qmlbridge.write_token_file(session.token)),
+        "--token-file", str(token_file),
     ]
     if a.selftest:
         argvq += ["--selftest", str(a.selftest)]

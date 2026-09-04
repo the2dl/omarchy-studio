@@ -46,7 +46,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 
-from omarchy_studio import setup_sources  # noqa: E402
+from omarchy_studio import qmlbridge, setup_sources  # noqa: E402
 from omarchy_studio.micmeter import MicMeter  # noqa: E402
 from omarchy_studio.qmlbridge import theme_tokens  # noqa: E402
 

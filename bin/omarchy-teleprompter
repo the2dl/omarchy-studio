@@ -39,7 +39,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 
-from omarchy_studio import compositor  # noqa: E402
+from omarchy_studio import compositor, qmlbridge  # noqa: E402
 from omarchy_studio.qmlbridge import theme_tokens  # noqa: E402
 
 QML6 = "/usr/bin/qml6"

@@ -1672,6 +1672,30 @@ class Session:
             self.dirty = False
             return self.state()
 
+    def export(self, output: str | None = None) -> dict:
+        """Save, then render. The save is not optional and not the caller's job.
+
+        The renderer runs in a SEPARATE PROCESS, handed the bundle's PATH and nothing
+        else, so it opens edit.json off disk. Every edit the editor makes lives in
+        memory until something saves it -- so an export that did not save first
+        rendered the last SAVED edit, which on a recording nobody had explicitly
+        saved is the one `begin` wrote. The camera sat at its setup placement, the
+        zoom was off, the backdrop was the default and the layers were absent: not
+        four broken features, one export reading a different edit.
+
+        Doing it HERE rather than in the export button is the point. Any caller that
+        can start a render gets a render of what is on screen, and no future one can
+        forget the step -- the same reason the renderer owns the easing rather than
+        each surface drawing its own.
+
+        A failed save propagates instead of exporting anyway. A stale export looks
+        finished and is wrong, which gives the user no reason to look twice.
+        """
+        with self.lock:
+            self.bundle.save_edit()
+            self.dirty = False
+            return self.exporter.start(output)
+
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "omarchy-studio-bridge/1"
@@ -1682,6 +1706,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args: Any) -> None:
         pass  # the default logs every drag frame to stderr
+
+    def _log_quit_save_failure(self, e: BaseException) -> None:
+        """Loud, because the alternative is a window that closed and took the work.
+        stderr is the editor's log, which the launcher keeps."""
+        print(f"omarchy-studio: could not save edit.json on quit: {e}", file=sys.stderr)
 
     def _authorized(self) -> bool:
         tok = self.headers.get("X-Studio-Token", "")
@@ -1741,7 +1770,9 @@ class _Handler(BaseHTTPRequestHandler):
             if r == "/save":
                 return self._send(self.session.save())
             if r == "/export":
-                self.session.exporter.start(body.get("output"))
+                # session.export, not exporter.start: the render happens in another
+                # process reading edit.json off disk, so the edit has to be there.
+                self.session.export(body.get("output"))
                 return self._send(self.session.exporter.snapshot())
             if r == "/export/cancel":
                 self.session.exporter.cancel()
@@ -1759,6 +1790,18 @@ class _Handler(BaseHTTPRequestHandler):
             if r == "/redo":
                 return self._send(self.session.redo())
             if r == "/quit":
+                # Save on the way out, for the same reason /export does: the edit
+                # lives in memory, and closing the window is not a decision to throw
+                # it away. Nothing here is destructive -- edit.json is a description
+                # of an edit and the master is never touched -- so persisting beats
+                # asking, and beats discarding an afternoon's work silently.
+                #
+                # A failed save must not trap the user in a window they asked to
+                # close, so it is reported and the quit proceeds.
+                try:
+                    self.session.save()
+                except (OSError, ProjectError) as e:
+                    self._log_quit_save_failure(e)
                 self.session.quit_requested.set()
                 return self._send({"ok": True})
         except (BridgeError, ProjectError, KeyError, ValueError) as e:

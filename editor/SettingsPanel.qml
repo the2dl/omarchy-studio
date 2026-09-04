@@ -74,10 +74,18 @@ ScrollView {
                                   ? preview.zoomSegments[selZoom] : null
 
     // The selected layer's resolved spec, or null. Everything below routes on this.
+    //
+    // Camera segments are excluded ON PURPOSE. They ARE layers, but this panel treats
+    // "a layer is selected" as "hide the recording panels and show a layer inspector"
+    // -- and the camera's inspector IS one of those recording panels. Selecting a
+    // segment therefore hid the very controls meant to edit it: click a block on the
+    // camera row and the whole webcam section vanished, with no layer inspector to
+    // replace it because there is no `webcam` case among the type-specific sections.
+    // Routing on camSeg instead keeps the webcam panel up and pointed at the segment.
     readonly property var selLayer: {
         var layers = st.layers || []
         for (var i = 0; i < layers.length; ++i)
-            if (layers[i].id === selectedId)
+            if (layers[i].id === selectedId && layers[i].type !== "webcam")
                 return layers[i]
         return null
     }

@@ -412,10 +412,49 @@ protect_overlays_from_capture() {
 
 # A self-view parked outside the capture: a region leaves room beside it, and a second
 # monitor is always outside a monitor capture. KMS records as usual.
+# Whether the bubble can sit OUTSIDE the capture, which is the only way KMS can have a
+# live self-view at all.
+#
+# A region used to answer "yes" unconditionally, which is true of a small region and
+# false of one that nearly fills its monitor -- and the second case is the common one.
+# The recorder then chose `park`, the camera script looked for somewhere to put the
+# bubble, found nothing, and dropped the self-view without saying so. Measured on the
+# take that prompted this: a 2538x1384 region on a 2560x1440 monitor leaves 11px.
+#
+# The size test mirrors omarchy-capture-camera's find_park_spot deliberately -- same
+# preset fractions, same margin. It is a duplicate, and the alternative is asking the
+# camera script a question it has no mode to answer; if the presets there change, this
+# has to follow, which is why both carry the numbers rather than one carrying a guess.
 self_view_possible() {
   local target=$1
-  [[ $target == region:* ]] && return 0
-  (($(hyprctl monitors -j | jq 'length') > 1))
+  if [[ $target != region:* ]]; then
+    (($(hyprctl monitors -j | jq 'length') > 1))
+    return
+  fi
+
+  [[ ${target#region:} =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]] || return 1
+  local rw=${BASH_REMATCH[1]} rh=${BASH_REMATCH[2]} rx=${BASH_REMATCH[3]} ry=${BASH_REMATCH[4]}
+
+  local mon
+  mon=$(hyprctl monitors -j 2>/dev/null | jq -r --arg n "$MONITOR_NAME" \
+    'first(.[] | select(.name == $n) | "\(.x) \(.y) \((.width / .scale) | floor) \((.height / .scale) | floor)") // empty')
+  [[ -n $mon ]] || return 1
+  local mx my mw mh
+  read -r mx my mw mh <<<"$mon"
+
+  local preset
+  case ${WEBCAM_SIZE:-medium} in
+  small) preset=$((mh * 4 / 25)) ;;
+  large) preset=$((mh * 3 / 10)) ;;
+  *) preset=$((mh * 2 / 9)) ;;
+  esac
+  local need=$((preset + 80)) # the bubble plus find_park_spot's margin on both sides
+
+  ((mx + mw - (rx + rw) >= need)) && return 0   # right
+  ((rx - mx >= need)) && return 0               # left
+  ((my + mh - (ry + rh) >= need)) && return 0   # below
+  ((ry - my >= need)) && return 0               # above
+  return 1
 }
 
 # The compositor can only keep a self-view out of the recording if something teaches it
@@ -437,6 +476,13 @@ self_view_exclusion_available() {
 #            sits inside the capture; portal backend (whole monitor only: a region that
 #            leaves no room is not a thing, --match-monitor turns a full one into monitor:*).
 # off     -- neither; the camera is still recorded, there is just no live preview.
+# The full logical rectangle of the monitor a capture sits on, as WxH+X+Y.
+monitor_logical_geometry() {
+  hyprctl monitors -j 2>/dev/null | jq -r --arg n "$MONITOR_NAME" \
+    'first(.[] | select(.name == $n)
+      | "\((.width / .scale) | floor)x\((.height / .scale) | floor)+\(.x)+\(.y)") // empty'
+}
+
 self_view_mode() {
   local target=$1
   [[ $WEBCAM == "true" && $BURN_IN != "true" ]] || {
@@ -449,6 +495,17 @@ self_view_mode() {
   fi
   if [[ $target == monitor:* ]] && self_view_exclusion_available; then
     echo exclude
+    return
+  fi
+  # A REGION can have one too, by recording the whole monitor through the portal and
+  # cropping back at export. KMS is the only backend that can capture a sub-rectangle
+  # directly, and KMS reads the scanout BELOW the compositor, so no_screen_share is
+  # invisible to it and the bubble would be welded into every frame. The portal can hide
+  # it but only ever hands over a whole monitor -- so we take the monitor and carve the
+  # region out afterwards. macOS never faces this: it excludes windows on the same fast
+  # path whatever the capture is.
+  if [[ $target == region:* ]] && [[ -n $MONITOR_NAME ]] && self_view_exclusion_available; then
+    echo exclude-crop
     return
   fi
   echo off
@@ -595,29 +652,40 @@ start_screenrecording() {
   fi
 
   local begin_output
+  # Decided BEFORE the bundle is created: an `exclude-crop` region streams its whole
+  # monitor, and capture.json has to record that from the outset -- it is the immutable
+  # description of what the hardware did.
+  local self_view_mode SOURCE_LOGICAL=""
+  self_view_mode=$(self_view_mode "$target")
+  if [[ $self_view_mode == "exclude-crop" ]]; then
+    SOURCE_LOGICAL=$(monitor_logical_geometry)
+    if [[ -z $SOURCE_LOGICAL ]]; then
+      trail "self-view: no monitor geometry for $MONITOR_NAME; recording without one"
+      self_view_mode="off"
+    fi
+  fi
+
   begin_output=$(studio_capture begin \
     --root "$OUTPUT_DIR/screenrecording-$(date +'%Y-%m-%d_%H-%M-%S')" \
     --logical "$LOGICAL_GEOMETRY" \
     --monitor "$MONITOR_NAME" \
     --scale "$MONITOR_SCALE" \
+    ${SOURCE_LOGICAL:+--source-logical "$SOURCE_LOGICAL"} \
     "${burned_in_flag[@]}" "${camera_placement_args[@]}") || {
     trail "begin: FAILED to create the bundle"
     omarchy-notification-send -u critical -t 3000 "Screen recording error" "Could not create the recording bundle"
     return 1
   }
 
-  local CAPTURE_SIZE="" CAPTURE_CODEC=""
+  local CAPTURE_SIZE="" CAPTURE_CODEC="" SOURCE_CROP=""
   eval "$begin_output"
   [[ -n $BUNDLE && -n $CAPTURE_SIZE ]] || return 1
-
-  local self_view_mode
-  self_view_mode=$(self_view_mode "$target")
 
   # gsr's -region flag is deprecated in 6.0.1; region geometry goes straight to -w.
   local capture_args=(-w "${target#*:}" -s "${RESOLUTION:-$CAPTURE_SIZE}")
   local capture_backend="kms" verbose_args=()
   local capture_fps="$FRAMERATE"
-  if [[ $self_view_mode == "exclude" ]]; then
+  if [[ $self_view_mode == "exclude" || $self_view_mode == "exclude-crop" ]]; then
     capture_backend="portal"
     mkdir -p "$(dirname "$PORTAL_TOKEN_FILE")"
     capture_args=(-w portal -restore-portal-session yes -portal-session-token-filepath "$PORTAL_TOKEN_FILE"
@@ -698,7 +766,9 @@ start_screenrecording() {
     [[ -n $WEBCAM_DEVICE ]] && camera_args+=(--device="$WEBCAM_DEVICE")
     case $self_view_mode in
     park) camera_args+=(--self-view=yes) ;;
-    exclude) camera_args+=(--self-view=yes --exclude=yes) ;; # inside the capture, hidden by the compositor
+    # Both hide the bubble in the compositor; exclude-crop additionally streams the
+    # whole monitor and carves the region out at export.
+    exclude | exclude-crop) camera_args+=(--self-view=yes --exclude=yes) ;;
     *) camera_args+=(--self-view=no) ;;
     esac
     if omarchy-capture-camera start "$BUNDLE" "${camera_args[@]}"; then

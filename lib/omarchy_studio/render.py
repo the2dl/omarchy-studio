@@ -194,7 +194,19 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
     # `fps` re-establishes the frame grid before anything indexes into it. gsr is passed
     # -fm cfr, but a dropped frame was still observed within seven seconds of capture,
     # and every gate downstream is a frame index.
-    g.add(layers_mod.timebase_chain("[0:v]", tb, "[base]"))
+    # The crop comes FIRST, before the frame grid and everything after it. A region
+    # capture that needed a live self-view recorded the whole monitor through the portal
+    # -- the only backend that can hide the bubble -- so the frame the user chose is a
+    # rectangle inside that stream. Cropping here means every later stage (cuts, zoom,
+    # cursor, layers, the canvas itself) sees exactly the frame they asked for, with no
+    # second coordinate system anywhere.
+    crop = capture.crop_rect()
+    base_in = "[0:v]"
+    if crop is not None:
+        x, y, w, h = crop
+        g.add(f"[0:v]crop={w}:{h}:{x}:{y}[cropped]")
+        base_in = "[cropped]"
+    g.add(layers_mod.timebase_chain(base_in, tb, "[base]"))
 
     audio_label = "[0:a]"
     if has_audio:

@@ -370,6 +370,7 @@ def begin(
     calibration_c_ms: float = 0.0,
     camera_rect: dict | None = None,
     camera_shape: str = "circle",
+    source_logical: dict | None = None,
 ) -> Bundle:
     """Lay out the bundle and record everything that is only knowable now.
 
@@ -377,15 +378,36 @@ def begin(
     lands in edit.json rather than capture.json on purpose: where the camera sits is an
     editing decision the user goes on to change, and capture.json is the immutable
     record of what the hardware did.
+
+    `source_logical` is the rectangle actually STREAMED, when that is larger than the
+    frame. A region that wants a live self-view has to record the whole monitor through
+    the portal -- the only backend that can hide the bubble -- so the stream is the
+    monitor and `logical_geometry` stays the region the user chose. Everything that maps
+    events to pixels keeps normalising against the region, and the renderer crops. When
+    they are the same rectangle there is no crop and nothing changes.
     """
+    frame_physical = to_physical(logical_geometry, monitor_scale)
+    source_crop: dict = {}
+    if source_logical and dict(source_logical) != dict(logical_geometry):
+        # Offsets are absolute desktop coordinates, so the crop is the frame's origin
+        # measured from the STREAM's origin, not from the desktop's.
+        src_physical = to_physical(source_logical, monitor_scale)
+        source_crop = {
+            "x": int(frame_physical["x"]) - int(src_physical["x"]),
+            "y": int(frame_physical["y"]) - int(src_physical["y"]),
+            "width": int(frame_physical["width"]),
+            "height": int(frame_physical["height"]),
+        }
+
     capture = Capture(
         created=datetime.now().astimezone().isoformat(timespec="seconds"),
         logical_geometry=dict(logical_geometry),
-        physical_geometry=to_physical(logical_geometry, monitor_scale),
+        physical_geometry=frame_physical,
         monitor_scale=float(monitor_scale),
         monitor_name=monitor_name,
         calibration_c_ms=float(calibration_c_ms),
         camera_burned_in=bool(camera_burned_in),
+        source_crop=source_crop,
     )
     bundle = project.create(Path(root), capture)
     if camera_rect:
@@ -493,6 +515,11 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--camera-rect", default="",
                    help="WxH+X+Y in logical pixels: where the setup bar left the "
                         "self-view. Seeds edit.json's webcam placement.")
+    b.add_argument("--source-logical", default="", metavar="WxH+X+Y",
+                   help="the rectangle actually STREAMED, when larger than --logical. "
+                        "A region that needs a live self-view records the whole monitor "
+                        "through the portal -- the only backend that can hide the "
+                        "bubble -- and the renderer crops back to --logical.")
     b.add_argument("--camera-shape", default="circle",
                    choices=["circle", "rounded", "rect"])
 
@@ -576,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
             calibration_c_ms=a.calibration_ms,
             camera_rect=parse_geometry(a.camera_rect) if a.camera_rect else None,
             camera_shape=a.camera_shape,
+            source_logical=parse_geometry(a.source_logical) if a.source_logical else None,
         )
         physical = bundle.capture.physical_geometry
         size = capture_size(physical)
@@ -591,6 +619,13 @@ def main(argv: list[str] | None = None) -> int:
             # Paired with the size: a grid past h264's ceiling is only capturable at all
             # because the codec was named to match it.
             "CAPTURE_CODEC": capture_codec(physical),
+            # Non-empty when the stream is larger than the frame, which is the recorder's
+            # signal that it must take the PORTAL: only that backend can hide the
+            # self-view, and it is the reason we are streaming more than was asked for.
+            "SOURCE_CROP": (
+                "{width}x{height}+{x}+{y}".format(**bundle.capture.source_crop)
+                if bundle.capture.source_crop else ""
+            ),
         }
         for key, value in emit.items():
             print(f"{key}={shlex.quote(value)}")

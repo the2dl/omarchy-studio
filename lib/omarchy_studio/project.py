@@ -98,12 +98,53 @@ class Capture:
     # Such a recording cannot have its webcam moved, and the editor must say so
     # rather than silently offering a control that does nothing.
     camera_burned_in: bool = False
+    # Where the FRAME sits inside the captured STREAM, in stream pixels, or empty when
+    # they are the same thing.
+    #
+    # A region capture cannot have a live self-view on the KMS backend: KMS reads the
+    # DRM scanout below the compositor, so no_screen_share is invisible to it and the
+    # bubble would be welded into every frame. The portal CAN hide it -- that is what
+    # the plugin is for -- but the portal only ever hands over a whole monitor. So a
+    # region that wants a self-view captures the MONITOR through the portal and carries
+    # the region here; the renderer crops before anything else and every stage
+    # downstream sees exactly the frame the user chose.
+    #
+    # It also means the framing stops being a decision made before recording: the whole
+    # monitor is on disk, so the crop can be moved afterwards.
+    source_crop: dict = field(default_factory=dict)
 
     @property
     def canvas(self) -> Canvas:
+        """The FRAME, which is the crop when there is one -- not the stream.
+
+        Everything downstream composes on the canvas, so making the crop the canvas is
+        what keeps a portal-and-crop region capture identical to a direct one from here
+        on: the same coordinates, the same webcam placement, the same zoom.
+        """
         if self.screen is None:
             raise ProjectError("capture has no screen stream")
+        crop = self.crop_rect()
+        if crop is not None:
+            return Canvas(crop[2], crop[3])
         return Canvas(self.screen.width, self.screen.height)
+
+    def crop_rect(self) -> tuple[int, int, int, int] | None:
+        """(x, y, w, h) in STREAM pixels, or None. Clamped to the stream, because a
+        crop running past the frame makes ffmpeg refuse the whole graph."""
+        c = self.source_crop
+        if not c or self.screen is None:
+            return None
+        try:
+            x, y = max(0, int(c["x"])), max(0, int(c["y"]))
+            w, h = int(c["width"]), int(c["height"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        w = min(w, self.screen.width - x)
+        h = min(h, self.screen.height - y)
+        if w <= 0 or h <= 0:
+            return None
+        # Even, for yuv420 chroma siting.
+        return x - (x & 1), y - (y & 1), w - (w & 1), h - (h & 1)
 
     @property
     def timebase(self) -> Timebase:

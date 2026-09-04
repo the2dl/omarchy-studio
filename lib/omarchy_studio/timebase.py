@@ -221,7 +221,19 @@ class CutMap:
         return None
 
     def to_source(self, output_frame: int) -> int:
-        offset = 0
+        """The recorded frame shown at this output frame.
+
+        Raises for an output frame inside a PAD, because none is: a pad is time that
+        was never recorded. Callers that walk the whole output timeline must ask
+        `is_pad` first -- the cursor compositor did not, and since render catches
+        ValueError and degrades to "no cursor", a single pad silently removed the
+        pointer from every export.
+        """
+        if self.is_pad(output_frame):
+            raise TimebaseError(
+                f"output frame {output_frame} is in a pad; nothing was recorded there"
+            )
+        offset = self.head_pad
         for k in self.kept:
             if output_frame < offset + len(k):
                 return k.start + (output_frame - offset)
@@ -229,6 +241,11 @@ class CutMap:
         raise TimebaseError(
             f"output frame {output_frame} past the end ({self.output_frames} frames)"
         )
+
+    def is_pad(self, output_frame: int) -> bool:
+        """Whether this output frame is in a pad rather than in the recording."""
+        return (output_frame < self.head_pad
+                or output_frame >= self.head_pad + self.kept_frames)
 
     def remap(self, r: FrameRange) -> list[FrameRange]:
         """Project a source range onto the output timeline.

@@ -408,7 +408,11 @@ def build_plan(
     margin_y = _OFFCANVAS_MARGIN_SPRITES * sprite_h
     positions: list[tuple[float, float] | None] = []
     for f in range(cutmap.output_frames):
-        p = src[cutmap.to_source(f)]
+        # A pad has no recorded frame, so it has no pointer either. Asking to_source
+        # for one raised, render caught it as a ValueError and degraded to "no cursor",
+        # and a single pad therefore removed the pointer from the WHOLE export --
+        # silently, because a cursorless render looks like a render.
+        p = None if cutmap.is_pad(f) else src[cutmap.to_source(f)]
         if p is None:
             positions.append(None)
         else:

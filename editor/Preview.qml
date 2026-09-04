@@ -175,8 +175,17 @@ Item {
     Connections {
         target: screenPlayer
         function onPlaybackStateChanged() {
-            if (screenPlayer.playbackState === MediaPlayer.StoppedState && !root.inPad)
-                root.transport = false
+            if (screenPlayer.playbackState !== MediaPlayer.StoppedState || root.inPad)
+                return
+            // The recording ending is not the OUTPUT ending when there is a tail pad:
+            // dropping the transport here made playback stop at the last recorded
+            // frame and the outro card unreachable except by scrubbing. Hand over to
+            // padClock instead, which is what plays the tail.
+            if (root.outFrame + 1 < root.outputFrames) {
+                root.outFrame = root.outFrame + 1
+                return
+            }
+            root.transport = false
         }
     }
 
@@ -279,6 +288,11 @@ Item {
             // recorded frame and hidden -- seeking it anywhere else would make the
             // handoff into the recording jump.
             scrubFrame = padAt(clamped) === "head" ? 0 : Math.max(0, sourceFrames - 1)
+            // Paused, not merely parked. Scrubbing into a pad mid-playback left the
+            // player running, so the recording's audio played on under a title card
+            // while the picture showed the card. padClock takes the clock from here.
+            screenPlayer.pause()
+            cameraPlayer.pause()
             if (hasScreen && screenPlayer.seekable)
                 screenPlayer.setPosition(scrubFrame * msPerFrame)
             return
@@ -289,6 +303,11 @@ Item {
             screenPlayer.setPosition(ms)
         else
             pendingSeekMs = ms
+        // Scrubbing OUT of a pad while the transport is running: padClock stops the
+        // moment inPad goes false, and nothing else was starting the player again, so
+        // playback stalled with the Pause icon showing.
+        if (transport && hasScreen && screenPlayer.playbackState !== MediaPlayer.PlayingState)
+            screenPlayer.play()
         if (hasCamera && cameraPlayer.seekable)
             cameraPlayer.setPosition(cameraSync.cameraMsFor(ms))
     }
@@ -935,9 +954,20 @@ Item {
                 return
             // A cut is not removed from the proxy; playback simply steps over it, which
             // is what the exported file will do.
-            var cut = root.cutContaining(root.frame)
-            if (cut)
-                root.seekFrame(cut.end)
+            //
+            // Read straight off the PLAYER. `root.frame` is derived from outFrame now,
+            // and outFrame refuses to follow the player through a cut (there is no
+            // output frame for cut material), so `frame` never entered a cut and this
+            // skip became dead code -- the editor played the removed footage while the
+            // playhead sat frozen. seekFrame takes OUTPUT frames, so the destination
+            // is converted rather than passed as the source frame it used to be.
+            var here = Math.round(screenPlayer.position / root.msPerFrame)
+            var cut = root.cutContaining(here)
+            if (cut) {
+                var dest = root.sourceToOutput(cut.end)
+                if (dest >= 0)
+                    root.seekFrame(dest)
+            }
         }
     }
 
@@ -979,7 +1009,11 @@ Item {
         onTriggered: {
             screenPlayer.pause()
             cameraPlayer.pause()
-            root.seekFrame(root.scrubFrame)
+            // outFrame, not scrubFrame. scrubFrame is a SOURCE frame and seekFrame
+            // takes OUTPUT frames, so priming threw the playhead back by the head pad
+            // plus the trim plus every earlier cut -- landing inside the intro after a
+            // scrub made while the proxy was still building.
+            root.seekFrame(root.outFrame)
         }
     }
 
@@ -988,7 +1022,13 @@ Item {
     Connections {
         target: screenPlayer
         function onPositionChanged() {
-            if (root.inPad)
+            // Only while the transport is actually running. The player also moves when
+            // it is primed -- play for 120ms, then pause, the only way to get frame 0
+            // on screen -- and letting those positions drive the playhead dragged a
+            // requested seek back to whatever the prime happened to reach (frame 3 at
+            // 30fps). scrubFrame used to be immune to that because it was set by the
+            // seek and never by the player; outFrame has to be immune the same way.
+            if (!root.transport || root.inPad)
                 return
             var o = root.sourceToOutput(Math.round(screenPlayer.position / root.msPerFrame))
             if (o >= 0 && o !== root.outFrame)
@@ -1001,7 +1041,9 @@ Item {
     // stalling on the last frame of the card.
     Timer {
         id: padClock
-        interval: Math.max(16, root.msPerFrame)
+        // Rounded UP, not truncated: Timer.interval is an int, so 16.67 became 16 and a
+        // pad ran about 4% fast at 60fps -- a three-second card finishing early.
+        interval: Math.max(1, Math.round(root.msPerFrame))
         repeat: true
         running: root.playing && root.inPad
         onTriggered: {

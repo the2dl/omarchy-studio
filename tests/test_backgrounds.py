@@ -261,7 +261,12 @@ def test_a_gradient_reaches_the_overlay_as_the_infinite_main_input():
     graph = _backdrop_graph(
         BackdropSettings(enabled=True, background="harbour"), Canvas(1280, 720)
     )
-    assert graph.index("gradients=") < graph.index("[content]overlay=")
+    # The content reaches the overlay through a PTS normalisation now (see
+    # render._backdrop): concat and tpad each leave the last frame's timing slightly
+    # off and the overlay's shortest=1 then ended a frame early. The claim under test
+    # is unchanged -- the gradient is the overlay's main input, ahead of the content.
+    assert graph.index("gradients=") < graph.index("]overlay=")
+    assert "[bg][content_cfr]overlay=" in graph
     assert "shortest=1" in graph
 
 

@@ -132,7 +132,12 @@ def effective_cutmap(bundle: Bundle, total: int | None = None) -> CutMap:
     total = bundle.source_frames() if total is None else total
     ranges = list(bundle.edit.cuts)
     head = int(bundle.edit.trim_head_frames)
-    if head > 0:
+    if head > 0 and total > 0:
+        # `total > 0` because FrameRange refuses an empty range: with no media the
+        # count is 0, min(head, 0) is 0, and FrameRange(0, 0) raised straight out of
+        # project_state -- the editor failing to OPEN a bundle whose media is missing.
+        # The previous fix for this only covered trim 0, and every real recording has a
+        # trim of 80-166 frames.
         ranges.append(FrameRange(0, min(head, total)))
     return CutMap(ranges, total,
                   head_pad=bundle.edit.head_pad_frames,
@@ -207,7 +212,26 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
     g.add(cuts.cut_chain(cutmap, tb, cut_targets, has_audio, audio_label=audio_label))
     cur = labels["[base]"]
     if cam_aligned:
-        registry.bind("camera", labels[cam_aligned])
+        # The camera is padded with the base, not just aligned to it. _pad_ends shifts
+        # the BASE by head_pad, and the webcam overlay composites by timestamp -- so a
+        # camera left unpadded showed frame head+k at output frame head+k, running the
+        # bubble head_pad frames (plus every earlier cut) ahead of the picture, and
+        # freezing on its last frame for the length of the pad. Measured at head=30:
+        # the bubble was 29-30 frames early throughout.
+        #
+        # `add` rather than `clone`: these frames are never seen -- the webcam layer's
+        # gate is remapped through the same cut map and so is dark for the whole pad --
+        # and cloning a frame to hide it wastes the decode.
+        cam_label = labels[cam_aligned]
+        if cutmap.head_pad > 0 or cutmap.tail_pad > 0:
+            parts = []
+            if cutmap.head_pad > 0:
+                parts.append(f"start={cutmap.head_pad}:start_mode=add")
+            if cutmap.tail_pad > 0:
+                parts.append(f"stop={cutmap.tail_pad}:stop_mode=add")
+            g.add(f"{cam_label}tpad={':'.join(parts)}[cam_padded]")
+            cam_label = "[cam_padded]"
+        registry.bind("camera", cam_label)
 
     cur = _pad_ends(g, cur, cutmap, edit, tb)
     cur = _cursor(g, cur, bundle, cutmap, registry)
@@ -614,7 +638,14 @@ def _backdrop(
 
     # shortest=1 against the infinite backdrop: the real video defines both the length
     # and the timebase. The other way round produced a 208-second file from a 6.9 s clip.
-    g.add("[bg][content]overlay=x=0:y=0:shortest=1:format=auto[composited]")
+    #
+    # The content's PTS are normalised to a clean 0..N-1 sequence first. Concat (from a
+    # cut) and tpad (from a pad) each leave the last frame's timing slightly off, and
+    # with BOTH the overlay's shortest=1 decided the content had ended one frame early
+    # -- a 65-frame render produced 64. Only that combination: backdrop+cut and
+    # backdrop+pad were each fine, which is why it survived the pads going in.
+    g.add("[content]setpts=N/FRAME_RATE/TB[content_cfr]")
+    g.add("[bg][content_cfr]overlay=x=0:y=0:shortest=1:format=auto[composited]")
     return "[composited]"
 
 

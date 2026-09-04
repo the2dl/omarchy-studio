@@ -229,3 +229,104 @@ def _png() -> bytes:
     return base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
     )
+
+
+# --- the eight found by review -----------------------------------------------
+#
+# Every one passed the suite and rendered plausibly. They are pinned individually
+# because each has its own way of coming back.
+
+
+@needs_ffmpeg
+def test_a_pad_does_not_remove_the_cursor_from_the_export(tmp_path):
+    """The worst of them: silent, total, and invisible in a render that still looks
+    like a render.
+
+    cursor.py walks every OUTPUT frame through CutMap.to_source, which knew nothing
+    about head_pad and raised past the recorded length. render catches ValueError and
+    degrades to "no cursor", so a single pad removed the pointer from the WHOLE export.
+    """
+    root = tmp_path / "cursor"
+    synthetic.make_bundle(root, seconds=2.0, width=320, height=180, camera=False)
+    b = Bundle(root)
+    # A real cursor track, written by the project's own writer rather than a guessed
+    # byte layout -- cursor.bin is a varint-delta format with a header, not packed
+    # structs, and a hand-rolled one simply fails to parse and looks like "no cursor".
+    from omarchy_studio.events import CursorSample, write_cursor
+    (root / "events").mkdir(exist_ok=True)
+    # Timed from the capture's own ANCHOR. Cursor samples are CLOCK_MONOTONIC, so a
+    # track starting at t_us=0 does not overlap the recording at all and build_plan
+    # returns None -- which looks exactly like "no cursor" and would make this test
+    # pass against the bug it exists to catch.
+    seconds = b.source_frames() / b.timebase.fps
+    hz = 120.0
+    anchor = b.capture.screen.anchor_us or 0
+    write_cursor(root / "events" / "cursor.bin",
+                 [CursorSample(t_us=anchor + int(i / hz * 1e6), x=100 + i, y=50)
+                  for i in range(int(seconds * hz))],
+                 hz=hz)
+    b.edit.cursor.enabled = True
+    assert "[cursored]" in render.build_graph(b).graph, "fixture has no cursor to lose"
+    for head, tail in ((30, 0), (0, 15), (30, 15)):
+        b.edit.head_pad_frames, b.edit.tail_pad_frames = head, tail
+        assert "[cursored]" in render.build_graph(b).graph, \
+            f"the cursor vanished with head={head} tail={tail}"
+
+
+def test_to_source_refuses_a_pad_frame_rather_than_guessing():
+    cm = CutMap([], 100, head_pad=30, tail_pad=20)
+    assert cm.is_pad(0) and cm.is_pad(149) and not cm.is_pad(30)
+    assert cm.to_source(30) == 0            # first recorded frame
+    for bad in (0, 29, 130, 149):
+        with pytest.raises(Exception):
+            cm.to_source(bad)
+
+
+@needs_ffmpeg
+def test_the_camera_is_padded_with_the_base(tmp_path):
+    """The base was padded and the camera was not, and the webcam overlay composites by
+    timestamp -- so the bubble ran head_pad frames (plus every earlier cut) AHEAD of the
+    picture, then froze on its last frame for the length of the pad."""
+    root = tmp_path / "cam"
+    synthetic.make_bundle(root, seconds=2.0, width=320, height=180)
+    b = Bundle(root)
+    b.edit.head_pad_frames = 30
+    g = render.build_graph(b).graph
+    assert "[cam_aligned]tpad=start=30:start_mode=add[cam_padded]" in g
+    assert "[cam_padded]" in g
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("backdrop", [False, True])
+@pytest.mark.parametrize("cut", [False, True])
+@pytest.mark.parametrize("pad", [False, True])
+def test_the_export_is_exactly_as_long_as_the_plan_says(tmp_path, backdrop, cut, pad):
+    """backdrop + cut + pad lost the last frame -- and ONLY that combination, which is
+    why it survived the pads going in. Concat and tpad each leave the final frame's
+    timing slightly off and the backdrop's shortest=1 then called it early."""
+    from omarchy_studio import probe
+    root = tmp_path / f"len-{backdrop}-{cut}-{pad}"
+    synthetic.make_bundle(root, seconds=2.0, width=320, height=180, camera=False)
+    b = Bundle(root)
+    b.edit.backdrop.enabled = backdrop
+    if cut:
+        b.edit.cuts = [FrameRange(10, 20)]
+    if pad:
+        b.edit.head_pad_frames = 15
+    b.save_edit()
+    want = render.build_graph(b).total_frames
+    out = root / "o.mp4"
+    render.render(b, out)
+    assert probe.frame_count(out) == want
+
+
+@needs_ffmpeg
+def test_the_editor_opens_a_bundle_with_no_media_and_a_head_trim(tmp_path):
+    """effective_cutmap built FrameRange(0, min(trim, 0)) -- an empty range, which
+    FrameRange refuses -- so project_state raised and the editor would not open. The
+    previous fix for this covered trim 0 only, and every real recording has 80-166."""
+    for trim in (0, 80, 166):
+        root = synthetic.make_bundle(tmp_path / f"nm{trim}", media=False)
+        b = Bundle(root)
+        b.edit.trim_head_frames = trim
+        assert qmlbridge.project_state(b)["timeline"]["output_frames"] == 0

@@ -103,6 +103,10 @@ Item {
     // What the export will keep -- the length the transport counts in (spec §2c:
     // "0:14 / 2:41" with "2:47 recorded · 6s cut" beside it).
     readonly property int editFrames: Math.max(0, sourceFrames - cutFrames)
+    // What the exported file will actually be: the kept recording plus both pads.
+    // The transport showed editFrames as the total, so a five-second output with an
+    // intro read "0:03".
+    readonly property int outputTotalFrames: editFrames + headPad + tailPad
 
     // Every row maps frames through the same track origin/width, so the playhead, the
     // ticks and the blocks can never disagree about where a frame is.
@@ -271,10 +275,15 @@ Item {
         return lastFrame
     }
 
-    // Source frame -> output frame: subtract the cut time before it, so the transport
-    // counts in the length the export will actually have.
+    // Timeline frame -> output frame, for the readouts. Pads and the head trim are
+    // part of the output too: without them the counter read a negative time through an
+    // intro and was short by the trim everywhere else.
     function outFrame(f) {
-        var o = f
+        if (f < 0)
+            return root.headPad + f                 // inside the head pad
+        if (f >= sourceFrames)
+            return root.headPad + editFrames + (f - sourceFrames)
+        var o = root.headPad + f
         for (var i = 0; i < cuts.length; ++i) {
             if (f >= cuts[i].end)
                 o -= cuts[i].end - cuts[i].start
@@ -462,7 +471,7 @@ Item {
                 id: totalLabel
                 anchors.left: parent.right
                 anchors.baseline: parent.baseline
-                text: " / " + root.shortTime(root.editFrames)
+                text: " / " + root.shortTime(root.outputTotalFrames)
                 color: Theme.text6
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fsRow
@@ -691,8 +700,18 @@ Item {
                         clip: true   // zoomed, a bar can run past the viewport
                         readonly property bool sel: root.preview && root.preview.selectedId === modelData.id
                         readonly property bool whole: !modelData.t
-                        readonly property int f0: modelData.t ? modelData.t.start : 0
-                        readonly property int f1: modelData.t ? modelData.t.end : root.sourceFrames
+                        // A layer in a pad has its range in PAD frames -- read as
+                        // source frames it drew over the recording instead, so a title
+                        // card appeared to sit on top of the video it precedes.
+                        readonly property int padBase:
+                            (modelData.pad || "") === "head" ? -root.headPad
+                            : (modelData.pad || "") === "tail" ? root.sourceFrames : 0
+                        readonly property int f0:
+                            modelData.t ? padBase + modelData.t.start : padBase
+                        readonly property int f1:
+                            modelData.t ? padBase + modelData.t.end
+                            : ((modelData.pad || "") === "" ? root.sourceFrames
+                                                            : padBase + 1)
 
                         Rectangle {
                             x: root.frameToX(parent.f0)

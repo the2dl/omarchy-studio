@@ -15,6 +15,7 @@
 // The report names the bridge/render additions that would make each of these live.
 import QtQuick
 import QtQuick.Dialogs
+import QtQuick.Controls.Basic as QC
 import ".."
 import "../controls" as C
 
@@ -198,6 +199,113 @@ Item {
                 color: Theme.text5
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fsHint
+            }
+
+            Item { width: 1; height: 4 }
+
+            // -- audio ----------------------------------------------------------
+            // Only for a recording that HAS audio. Two processing choices, applied at
+            // export rather than baked into the capture, so either can be undone by
+            // unticking it and rendering again.
+            Column {
+                width: parent.width
+                spacing: 7
+                visible: st.audio !== undefined && st.audio.has_audio === true
+
+                C.Caption { text: "audio" }
+
+                Repeater {
+                    model: [
+                        { key: "normalize", label: "Normalise loudness",
+                          tip: "Brings the whole take to a consistent level (-14 LUFS)." },
+                        { key: "declick", label: "Remove keyboard clicks",
+                          tip: "Takes the impulsive noise out of a voice track \u2014 a "
+                             + "mechanical keyboard under narration. Measured on speech "
+                             + "plus clacks: loud transients 564 \u2192 1, with the voice "
+                             + "itself left alone." }
+                    ]
+                    delegate: Item {
+                        required property var modelData
+                        width: parent.width
+                        height: 24
+
+                        Row {
+                            id: audioRow
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: 8
+                            Rectangle {
+                                width: 16; height: 16
+                                anchors.verticalCenter: parent.verticalCenter
+                                radius: 4
+                                color: on ? Theme.accent : "transparent"
+                                border.width: 1
+                                border.color: on ? Theme.accent
+                                            : audioMa.containsMouse ? Theme.text3 : Theme.text5
+                                readonly property bool on: st.audio !== undefined
+                                                        && st.audio[modelData.key] === true
+                                Behavior on color { ColorAnimation { duration: Theme.durFast } }
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "\uf00c"
+                                    visible: parent.on
+                                    color: Theme.bg
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: 10
+                                }
+                            }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: modelData.label
+                                color: audioMa.containsMouse ? Theme.text2 : Theme.text3
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fsRow
+                            }
+                        }
+
+                        MouseArea {
+                            id: audioMa
+                            objectName: "ctl:audio-" + modelData.key
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                var args = {}
+                                args[modelData.key + "_audio"] =
+                                    !(st.audio !== undefined && st.audio[modelData.key] === true)
+                                Bridge.op("set_audio", args)
+                            }
+                        }
+
+                        QC.ToolTip {
+                            id: audioTip
+                            visible: audioMa.containsMouse
+                            text: modelData.tip
+                            delay: 350
+                            timeout: -1
+                            padding: 0
+                            margins: 0
+                            x: -width - 10
+                            y: (parent.height - height) / 2
+                            background: Rectangle {
+                                color: Theme.bgFloat
+                                radius: Theme.radiusRow - 2
+                                border.width: 1
+                                border.color: Theme.hairline
+                            }
+                            contentItem: Text {
+                                text: audioTip.text
+                                color: Theme.text2
+                                width: 260
+                                wrapMode: Text.WordWrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fsRow
+                                leftPadding: 10; rightPadding: 10
+                                topPadding: 7; bottomPadding: 7
+                                lineHeight: 1.25
+                            }
+                        }
+                    }
+                }
             }
 
             Item { width: 1; height: 4 }

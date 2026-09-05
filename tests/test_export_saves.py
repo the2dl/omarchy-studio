@@ -184,3 +184,50 @@ def test_the_export_is_done_before_anything_is_opened(session, monkeypatch):
     _finished(session, 0, monkeypatch,
               hook=lambda p: seen.append(session.exporter.snapshot()["state"]))
     assert seen == ["done"]
+
+
+# --- audio cleanup at export -------------------------------------------------
+
+
+def test_declick_is_off_until_asked(session):
+    """It is a judgement about a particular recording, not a default."""
+    assert session.bundle.edit.declick_audio is False
+    assert session.state()["audio"]["declick"] is False
+
+
+def test_the_switches_are_independent(session):
+    """set_audio used to require normalize_audio and would have thrown on a payload
+    that named only the other one."""
+    session.op("set_audio", {"declick_audio": True})
+    assert session.bundle.edit.declick_audio is True
+    assert session.bundle.edit.normalize_audio is True, "untouched"
+    session.op("set_audio", {"normalize_audio": False})
+    assert session.bundle.edit.declick_audio is True, "still on"
+
+
+def test_declick_runs_before_the_loudness_pass(tmp_path):
+    """A key clack is the loudest thing in a narration track, so normalising first
+    would set the gain from the noise and leave the voice quiet."""
+    import synthetic
+    from omarchy_studio import render
+    from omarchy_studio.project import Bundle
+
+    root = tmp_path / "aud"
+    synthetic.make_bundle(root, seconds=1.0, width=320, height=240, camera=False)
+    b = Bundle(root)
+    b.edit.declick_audio = True
+    b.edit.normalize_audio = True
+    g = render.build_graph(b).graph
+    assert "adeclick" in g
+    assert g.index("adeclick") < g.index("loudnorm")
+
+
+def test_no_declick_filter_when_it_is_off(tmp_path):
+    import synthetic
+    from omarchy_studio import render
+    from omarchy_studio.project import Bundle
+
+    root = tmp_path / "aud2"
+    synthetic.make_bundle(root, seconds=1.0, width=320, height=240, camera=False)
+    b = Bundle(root)
+    assert "adeclick" not in render.build_graph(b).graph

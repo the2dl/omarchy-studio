@@ -424,6 +424,10 @@ class Edit:
     backdrop: BackdropSettings = field(default_factory=BackdropSettings)
     cursor: CursorSettings = field(default_factory=CursorSettings)
     normalize_audio: bool = True
+    # Remove impulsive noise -- a mechanical keyboard under a voice track is the case
+    # it exists for. OFF by default: it is a judgement about the recording, and one
+    # that should be made after hearing it rather than applied to everything.
+    declick_audio: bool = False
     trim_head_frames: int = 0
     # Output-only time at each end, so a title or end card has somewhere to live. Cuts
     # can only remove time; these are the only way the output gets longer than the
@@ -452,6 +456,7 @@ class Edit:
             "backdrop": asdict(self.backdrop),
             "cursor": asdict(self.cursor),
             "normalize_audio": self.normalize_audio,
+            "declick_audio": self.declick_audio,
             "trim_head_frames": self.trim_head_frames,
             "head_pad_frames": self.head_pad_frames,
             "tail_pad_frames": self.tail_pad_frames,
@@ -475,6 +480,7 @@ class Edit:
             backdrop=BackdropSettings(**d.get("backdrop", {})),
             cursor=CursorSettings.from_dict(d.get("cursor", {})),
             normalize_audio=bool(d.get("normalize_audio", True)),
+            declick_audio=bool(d.get("declick_audio", False)),
             trim_head_frames=int(d.get("trim_head_frames", 0)),
             head_pad_frames=_clamp_pad(d.get("head_pad_frames", 0)),
             tail_pad_frames=_clamp_pad(d.get("tail_pad_frames", 0)),

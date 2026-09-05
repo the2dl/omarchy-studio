@@ -338,6 +338,19 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
                 steps.append(f"apad=pad_dur={cutmap.tail_pad * secs:.3f}")
             g.add(f"{aout}{','.join(steps)}[apadded]")
             aout = "[apadded]"
+        if edit.declick_audio:
+            # BEFORE loudnorm, deliberately: a key clack is the loudest thing in a
+            # narration track, so normalising first would set the gain from the noise
+            # and leave the voice quiet. Removing the impulses changes the right
+            # answer, so it has to happen first.
+            #
+            # adeclick and not afftdn or arnndn, measured on speech plus broadband
+            # clacks: samples above -9dBFS went 564 -> 1 with adeclick, while the
+            # clean speech moved by -37dB (inaudible). afftdn removed no transients at
+            # all, and RNNoise -- the obvious answer, and the one that needs a model
+            # file -- left 9 and altered the voice MORE than it removed (+2dB).
+            g.add(f"{aout}adeclick[adeclicked]")
+            aout = "[adeclicked]"
         if edit.normalize_audio:
             # loudnorm AFTER the cut: it measures the material it is normalizing, and a
             # cut that removes a loud passage changes the right answer.

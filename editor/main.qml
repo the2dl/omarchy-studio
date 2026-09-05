@@ -131,11 +131,22 @@ ApplicationWindow {
             height: parent.height
             spacing: 14
 
-            Text {   // nf-fa-film
-                text: ""
-                color: Theme.accent
-                font.family: Theme.fontFamily
-                font.pixelSize: 17
+            // The mark, not a font glyph. SMALL variant, and that is a rule rather
+            // than a preference: below 24px the full mark's three receding frames thin
+            // out and its opacity ramp turns to mush, so the small form -- one thicker
+            // frame, a bigger core, no opacity -- is the required shape at this size.
+            // See docs/media/logo/README.md.
+            //
+            // The accent file rather than the currentcolor one: Qt's SVG renderer has
+            // no CSS inheritance, so stroke="currentColor" would resolve to black. The
+            // colour is baked in and is Theme.accent by construction.
+            Image {
+                source: "assets/mark-small-accent.svg"
+                sourceSize.width: 40      // 2x, to stay crisp on a HiDPI display
+                sourceSize.height: 40
+                width: 20
+                height: 20
+                smooth: true
             }
             Text {
                 text: app.st.name || "loading…"

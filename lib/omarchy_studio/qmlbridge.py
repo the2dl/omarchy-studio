@@ -555,6 +555,13 @@ def project_state(
         # other setting rather than holding a copy that could drift from the file the
         # renderer actually reads.
         "export_preset": bundle.edit.export_preset,
+        # Audio processing applied at export. `has_audio` gates the controls: offering
+        # them on a silent recording is offering nothing.
+        "audio": {
+            "has_audio": bool(screen is not None and screen.has_audio),
+            "normalize": bundle.edit.normalize_audio,
+            "declick": bundle.edit.declick_audio,
+        },
         # Following the recorded window. `available` is whether the window ever moved:
         # a toggle that would visibly do nothing is worse than no toggle, so the pane
         # only draws the control when there is something to follow.
@@ -1051,7 +1058,10 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         edit.export_preset = want
 
     elif op == "set_audio":
-        edit.normalize_audio = bool(args["normalize_audio"])
+        if "normalize_audio" in args:
+            edit.normalize_audio = bool(args["normalize_audio"])
+        if "declick_audio" in args:
+            edit.declick_audio = bool(args["declick_audio"])
 
     elif op == "reset":
         bundle.reset_edit()

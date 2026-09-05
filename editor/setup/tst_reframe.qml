@@ -57,6 +57,19 @@ Item {
             return findChild(bar, "ctl:reframe-toggle")
         }
 
+        // A control whose `visible` has just been flipped by a property change has not
+        // necessarily been laid out yet, and mouseClick on a zero-sized item lands on
+        // nothing. Under full-suite load that raced and the click silently missed --
+        // the test passed alone and failed in the suite, which reads like an
+        // environmental flake and is not one.
+        function ready(item) {
+            verify(item !== null, "control not found")
+            tryVerify(function () { return item.visible && item.width > 0 && item.height > 0 },
+                      2000, "control never got geometry")
+            waitForRendering(bar)
+            return item
+        }
+
         function test_it_is_visible_while_choosing_a_window() {
             // The reported state: Window mode, nothing picked yet.
             fakeApp.mode = 1
@@ -106,8 +119,7 @@ Item {
             fakeApp.mode = 1
             fakeApp.windowOnly = false
             fakeApp.fullMonitor = false
-            var only = findChild(bar, "ctl:windowonly-toggle")
-            verify(only !== null, "the isolate control should exist for a window pick")
+            var only = ready(findChild(bar, "ctl:windowonly-toggle"))
             mouseClick(only)
             compare(fakeApp.windowOnly, true)
             compare(fakeApp.fullMonitor, false)
@@ -132,9 +144,10 @@ Item {
             fakeApp.windowOnly = false
             fakeApp.mode = 1
             fakeApp.fullMonitor = false
-            mouseClick(control())
+            var c = ready(control())
+            mouseClick(c)
             compare(fakeApp.fullMonitor, true)
-            mouseClick(control())
+            mouseClick(c)
             compare(fakeApp.fullMonitor, false)
         }
     }

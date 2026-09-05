@@ -1,3 +1,5 @@
+<img src="docs/media/logo/png/mark-128.png" width="72" alt="">
+
 # omarchy-studio
 
 A non-destructive screen recorder for Linux, built for Hyprland.
@@ -123,6 +125,20 @@ The codebase is opinionated about a few things, and they are load-bearing:
   than the selection is a checkbox, because picking one window is frequently a
   decision *not* to record the rest of the screen.
 - **A control that would visibly do nothing is worse than no control.**
+
+## The mark
+
+Three nested frames receding to a filled core: a zoom push-in, which is the editor's
+signature move, and a screen within a screen. `docs/media/logo/` carries the SVGs, the
+rasterised PNGs and the handoff notes -- including the two rules worth knowing before
+using it anywhere:
+
+- **Below 24px, use the small mark.** It is not an optimisation. The full mark's
+  receding strokes thin out and its opacity ramp turns to grey mush at that size, so
+  the small form drops the middle frame and thickens the outer one. The editor's own
+  title bar is a 20px instance and uses it.
+- **Single colour, always.** The three frames differ in opacity, never in hue. No
+  gradient, no glow, no second colour.
 
 ## Tests
 

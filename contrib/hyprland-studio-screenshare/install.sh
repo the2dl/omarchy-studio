@@ -13,6 +13,24 @@
 # or after going back to the stock package.
 set -euo pipefail
 
+# Preflight, because everything below is `set -e` and the failures are otherwise
+# bare "command not found" from the middle of a staging step, or -- worse -- a cmake
+# error from inside hyprpm's own build output, where it reads as the plugin being
+# broken rather than the toolchain being absent.
+#
+# hyprpm supplies the Hyprland HEADERS itself (it builds against stock ones, on
+# purpose -- see hyprpm.toml). The pkg-config modules CMakeLists asks for beyond that
+# are Hyprland's own runtime dependencies, so a machine running Hyprland already has
+# them; they are not re-checked here.
+need() {
+  command -v "$1" >/dev/null || { echo "missing: $1  ($2)" >&2; exit 1; }
+}
+need rsync "rsync -- staging into the hyprpm repo"
+need git "git -- hyprpm only accepts a git repository"
+need hyprpm "hyprpm -- ships with hyprland"
+need cmake "cmake -- the plugin's build, see hyprpm.toml"
+need g++ "base-devel"
+
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 STAGE=${OMARCHY_STUDIO_HYPRPM_STAGE:-"$HOME/.local/share/omarchy-studio/hyprpm/omarchy-studio-screenshare"}
 NAME=omarchy-studio-screenshare

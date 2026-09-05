@@ -86,6 +86,13 @@ Two optional native pieces, in the order they are worth having:
     contrib/omarchy-capture-window/build.sh            true single-window capture
     contrib/hyprland-studio-screenshare/install.sh     exclusion instead of blackout
 
+Each checks its own toolchain first and names what is missing, rather than failing
+somewhere in the middle of a build. Between them they want:
+
+    sudo pacman -S --needed base-devel cmake rsync
+
+Everything else they link against is already on a machine running Hyprland.
+
 Neither is required and neither fails loudly, which is the point of listing what you
 give up. Without the first, "just this window" records the window's RECTANGLE, so
 anything on top of it lands in the take; the dispatch detects the missing binary and

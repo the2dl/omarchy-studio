@@ -31,6 +31,15 @@ need hyprpm "hyprpm -- ships with hyprland"
 need cmake "cmake -- the plugin's build, see hyprpm.toml"
 need g++ "base-devel"
 
+# Hyprland's plugin hooking is x86_64-only (CFunctionHook::hook returns false on
+# every other architecture), so the plugin builds here and then dies in init. Say so
+# rather than leaving someone to work out why an installed, enabled plugin never loads.
+if [[ $(uname -m) != x86_64 ]]; then
+  echo "note: Hyprland plugins only load on x86_64 -- this will build and install," >&2
+  echo "      but will not load on $(uname -m). The recorder handles its absence:" >&2
+  echo "      the self-view parks outside the capture, or is dropped." >&2
+fi
+
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 STAGE=${OMARCHY_STUDIO_HYPRPM_STAGE:-"$HOME/.local/share/omarchy-studio/hyprpm/omarchy-studio-screenshare"}
 NAME=omarchy-studio-screenshare

@@ -26,6 +26,25 @@ set -uo pipefail
 PLUGIN=omarchy-studio-screenshare
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 
+# NOT ON aarch64, AND NOT AS AN OPTIMISATION. Hyprland's plugin function-hooking is
+# x86_64-only -- CFunctionHook::hook() in src/plugins/HookSystem.cpp opens with
+#
+#     #if !defined(__x86_64__)
+#         return false;
+#     #endif
+#
+# so on any other architecture every hook fails and the plugin dies in init. It still
+# BUILDS and hyprpm still reports it enabled, which is the trap: without this gate the
+# script would find it "not loaded" at every login, decide the build was stale, spend a
+# cmake compile rebuilding it, and then notify that it still did not load. Every login,
+# forever, on a machine where it can never work.
+#
+# Silent, because there is nothing for the user to do about their CPU architecture.
+case "$(uname -m)" in
+  x86_64) ;;
+  *) exit 0 ;;
+esac
+
 loaded() {
   hyprctl -j plugin list 2>/dev/null \
     | jq -e --arg n "$PLUGIN" '.[] | select(.name == $n)' >/dev/null 2>&1

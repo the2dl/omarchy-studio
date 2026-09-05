@@ -582,6 +582,23 @@ def test_no_plugin_script_ever_updates_every_repo():
             assert "hyprpm update" not in stripped, f"{name} runs a global update: {line}"
 
 
+def test_the_autostart_hook_does_nothing_off_x86_64():
+    """It is meant for `exec_on_start` on dotfiles shared between machines.
+
+    Hyprland's plugin function-hooking is x86_64-only -- CFunctionHook::hook() returns
+    false everywhere else -- so the plugin builds, hyprpm calls it enabled, and it dies
+    in init. Without this gate the hook would find it "not loaded" every login, decide
+    the build was stale, spend a cmake compile, and notify that it still did not load.
+    Forever, on a machine where it can never work.
+    """
+    src = (Path(__file__).resolve().parents[1] / "contrib"
+           / "hyprland-studio-screenshare" / "ensure-loaded.sh").read_text()
+    gate = src[:src.index("loaded() {")]
+    assert "uname -m" in gate, "the arch gate must come before anything else runs"
+    assert "x86_64" in gate
+    assert "exit 0" in gate
+
+
 def test_the_autostart_hook_is_a_no_op_when_the_plugin_is_loaded():
     """It is meant for `exec_on_start`, so the common path -- every login after the
     first -- must be one hyprctl call and an exit, not a build."""

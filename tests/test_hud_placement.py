@@ -177,3 +177,36 @@ def test_no_recording_binding_at_all_is_an_empty_answer(hud, monkeypatch):
 def test_unparseable_binds_do_not_raise(hud, monkeypatch):
     monkeypatch.setattr(hud, "hypr", lambda *a: "not json")
     assert hud.stop_binding() == ""
+
+
+# --- a stop that does not take must still close the window --------------------
+
+
+def test_wait_gone_reports_exit(hud):
+    """The watchdog polls rather than waits: it runs on a daemon thread, where
+    proc.wait() would outlive the reason for waiting."""
+    class P:
+        def __init__(self, codes): self.codes = list(codes)
+        def poll(self): return self.codes.pop(0) if self.codes else 0
+    assert hud._wait_gone(P([None, None, 0]), 2.0) is True
+
+
+def test_wait_gone_reports_still_running(hud):
+    class P:
+        def poll(self): return None
+    assert hud._wait_gone(P(), 0.6) is False
+
+
+def test_the_stop_is_detached_and_holds_no_pipe(hud):
+    """The recorder's stop kills this HUD partway through, and this process reads its
+    output. With a pipe, that kill closed the read end and the recorder took SIGPIPE
+    before opening the editor -- the take finished and nothing appeared."""
+    src = (REPO / "bin" / "omarchy-recording-hud").read_text()
+    block = src[src.index("def stop_recording"):src.index("def act(")]
+    # Code only. The comment above this call explains the SIGPIPE it was written to
+    # prevent, and a naive substring search matches its prose instead of the call.
+    code = "\n".join(l for l in block.splitlines() if not l.strip().startswith("#"))
+    assert "start_new_session=True" in code
+    assert code.count("subprocess.DEVNULL") >= 3, "stdin, stdout and stderr"
+    assert "capture_output" not in code
+    assert "subprocess.PIPE" not in code

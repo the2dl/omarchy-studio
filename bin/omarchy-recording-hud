@@ -346,6 +346,17 @@ def serve(session: Session, port: int = 0) -> ThreadingHTTPServer:
     return server
 
 
+def _wait_gone(proc: subprocess.Popen, seconds: float) -> bool:
+    """Whether `proc` exited within `seconds`. Polled rather than waited on, because
+    the caller is a daemon thread and proc.wait() there would outlive the reason."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        time.sleep(0.25)
+    return proc.poll() is not None
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--socket", default="", help="the running gsr's IPC socket")
@@ -394,6 +405,26 @@ def main(argv: list[str] | None = None) -> int:
         proc.terminate()
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
+
+    # A stop that does not take has to close this window anyway.
+    #
+    # Stop fires `omarchy-capture-screenrecording --stop-recording` and then relies on
+    # that path to kill this HUD as it finalises -- which it does, in about three
+    # seconds. But the flag exits 1 when there is NOTHING to stop, and then nobody
+    # kills anything: the pill sits on screen saying "stopping" for as long as the
+    # session lasts, over a recording that is already over. Seen for real after a take
+    # was finalised out from under it.
+    #
+    # session.finished was already being set here and consumed by nothing at all.
+    def stop_watchdog():
+        session.finished.wait()
+        # Generous: a finalize on a long take is slow, and killing the window early
+        # would take the Stop button away while the stop is still working.
+        if proc.poll() is None and not _wait_gone(proc, 15.0):
+            print("stop did not close the HUD within 15s; closing it rather than "
+                  "leaving a pill over a finished recording.", file=sys.stderr)
+            proc.terminate()
+    threading.Thread(target=stop_watchdog, daemon=True).start()
 
     def settle():
         for _ in range(80):

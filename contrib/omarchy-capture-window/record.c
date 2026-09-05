@@ -36,6 +36,9 @@
 #include "linux-dmabuf-v1-client-protocol.h"
 
 #define NBUF 4   // rendering into one, one queued, one encoding, one spare
+// A window hidden for a minute should not cost a minute of repeated frames in one
+// burst. Past this the take simply has a shorter gap than real time.
+#define MAX_GAP_FILL 300
 
 // ---------------------------------------------------------------- options
 
@@ -84,6 +87,9 @@ static AVBufferRef *va_dev;
 static AVFilterGraph *graph;
 static AVFilterContext *fsrc, *fsink;
 static AVFrame *filt_frame;
+// The last frame handed to the encoder, kept so a gap can be filled with it.
+static AVFrame *held;
+static int64_t last_sent = -1;
 static AVPacket *pkt;
 
 static volatile sig_atomic_t stop_now;
@@ -161,7 +167,34 @@ static void encode_bo(struct buf *b, int64_t pts) {
         r = av_buffersink_get_frame(fsink, filt_frame);
         if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return;
         if (r < 0) die("buffersink", r);
+
+        // CONSTANT FRAME RATE, by repeating the last frame across any gap.
+        //
+        // Placing frames at their true times and leaving holes produced an honest
+        // VFR file -- and an unusable one. probe.fps prefers avg_frame_rate, which
+        // for a gapped stream is the AVERAGE (510/11 = 46.4) rather than the grid the
+        // frames actually sit on (r_frame_rate = 60). That number becomes the
+        // bundle's Timebase, and every frame index downstream -- cuts, zoom, the
+        // cursor track -- is computed against it. A repeat is also what a dropped
+        // frame looks like to a viewer: the picture did not change.
+        if (held && last_sent >= 0 && pts > last_sent + 1) {
+            int64_t gap = pts - last_sent - 1;
+            if (gap > MAX_GAP_FILL) gap = MAX_GAP_FILL;   // a long hide, not a drop
+            for (int64_t g = 0; g < gap; g++) {
+                av_frame_unref(filt_frame);
+                if (av_frame_ref(filt_frame, held) < 0) break;
+                filt_frame->pts = last_sent + 1 + g;
+                drain(0);
+            }
+            last_sent += gap;
+            av_frame_unref(filt_frame);
+            if (av_buffersink_get_frame(fsink, filt_frame) < 0) return;
+        }
+
         filt_frame->pts = pts;
+        av_frame_unref(held);
+        av_frame_ref(held, filt_frame);
+        last_sent = pts;
         drain(0);
         av_frame_unref(filt_frame);
     }
@@ -546,6 +579,7 @@ static void setup_pipeline(void) {
     if (r < 0) die("write_header", r);
 
     filt_frame = av_frame_alloc();
+    held = av_frame_alloc();
     pkt = av_packet_alloc();
 }
 

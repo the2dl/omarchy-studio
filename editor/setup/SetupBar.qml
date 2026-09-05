@@ -116,9 +116,12 @@ Item {
         }
         C.Toggle {
             objectName: "ctl:mic-toggle"
-            checked: app.micOn
-            enabled: app.sources.mic !== null
-            onToggled: function (v) { app.micOn = v }
+            checked: app.micOn && app.audioAvailable
+            // Two reasons to be off: no microphone exists, or this capture mode
+            // cannot record one.
+            enabled: app.sources.mic !== null && app.audioAvailable
+            opacity: app.audioAvailable ? 1.0 : 0.4
+            onToggled: function (v) { if (app.audioAvailable) app.micOn = v }
         }
 
         Rectangle { width: 1; height: 26; color: Theme.hairline }
@@ -131,8 +134,10 @@ Item {
         }
         C.Toggle {
             objectName: "ctl:audio-toggle"
-            checked: app.desktopAudio
-            onToggled: function (v) { app.desktopAudio = v }
+            checked: app.desktopAudio && app.audioAvailable
+            enabled: app.audioAvailable
+            opacity: app.audioAvailable ? 1.0 : 0.4
+            onToggled: function (v) { if (app.audioAvailable) app.desktopAudio = v }
         }
 
         Rectangle { width: 1; height: 26; color: Theme.hairline }
@@ -162,6 +167,97 @@ Item {
         // followed. It also means everything beside the selection lands on disk, and
         // picking one window is often precisely a decision NOT to record the rest.
         // That is not a default anyone should get without asking for it.
+        // Two answers to one question, so they are drawn as a pair and only one can
+        // be true. "Just this window" captures the window's own surface tree, so
+        // nothing drawn over it is in the take and there is no surrounding pixel to
+        // re-frame into -- which is exactly what "Re-frame later" needs. Ticking
+        // either therefore unticks the other.
+        Item {
+            id: windowOnlyRow
+            // Window picks only. An area is a rectangle by definition; there is no
+            // toplevel behind it to export.
+            visible: app.mode === 1
+            implicitWidth: windowOnlyContent.implicitWidth
+            implicitHeight: 26
+            Layout.preferredWidth: implicitWidth
+            Layout.preferredHeight: implicitHeight
+
+            Row {
+                id: windowOnlyContent
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 8
+                Rectangle {
+                    width: 16; height: 16
+                    anchors.verticalCenter: parent.verticalCenter
+                    radius: 4
+                    color: app.windowOnly ? Theme.accent : "transparent"
+                    border.width: 1
+                    border.color: app.windowOnly ? Theme.accent
+                                : windowOnlyMa.containsMouse ? Theme.text3 : Theme.text5
+                    Behavior on color { ColorAnimation { duration: Theme.durFast } }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "\uf00c"
+                        visible: app.windowOnly
+                        color: Theme.bg
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 10
+                    }
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Just this window"
+                    color: app.windowOnly ? Theme.text2
+                         : windowOnlyMa.containsMouse ? Theme.text3 : Theme.text4
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsRow
+                }
+            }
+            MouseArea {
+                id: windowOnlyMa
+                objectName: "ctl:windowonly-toggle"
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                    app.windowOnly = !app.windowOnly
+                    if (app.windowOnly)
+                        app.fullMonitor = false
+                }
+            }
+            QC.ToolTip {
+                id: windowOnlyTip
+                objectName: "windowOnlyTip"
+                parent: windowOnlyRow
+                visible: windowOnlyMa.containsMouse
+                text: "Records this window's own pixels. Anything drawn over it \u2014 a "
+                    + "dropdown, a notification \u2014 is not in the take, and the frame "
+                    + "follows the window if it moves.\nOff records the rectangle it sits "
+                    + "in, whatever ends up on top.\nNo audio yet in this mode."
+                delay: 350
+                timeout: -1
+                padding: 0
+                margins: 0
+                y: -height - 10
+                x: -(width - windowOnlyRow.width) / 2
+                background: Rectangle {
+                    color: Theme.bgFloat
+                    radius: Theme.radiusRow - 2
+                    border.width: 1
+                    border.color: Theme.hairline
+                }
+                contentItem: Text {
+                    text: windowOnlyTip.text
+                    color: Theme.text2
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsRow
+                    leftPadding: 10; rightPadding: 10
+                    topPadding: 7; bottomPadding: 7
+                    lineHeight: 1.25
+                }
+            }
+        }
+
         // A CHECKBOX, not another Toggle. The bar already carries three switches
         // (mic, system audio, Script) and they all mean "turn this input on". This
         // one means something else -- how much of the screen reaches the disk -- and
@@ -179,7 +275,7 @@ Item {
             // exactly when someone would look for it. It survived review because the
             // selftest auto-picks a window to make the picked state photographable, so
             // every screenshot had a selection the real flow never has.
-            visible: app.mode !== 0
+            visible: app.mode !== 0 && !app.windowOnly
             implicitWidth: reframeContent.implicitWidth
             implicitHeight: 26
             Layout.preferredWidth: implicitWidth
@@ -224,7 +320,11 @@ Item {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: app.fullMonitor = !app.fullMonitor
+                onClicked: {
+                    app.fullMonitor = !app.fullMonitor
+                    if (app.fullMonitor)
+                        app.windowOnly = false
+                }
             }
 
             // The label cannot carry the trade-off, and the trade-off is the whole

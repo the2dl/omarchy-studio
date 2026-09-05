@@ -396,3 +396,15 @@ def test_a_selection_only_capture_offers_no_follow_toggle(tmp_path):
     b.edit.follow_window = True
     b._follow_cache = None
     assert follow.for_bundle(b) is None
+
+
+def test_an_isolated_capture_is_never_offered_following(tmp_path):
+    """The stream IS the window: it followed on its own, there is nothing around it
+    to pan into, and offering to follow it would offer the thing it already did."""
+    b = _bundle_with_track(tmp_path / "iso", (0, 200, 100, 300, 200),
+                           (2, 400, 100, 300, 200))
+    b.capture.window_isolated = True
+    assert follow.has_track(b) is False
+    b.edit.follow_window = True
+    b._follow_cache = None
+    assert follow.for_bundle(b) is None

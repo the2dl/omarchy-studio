@@ -154,6 +154,9 @@ GSR_STDERR="$RUNTIME_DIR/omarchy-studio-gsr.err"
 # afterwards the token (persisted by xdg-desktop-portal, survives reboots while an output
 # of that name exists) skips it.
 PORTAL_TOKEN_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gpu-screen-recorder/restore_token"
+# The single-window recorder. Built from contrib/, not packaged, so its absence is a
+# fallback rather than an error -- see the isolated branch below.
+WINDOW_RECORDER="$STUDIO_ROOT/contrib/omarchy-capture-window/omarchy-capture-window"
 HUD_PID_FILE="$RUNTIME_DIR/omarchy-studio-hud.pid"
 # Only set when the setup bar's Script toggle raised the prompter, so a prompter the
 # user started themselves is never taken away from them.
@@ -391,6 +394,8 @@ park_window_outside() {
 # user is told they will be recorded.
 protect_overlays_from_capture() {
   local backend=$1 rect=$2
+  # Only KMS needs this. The portal hides marked windows for us, and a toplevel
+  # capture contains one window's surface tree and cannot see any other.
   [[ $backend == "kms" ]] || return 0
 
   local title stuck=()
@@ -675,7 +680,28 @@ start_screenrecording() {
   #
   # Still KMS when it is on, so it costs disk rather than the portal's 30fps. The
   # portal is taken only when a self-view forces it, decided above.
-  if [[ ${SETUP_FULL_MONITOR:-false} == "true" && -z $SOURCE_LOGICAL && $target == region:* ]]; then
+  # Isolating a window is a different BACKEND, not a different rectangle, so it
+  # settles before any of the framing questions: there is no crop, no monitor to
+  # widen to, and nothing for the window track to be used for.
+  local isolated="false"
+  if [[ ${SETUP_WINDOW_ISOLATED:-false} == "true" && -n ${SETUP_WINDOW:-} ]]; then
+    if [[ -x $WINDOW_RECORDER ]]; then
+      isolated="true"
+      SOURCE_LOGICAL=""
+      # The self-view is a different window, and a toplevel capture contains exactly
+      # one. So the bubble cannot be in the take wherever it sits -- no parking, no
+      # portal, no compositor rule -- and the user's placement is honoured as-is.
+      # A mode of its own rather than reusing "exclude", which would send the SCREEN
+      # capture down the portal branch.
+      [[ $self_view_mode != "off" ]] && self_view_mode="free"
+    else
+      trail "isolated: $WINDOW_RECORDER is not built; falling back to a rectangle capture"
+      omarchy-notification-send -u normal -t 4000 "Recording the window's rectangle" \
+        "The single-window recorder is not built, so anything overlapping the window will be in the take."
+    fi
+  fi
+
+  if [[ $isolated == "false" && ${SETUP_FULL_MONITOR:-false} == "true" && -z $SOURCE_LOGICAL && $target == region:* ]]; then
     SOURCE_LOGICAL=$(monitor_logical_geometry)
     [[ -n $SOURCE_LOGICAL ]] ||
       trail "reframe: no monitor geometry for $MONITOR_NAME; recording the selection only"
@@ -687,6 +713,7 @@ start_screenrecording() {
     --monitor "$MONITOR_NAME" \
     --scale "$MONITOR_SCALE" \
     ${SOURCE_LOGICAL:+--source-logical "$SOURCE_LOGICAL"} \
+    $([[ $isolated == "true" ]] && echo --window-isolated) \
     "${burned_in_flag[@]}" "${camera_placement_args[@]}") || {
     trail "begin: FAILED to create the bundle"
     omarchy-notification-send -u critical -t 3000 "Screen recording error" "Could not create the recording bundle"
@@ -704,6 +731,7 @@ start_screenrecording() {
   [[ -n $SOURCE_LOGICAL && -n $MONITOR_NAME ]] && capture_w="$MONITOR_NAME"
   local capture_args=(-w "$capture_w" -s "${RESOLUTION:-$CAPTURE_SIZE}")
   local capture_backend="kms" verbose_args=()
+  [[ $isolated == "true" ]] && capture_backend="toplevel"
   local capture_fps="$FRAMERATE"
   if [[ $self_view_mode == "exclude" || $self_view_mode == "exclude-crop" ]]; then
     capture_backend="portal"
@@ -753,12 +781,26 @@ start_screenrecording() {
   # with its luma sitting in 17-242: black backgrounds lifted off zero and white text
   # pulled off 255, i.e. every take shipped with its contrast quietly reduced. A desktop
   # is full-range source and there is no reason to record it as broadcast video.
+  if [[ $isolated == "true" ]]; then
+    # A different recorder entirely: hyprland_toplevel_export_v1 gives us the window's
+    # own surface tree, so nothing drawn over it is in the frames and the capture
+    # follows the window with no track. It speaks gsr's flag vocabulary deliberately.
+    #
+    # No -ipc: it has no control socket, and does not need one -- SIGTERM finalises the
+    # file. The stop path already signals before it talks to the socket.
+    "$WINDOW_RECORDER" -w "$SETUP_WINDOW" \
+      -k "${CAPTURE_CODEC:-auto}" -f "$capture_fps" \
+      -cursor "$CURSOR_CAPTURE" \
+      -write-first-frame-ts "$master.ts" \
+      -o "$master" 2> >(tee -a "$GSR_STDERR" >>"$LOG_FILE") &
+  else
   gpu-screen-recorder "${capture_args[@]}" \
     -k "${CAPTURE_CODEC:-auto}" -cr full -f "$capture_fps" -fm cfr -fallback-cpu-encoding yes \
     -cursor "$CURSOR_CAPTURE" \
     -write-first-frame-ts yes \
     -ipc "$IPC_SOCKET" "${verbose_args[@]}" \
     -o "$master" "${audio_args[@]}" 2> >(tee -a "$GSR_STDERR" >>"$LOG_FILE") &
+  fi
   GSR_PID=$!
   # Identity recorded now, while we still know it. Verified at stop as (pid, start
   # time), so a recycled pid cannot be mistaken for this process.
@@ -792,6 +834,8 @@ start_screenrecording() {
     [[ -n ${SETUP_CAMERA_RECT:-} ]] && camera_args+=(--rect="$SETUP_CAMERA_RECT")
     case $self_view_mode in
     park) camera_args+=(--self-view=yes) ;;
+    # Nothing to hide from: the capture is one window and this is not it.
+    free) camera_args+=(--self-view=yes --exclude=yes) ;;
     # Both hide the bubble in the compositor; exclude-crop additionally streams the
     # whole monitor and carves the region out at export.
     exclude | exclude-crop) camera_args+=(--self-view=yes --exclude=yes) ;;
@@ -873,6 +917,7 @@ start_screenrecording() {
     [[ $target == region:* ]] && what="region ${target#region:}"
     echo "Recording $what -> $BUNDLE"
     [[ $capture_backend == "portal" ]] && echo "  backend: portal (self-view inside the capture, kept out of it by the compositor)"
+    [[ $capture_backend == "toplevel" ]] && echo "  backend: toplevel (this window's own pixels; nothing drawn over it is in the take)"
     [[ $WEBCAM == "true" && $BURN_IN != "true" ]] && echo "  camera: media/cam.mp4, separate stream (movable in the editor)"
     echo "  stop:   Alt+PrintScreen, the bar indicator, or run this command again"
   fi

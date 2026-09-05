@@ -157,6 +157,8 @@ def plan(
     screen = capture.screen
     if screen is None or not track.samples:
         return None
+    if getattr(capture, "window_isolated", False):
+        return None
     if not capture.source_crop:
         # No surrounding pixels to pan into: the stream IS the frame.
         return None
@@ -271,6 +273,11 @@ def has_track(bundle) -> bool:
     """
     from .events import read_window_track
 
+    if getattr(bundle.capture, "window_isolated", False):
+        # The stream IS the window. It followed on its own, there is nothing around it
+        # to pan into, and offering to "follow" it would be offering the thing it
+        # already did.
+        return False
     if not bundle.capture.source_crop:
         return False
     return read_window_track(track_path(bundle)).moved

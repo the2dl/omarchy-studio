@@ -172,6 +172,14 @@ ApplicationWindow {
     // Record the whole display and carry the selection as a crop, so the framing can
     // be changed afterwards. Off by default: see the control in SetupBar.
     property bool fullMonitor: false
+    // Capture the window itself rather than the rectangle it sits in. Window picks
+    // only -- an area has no toplevel behind it to export.
+    property bool windowOnly: false
+    // The single-window recorder captures video only. Rather than record silence and
+    // let it be discovered in the editor, the audio switches turn themselves off and
+    // say why while this mode is on.
+    readonly property bool audioAvailable: !(mode === 1 && windowOnly)
+    onWindowOnlyChanged: if (windowOnly) { micOn = false; desktopAudio = false }
 
     readonly property var micEntry: entryFor(sources.mics, micDevice, "name")
     readonly property var cameraEntry: entryFor(sources.cameras, cameraDevice, "device")
@@ -341,7 +349,8 @@ ApplicationWindow {
             // cut from, so the recorder can log where it went afterwards.
             window: (sel && sel.kind === "window" && sel.address) ? sel.address : null,
             // Only meaningful for a window or an area; config drops it for a display.
-            full_monitor: mode !== 0 && fullMonitor
+            full_monitor: mode !== 0 && fullMonitor,
+            window_isolated: mode === 1 && windowOnly
         }, function (r, ok) {
             if (!ok)
                 return          // rejected config; everything stays up

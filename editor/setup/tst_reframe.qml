@@ -29,6 +29,8 @@ Item {
         property int mode: 1
         property var sel: null
         property bool fullMonitor: false
+        property bool windowOnly: false
+        readonly property bool audioAvailable: !(mode === 1 && windowOnly)
         property bool micOn: false
         property bool desktopAudio: false
         property bool prompterOn: false
@@ -36,7 +38,7 @@ Item {
         property var cameraModes: ["off", "circle", "rounded", "rect"]
         property var micEntry: null
         property var cameraEntry: null
-        property var sources: ({ cameras: [], monitors: [], windows: [], mic: null })
+        property var sources: ({ cameras: [], monitors: [], windows: [], mic: null, mics: [] })
         property string pickerOpen: ""
         property real micDb: -60
         property bool counting: false
@@ -98,7 +100,41 @@ Item {
             compare(c.height, row.height)
         }
 
+        function test_the_two_answers_are_exclusive() {
+            // Re-frame needs surrounding pixels; isolating means the stream IS the
+            // window and there are none. Both true at once describes nothing.
+            fakeApp.mode = 1
+            fakeApp.windowOnly = false
+            fakeApp.fullMonitor = false
+            var only = findChild(bar, "ctl:windowonly-toggle")
+            verify(only !== null, "the isolate control should exist for a window pick")
+            mouseClick(only)
+            compare(fakeApp.windowOnly, true)
+            compare(fakeApp.fullMonitor, false)
+            verify(!control().visible, "re-frame is meaningless once the stream is the window")
+        }
+
+        function test_audio_is_disabled_where_it_cannot_be_recorded() {
+            // The single-window recorder is video-only. Offering a mic switch that
+            // silently records nothing is the kind of thing found in the editor,
+            // after the take, when it cannot be redone.
+            fakeApp.mode = 1
+            fakeApp.windowOnly = true
+            verify(!findChild(bar, "ctl:mic-toggle").enabled)
+            verify(!findChild(bar, "ctl:audio-toggle").enabled)
+            fakeApp.windowOnly = false
+            verify(findChild(bar, "ctl:audio-toggle").enabled,
+                   "system audio comes back when the mode can record it")
+        }
+
+        function test_isolating_is_not_offered_for_an_area() {
+            fakeApp.mode = 2
+            verify(!findChild(bar, "ctl:windowonly-toggle").visible,
+                   "an area has no toplevel to export")
+        }
+
         function test_clicking_it_flips_the_answer() {
+            fakeApp.windowOnly = false
             fakeApp.mode = 1
             fakeApp.fullMonitor = false
             mouseClick(control())

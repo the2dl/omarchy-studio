@@ -182,8 +182,25 @@ def test_config_has_every_key_always():
                   camera="off", camera_device=None)
     assert c == {"target": "monitor:DP-1", "mic": True, "mic_device": None,
                  "desktop_audio": False, "camera": "off", "camera_device": None,
-                 "camera_rect": None, "window": None, "full_monitor": False,
-                 "countdown": 3}
+                 "camera_rect": None, "window": None, "window_isolated": False,
+                 "full_monitor": False, "countdown": 3}
+
+
+def test_only_a_real_window_can_be_isolated():
+    """An area is a rectangle by definition; there is no toplevel behind it to
+    export, so asking for one is not a thing that can be honoured."""
+    assert ss.config("region:800x600+10+20", True, False, "off",
+                     None, window_isolated=True)["window_isolated"] is False
+    assert ss.config("region:800x600+10+20", True, False, "off", None,
+                     window="0x5f2a", window_isolated=True)["window_isolated"] is True
+
+
+def test_isolating_and_reframing_cannot_both_be_true():
+    """Re-framing needs pixels around the frame; isolating means the stream IS the
+    window and there are none. Both at once describes nothing."""
+    c = ss.config("region:800x600+10+20", True, False, "off", None,
+                  window="0x5f2a", window_isolated=True, full_monitor=True)
+    assert c["window_isolated"] is True and c["full_monitor"] is False
 
 
 def test_recording_more_than_the_selection_is_opt_in():

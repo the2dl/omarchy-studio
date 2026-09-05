@@ -103,33 +103,39 @@ Flags mirror gpu-screen-recorder on purpose: the capture script already branches
 `kms|portal`, and this is meant to be a third value rather than a second way of
 doing everything.
 
-**Measured, on this box (Granite Ridge iGPU, DP-1 5120x2880@2x), 6s takes:**
+**Measured on this box** (Granite Ridge iGPU, 2 CU, one VCN 3.1.2, driving DP-1 at
+5120x2880@60), 6s takes, zero-copy + threaded encode:
 
-    window            capture only    with encode
-    2526x1372          59.6 fps        59.3 fps
-    2526x2768             --           34.9 fps
-    5076x2768          59.6 fps        25.5 fps
+    window        fps out   dropped
+    2526x1372      59.6       0        display rate
+    5076x2768      47.2       0        VCN-bound, see below
 
-Capture alone holds display rate at any size. Adding the encode costs nothing on a
-small window and most of the rate on a maximised one -- it scales with pixels, so it
-is throughput, not a fixed overhead. A 5076x2768 frame is 14M pixels uploaded and
-HEVC-encoded sixty times a second, on an iGPU also driving a 5K display.
+Getting here corrected three wrong beliefs, all of them mine:
 
-The upload is what a working DMA-BUF import would delete. VAAPI on this driver
-refuses one:
+**The DMA-BUF import works fine.** The earlier "VAAPI refuses to import a BGRA DRM
+object" was a bug in the attempt, not a driver limit: the descriptor was rebuilt each
+frame and the fd `close()`d as soon as `av_buffersrc_add_frame_flags` returned. VAAPI
+imports later, when the graph maps the surface, and by then the fd was gone --
+reported as "resource allocation failed". One fd per buffer, held for its lifetime,
+and it imports every way it was tried (tiled, linear, ARGB, XRGB).
 
-    Failed to create surface from DRM object: 2 (resource allocation failed)
-    Failed to map frame: -5
+**shm was the wrong call.** It looked like "one copy instead of two", but `hwupload`
+from system memory is a tiled blit on the GFX engine, and on a 2-CU iGPU that competes
+with the compositor's own rendering -- capture alone falls from 58 fps to 27 with a
+synthetic upload running beside it. The cost was on the GPU, not the CPU, so counting
+memcpys got it backwards.
 
-Tried tiled and linear, ARGB and XRGB (same bytes, only the alpha channel differs --
-VAAPI often accepts the X variant and here it does not). So it is the format class,
-not the modifier or the alpha. Getting past it means importing through EGL or Vulkan
-and converting to NV12 there, which is a real piece of work rather than a flag.
+**The encode was not the wall; the compute engine was.** Capture alone already costs
+~84% GPU at 5K: the compositor renders that window a second time for us. What the
+encode thread buys is not CPU parallelism -- the Wayland loop is idle ~99% of the
+time either way -- but getting `vaSync` off the critical path, so the compositor can
+render frame N+1 while the VCN encodes frame N on a different engine.
 
-Capture is on wl_shm for that reason. The dmabuf path captures faster (59.6 vs 44.8
-measured with no encoder attached) but only pays off if the encoder can read that
-buffer without a copy, and it cannot -- mapping it back out of the GPU cost more than
-shm's single copy ever did.
+What remains at 5K is the VCN. `hevc_vaapi` at 5076x2768 from NV12 already resident
+tops out at ~52 fps regardless of qp, rate control, `async_depth` or GOP; `low_power`
+does not exist on this ASIC, `av1_vaapi` will not open, and `h264_vaapi` refuses
+anything wider than 4096. So a maximised window on a 5K display records in the high
+forties and a normal one records at 60. That is the hardware, not the pipeline.
 
 ## What is still missing## What is still missing
 

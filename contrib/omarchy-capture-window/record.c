@@ -20,7 +20,8 @@
 #include <unistd.h>
 
 #include <poll.h>
-#include <sys/mman.h>
+#include <pthread.h>
+#include <gbm.h>
 #include <wayland-client.h>
 #include <libavcodec/avcodec.h>
 #include <libavfilter/avfilter.h>
@@ -32,8 +33,9 @@
 #include <libavutil/opt.h>
 
 #include "hyprland-toplevel-export-v1-client-protocol.h"
+#include "linux-dmabuf-v1-client-protocol.h"
 
-#define NBUF 3   // one being rendered into, one in flight, one free
+#define NBUF 4   // rendering into one, one queued, one encoding, one spare
 
 // ---------------------------------------------------------------- options
 
@@ -45,17 +47,33 @@ static const char *o_ts;          // gsr-compatible first-frame sidecar
 // ---------------------------------------------------------------- wayland
 
 static struct wl_display *dpy;
-static struct wl_shm *shm;
+static struct zwp_linux_dmabuf_v1 *dmabuf;
 static struct hyprland_toplevel_export_manager_v1 *mgr;
+static struct gbm_device *gbm;
+
+// The fd, the descriptor and the AVFrame all live as long as the buffer does.
+//
+// THE BUG THIS SHAPE EXISTS FOR: the first attempt built a descriptor per frame and
+// closed the fd as soon as av_buffersrc_add_frame_flags returned. VAAPI imports the
+// object later, when the filter graph actually maps it, and by then the fd was gone --
+// which surfaces as "Failed to create surface from DRM object: 2 (resource allocation
+// failed)". That was read as "this driver cannot import BGRA" and very nearly bought
+// an EGL implementation nobody needed.
+enum { B_FREE = 0, B_CAPTURING, B_FILLED, B_ENCODING };
 
 struct buf {
-    void *pix;
-    size_t size;
+    struct gbm_bo *bo;
     struct wl_buffer *wb;
+    int fd;
+    AVDRMFrameDescriptor desc;
+    AVFrame *frame;
+    int state;
+    int64_t pts;
 };
 static struct buf bufs[NBUF];
 static int nbufs, have_params, allocated;
-static uint32_t FMT, W, H, STRIDE;
+static uint32_t FMT, W, H;
+static AVBufferRef *drm_dev, *drm_frames;
 
 // ---------------------------------------------------------------- ffmpeg
 
@@ -65,13 +83,25 @@ static AVCodecContext *enc;
 static AVBufferRef *va_dev;
 static AVFilterGraph *graph;
 static AVFilterContext *fsrc, *fsink;
-static AVFrame *drm_frame, *filt_frame;
+static AVFrame *filt_frame;
 static AVPacket *pkt;
 
 static volatile sig_atomic_t stop_now;
 static int consec_fail;
+
+// The encode runs on its own thread. Not for CPU parallelism -- this loop is idle
+// ~99% of the time either way -- but because avcodec_send_frame ends in a vaSync that
+// blocks until the VCN has finished the frame. On the Wayland thread that wait was
+// the last serial link: the compositor could not be asked for the next frame until
+// the previous one had finished ENCODING, on a different engine that was otherwise
+// free to run in parallel.
+static pthread_t enc_thread;
+static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t q_cond = PTHREAD_COND_INITIALIZER;
+static int enc_running;
+static int64_t dropped;
 static int64_t frames_in, frames_out;
-static int64_t first_frame_mono_us, first_frame_real_us;
+static int64_t first_frame_mono_us, first_frame_real_us, frame_mono_us, last_pts = -1;
 static int have_first;
 
 static double now_s(void) {
@@ -115,11 +145,8 @@ static void drain(int flush) {
 // Wrap a GBM bo as a DRM PRIME AVFrame, push it through the GPU filter chain
 // (hwmap into VAAPI, convert to nv12) and encode whatever comes out.
 static void encode_bo(struct buf *b, int64_t pts) {
-    drm_frame->data[0] = b->pix;
-    drm_frame->linesize[0] = (int)STRIDE;
-    drm_frame->pts = pts;
-    int r = av_buffersrc_add_frame_flags(fsrc, drm_frame,
-                                         AV_BUFFERSRC_FLAG_KEEP_REF);
+    b->frame->pts = pts;
+    int r = av_buffersrc_add_frame_flags(fsrc, b->frame, AV_BUFFERSRC_FLAG_KEEP_REF);
     if (r < 0) die("buffersrc", r);
 
     while (1) {
@@ -136,14 +163,58 @@ static void encode_bo(struct buf *b, int64_t pts) {
 
 static void shoot(void);
 
+static void *encoder_main(void *u) {
+    (void)u;
+    for (;;) {
+        pthread_mutex_lock(&q_lock);
+        int i = -1;
+        while (i < 0) {
+            for (int k = 0; k < nbufs; k++)
+                if (bufs[k].state == B_FILLED) { i = k; break; }
+            if (i >= 0) break;
+            if (!enc_running) { pthread_mutex_unlock(&q_lock); return NULL; }
+            pthread_cond_wait(&q_cond, &q_lock);
+        }
+        bufs[i].state = B_ENCODING;
+        int64_t pts = bufs[i].pts;
+        pthread_mutex_unlock(&q_lock);
+
+        encode_bo(&bufs[i], pts);
+
+        pthread_mutex_lock(&q_lock);
+        bufs[i].state = B_FREE;
+        pthread_cond_broadcast(&q_cond);
+        pthread_mutex_unlock(&q_lock);
+    }
+}
+
+// Hand this buffer to the encoder and take a free one for the next capture. Returns
+// the index to render into, or -1 when every buffer is busy -- in which case the
+// frame is dropped rather than waited for, because stalling here stalls the
+// compositor too and a dropped frame is a repeat, not a hole.
+static int hand_off(int filled, int64_t pts) {
+    pthread_mutex_lock(&q_lock);
+    if (filled >= 0) {
+        bufs[filled].pts = pts;
+        bufs[filled].state = B_FILLED;
+        pthread_cond_broadcast(&q_cond);
+    }
+    int next = -1;
+    for (int k = 0; k < nbufs; k++)
+        if (bufs[k].state == B_FREE) { next = k; bufs[k].state = B_CAPTURING; break; }
+    if (next < 0) dropped++;
+    pthread_mutex_unlock(&q_lock);
+    return next;
+}
+
 static void on_dmabuf(void *u, struct hyprland_toplevel_export_frame_v1 *f,
                       uint32_t fmt, uint32_t w, uint32_t h) {
-    (void)u;(void)f;(void)fmt;(void)w;(void)h;   // dmabuf offered too; see the README
+    (void)u; (void)f;
+    FMT = fmt; W = w; H = h; have_params = 1;
 }
 static void on_buffer(void *u, struct hyprland_toplevel_export_frame_v1 *f,
                       uint32_t fmt, uint32_t w, uint32_t h, uint32_t stride) {
-    (void)u; (void)f;
-    FMT = fmt; W = w; H = h; STRIDE = stride; have_params = 1;
+    (void)u;(void)f;(void)fmt;(void)w;(void)h;(void)stride;   // shm offered too; unused
 }
 static void on_damage(void *u, struct hyprland_toplevel_export_frame_v1 *f,
                       uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
@@ -159,13 +230,30 @@ static void setup_pipeline(void);
 static void on_buffer_done(void *u, struct hyprland_toplevel_export_frame_v1 *f) {
     (void)u;
     if (!have_params) { hyprland_toplevel_export_frame_v1_destroy(f); stop_now = 1; return; }
-    if (!allocated) { setup_pipeline(); allocated = 1; }
+    if (!allocated) {
+        setup_pipeline();
+        allocated = 1;
+        enc_running = 1;
+        if (pthread_create(&enc_thread, NULL, encoder_main, NULL) != 0)
+            die("pthread_create", 0);
+        cur = hand_off(-1, 0);
+    }
+    if (cur < 0) {
+        // Nothing free: skip this one and ask again. The compositor paces the retry,
+        // so this does not spin.
+        hyprland_toplevel_export_frame_v1_destroy(f);
+        cur = hand_off(-1, 0);
+        if (!stop_now) shoot();
+        return;
+    }
     hyprland_toplevel_export_frame_v1_copy(f, bufs[cur].wb, 1);
 }
 
 static void on_ready(void *u, struct hyprland_toplevel_export_frame_v1 *f,
                      uint32_t hi, uint32_t lo, uint32_t nsec) {
     (void)u;
+    frame_mono_us = ((int64_t)hi << 32 | lo) * 1000000 + (int64_t)nsec / 1000;
+    if (frame_mono_us <= 0) frame_mono_us = mono_us();
     if (!have_first) {
         // The compositor's own stamp for this frame, which is CLOCK_MONOTONIC. Pair
         // it with a REALTIME sample taken now: the sidecar carries both so the event
@@ -185,11 +273,24 @@ static void on_ready(void *u, struct hyprland_toplevel_export_frame_v1 *f,
     // means the compositor renders frame N+1 into another buffer while frame N is
     // still being encoded, which is the only thing NBUF was ever for.
     int done = cur;
-    cur = (cur + 1) % nbufs;
     hyprland_toplevel_export_frame_v1_destroy(f);
-    if (!stop_now) shoot();
     consec_fail = 0;
-    encode_bo(&bufs[done], frames_in++);
+    // pts from the compositor's own stamp for THIS frame, not a running counter.
+    //
+    // `pts = frames_in++` on a 1/60 time base says every frame is 1/60s after the
+    // last one, which is only true if nothing is ever dropped. It never held: a 4.02s
+    // take that captured 94 frames became a 1.55s file playing 2.6x too fast, and any
+    // recording that dropped anything was silently sped up in proportion. Placing each
+    // frame at its real time leaves gaps where frames were missed, which is what a
+    // gap IS, and the file's duration matches the take.
+    int64_t rel = frame_mono_us - first_frame_mono_us;
+    if (rel < 0) rel = 0;
+    int64_t pts = (rel * o_fps + 500000) / 1000000;
+    if (pts <= last_pts) pts = last_pts + 1;   // strictly increasing, as the muxer needs
+    last_pts = pts;
+    frames_in++;
+    cur = hand_off(done, pts);
+    if (!stop_now) shoot();
 }
 
 // A window that never yields a frame, or stops yielding for good, must not leave the
@@ -214,7 +315,9 @@ static void on_failed(void *u, struct hyprland_toplevel_export_frame_v1 *f) {
     // Hidden, on another workspace, or mid-resize. Repeating the last frame keeps the
     // timeline honest: the recording continues showing what the window last showed
     // rather than stalling or ending early.
-    if (allocated && have_first) encode_bo(&bufs[(cur + nbufs - 1) % nbufs], frames_in++);
+    // No repeat frame here any more: the buffers belong to the encoder thread now,
+    // and re-submitting one it may be reading is a race for a frame nobody asked for.
+    // A gap in pts is already how a missing frame is represented.
     if (!stop_now) shoot();
 }
 
@@ -232,8 +335,8 @@ static void shoot(void) {
 
 static void reg(void *u, struct wl_registry *r, uint32_t name, const char *i, uint32_t v) {
     (void)u; (void)v;
-    if (!strcmp(i, wl_shm_interface.name))
-        shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
+    if (!strcmp(i, zwp_linux_dmabuf_v1_interface.name))
+        dmabuf = wl_registry_bind(r, name, &zwp_linux_dmabuf_v1_interface, 3);
     else if (!strcmp(i, hyprland_toplevel_export_manager_v1_interface.name))
         mgr = wl_registry_bind(r, name, &hyprland_toplevel_export_manager_v1_interface, 1);
 }
@@ -242,40 +345,92 @@ static const struct wl_registry_listener reg_l = { reg, reg_gone };
 
 // ---------------------------------------------------------------- setup
 
-// wl_shm, not the DMA-BUF the protocol also offers.
-//
-// The dmabuf path is faster to CAPTURE into (59.6 vs 44.8 fps measured, see README)
-// but only pays off if the encoder can read that buffer without a copy -- and VAAPI
-// on this driver refuses to import it: "Failed to create surface from DRM object: 2",
-// with tiled and with linear, as ARGB and as XRGB. So the frame had to be mapped back
-// out of the GPU before uploading, which is a read from write-combined memory and the
-// most expensive step in the whole pipeline.
-//
-// shm skips it: the compositor writes into memory we already hold, and that pointer
-// goes straight to the encoder's upload. One copy instead of two.
+static void nofree(void *o, uint8_t *d) { (void)o; (void)d; }
+
+static void params_created(void *u, struct zwp_linux_buffer_params_v1 *p, struct wl_buffer *b) {
+    (void)u;(void)p;(void)b;
+}
+static void params_failed(void *u, struct zwp_linux_buffer_params_v1 *p) { (void)u;(void)p; }
+static const struct zwp_linux_buffer_params_v1_listener params_l = {
+    params_created, params_failed,
+};
+
+// DMA-BUF, so the frame never leaves the GPU: the compositor renders into these and
+// VAAPI reads the same memory. The alternative (shm, then hwupload) turns the upload
+// into a tiled blit on the GFX engine, and on a 2-CU iGPU that competes with the
+// compositor's own rendering -- capture drops from 58 fps to 27 with nothing else
+// changed. It is a GPU cost, not a CPU one, which is why "one less memcpy" reasoning
+// got it wrong.
 static void alloc_buffers(void) {
-    size_t sz = (size_t)STRIDE * H;
     for (int i = 0; i < NBUF; i++) {
-        int fd = memfd_create("omarchy-capture-window", MFD_CLOEXEC);
-        if (fd < 0 || ftruncate(fd, sz) < 0) die("memfd", 0);
-        void *pix = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (pix == MAP_FAILED) die("mmap", 0);
-        struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, sz);
-        bufs[i].wb = wl_shm_pool_create_buffer(pool, 0, W, H, STRIDE, FMT);
-        wl_shm_pool_destroy(pool);
-        close(fd);
-        bufs[i].pix = pix;
-        bufs[i].size = sz;
+        struct gbm_bo *bo = gbm_bo_create(gbm, W, H, FMT,
+                                          GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT);
+        if (!bo) bo = gbm_bo_create(gbm, W, H, FMT, GBM_BO_USE_RENDERING);
+        if (!bo) die("gbm_bo_create", 0);
+        int fd = gbm_bo_get_fd(bo);
+        if (fd < 0) die("gbm_bo_get_fd", 0);
+        uint64_t mod = gbm_bo_get_modifier(bo);
+
+        struct zwp_linux_buffer_params_v1 *p = zwp_linux_dmabuf_v1_create_params(dmabuf);
+        zwp_linux_buffer_params_v1_add_listener(p, &params_l, NULL);
+        zwp_linux_buffer_params_v1_add(p, fd, 0, gbm_bo_get_offset(bo, 0),
+                                       gbm_bo_get_stride(bo),
+                                       (uint32_t)(mod >> 32), (uint32_t)(mod & 0xFFFFFFFF));
+        bufs[i].wb = zwp_linux_buffer_params_v1_create_immed(p, W, H, FMT, 0);
+        zwp_linux_buffer_params_v1_destroy(p);
+        if (!bufs[i].wb) die("create_immed", 0);
+
+        bufs[i].bo = bo;
+        bufs[i].fd = fd;                      // kept open: VAAPI imports it later
+        AVDRMFrameDescriptor *d = &bufs[i].desc;
+        memset(d, 0, sizeof *d);
+        d->nb_objects = 1;
+        d->objects[0].fd = fd;
+        d->objects[0].size = lseek(fd, 0, SEEK_END);
+        d->objects[0].format_modifier = mod;
+        d->nb_layers = 1;
+        d->layers[0].format = FMT;
+        d->layers[0].nb_planes = 1;
+        d->layers[0].planes[0].object_index = 0;
+        d->layers[0].planes[0].offset = gbm_bo_get_offset(bo, 0);
+        d->layers[0].planes[0].pitch = gbm_bo_get_stride(bo);
+
+        AVFrame *f = av_frame_alloc();
+        f->format = AV_PIX_FMT_DRM_PRIME;
+        f->width = W; f->height = H;
+        f->hw_frames_ctx = av_buffer_ref(drm_frames);
+        // Stated, not inherited. The VPP produced limited-range pixels while the
+        // encoder tagged them full, which reads as washed-out blacks; the shm path
+        // only looked right because its defaults happened to agree.
+        f->color_range = AVCOL_RANGE_JPEG;
+        f->buf[0] = av_buffer_create((uint8_t *)d, sizeof *d, nofree, NULL,
+                                     AV_BUFFER_FLAG_READONLY);
+        f->data[0] = (uint8_t *)d;
+        bufs[i].frame = f;
         nbufs++;
     }
 }
 
 static void setup_pipeline(void) {
     int r;
-    alloc_buffers();
-
-    r = av_hwdevice_ctx_create(&va_dev, AV_HWDEVICE_TYPE_VAAPI, o_render, NULL, 0);
+    // Devices and the DRM frames context FIRST: every buffer's AVFrame takes a
+    // reference to drm_frames as it is created, so allocating buffers before it
+    // exists dereferences null.
+    r = av_hwdevice_ctx_create(&drm_dev, AV_HWDEVICE_TYPE_DRM, o_render, NULL, 0);
+    if (r < 0) die("drm hwdevice", r);
+    r = av_hwdevice_ctx_create_derived(&va_dev, AV_HWDEVICE_TYPE_VAAPI, drm_dev, 0);
     if (r < 0) die("vaapi hwdevice", r);
+
+    drm_frames = av_hwframe_ctx_alloc(drm_dev);
+    if (!drm_frames) die("drm frames ctx", 0);
+    AVHWFramesContext *fc = (AVHWFramesContext *)drm_frames->data;
+    fc->format = AV_PIX_FMT_DRM_PRIME;
+    fc->sw_format = AV_PIX_FMT_BGRA;
+    fc->width = W; fc->height = H;
+    r = av_hwframe_ctx_init(drm_frames);
+    if (r < 0) die("drm frames init", r);
+
+    alloc_buffers();
 
     // hwmap into VAAPI, then scale_vaapi for the BGRA -> NV12 the encoder wants.
     // Both stages run on the GPU; the pixels never touch the CPU.
@@ -285,13 +440,19 @@ static void setup_pipeline(void) {
     // is rejected unless hw_frames_ctx is already set, and the one-shot initialises
     // before there is anywhere to set it ("Setting BufferSourceContext.pix_fmt to a
     // HW format requires hw_frames_ctx to be non-NULL").
-    char args[256];
-    snprintf(args, sizeof args,
-             "video_size=%ux%u:pix_fmt=%d:time_base=1/%d:pixel_aspect=1/1",
-             W, H, AV_PIX_FMT_BGRA, o_fps);
-    r = avfilter_graph_create_filter(&fsrc, avfilter_get_by_name("buffer"), "in",
-                                     args, NULL, graph);
-    if (r < 0) die("buffer filter", r);
+    fsrc = avfilter_graph_alloc_filter(graph, avfilter_get_by_name("buffer"), "in");
+    if (!fsrc) die("buffer alloc", 0);
+    AVBufferSrcParameters *bp = av_buffersrc_parameters_alloc();
+    bp->format = AV_PIX_FMT_DRM_PRIME;
+    bp->width = W; bp->height = H;
+    bp->time_base = (AVRational){1, o_fps};
+    bp->sample_aspect_ratio = (AVRational){1, 1};
+    bp->hw_frames_ctx = drm_frames;
+    r = av_buffersrc_parameters_set(fsrc, bp);
+    av_free(bp);
+    if (r < 0) die("buffersrc params", r);
+    r = avfilter_init_str(fsrc, NULL);
+    if (r < 0) die("buffersrc init", r);
 
     r = avfilter_graph_create_filter(&fsink, avfilter_get_by_name("buffersink"), "out",
                                      NULL, NULL, graph);
@@ -302,17 +463,19 @@ static void setup_pipeline(void) {
     // initialises as it parses -- "A hardware device reference is required to upload
     // frames to", with no opportunity to supply one. Allocating each filter, setting
     // the device, then initialising is the only order that works.
+    // hwmap, not hwupload: the buffer is already on the GPU, so VAAPI wraps it in
+    // place. derive_device gets the VAAPI device from the DRM one the frames come
+    // from, which is also what makes the import legal.
     AVFilterContext *up = avfilter_graph_alloc_filter(graph,
-                              avfilter_get_by_name("hwupload"), "up");
-    if (!up) die("hwupload alloc", 0);
-    up->hw_device_ctx = av_buffer_ref(va_dev);
-    r = avfilter_init_str(up, NULL);
-    if (r < 0) die("hwupload init", r);
+                              avfilter_get_by_name("hwmap"), "map");
+    if (!up) die("hwmap alloc", 0);
+    r = avfilter_init_str(up, "derive_device=vaapi");
+    if (r < 0) die("hwmap init", r);
 
     AVFilterContext *sc = avfilter_graph_alloc_filter(graph,
                               avfilter_get_by_name("scale_vaapi"), "sc");
     if (!sc) die("scale_vaapi alloc", 0);
-    r = avfilter_init_str(sc, "format=nv12");
+    r = avfilter_init_str(sc, "format=nv12:out_range=pc");
     if (r < 0) die("scale_vaapi init", r);
 
     if ((r = avfilter_link(fsrc, 0, up, 0)) < 0) die("link src->up", r);
@@ -332,7 +495,7 @@ static void setup_pipeline(void) {
     enc->pix_fmt = AV_PIX_FMT_VAAPI;
     enc->time_base = (AVRational){1, o_fps};
     enc->framerate = (AVRational){o_fps, 1};
-    enc->color_range = AVCOL_RANGE_JPEG;   // full range, as the rest of the pipeline
+    enc->color_range = AVCOL_RANGE_JPEG;   // matches scale_vaapi's out_range=pc
     enc->hw_frames_ctx = av_buffer_ref(av_buffersink_get_hw_frames_ctx(fsink));
     av_opt_set_int(enc->priv_data, "qp", o_quality, 0);
 
@@ -348,12 +511,15 @@ static void setup_pipeline(void) {
     vstream->time_base = enc->time_base;
     r = avio_open(&ofmt->pb, o_out, AVIO_FLAG_WRITE);
     if (r < 0) die("avio_open", r);
-    r = avformat_write_header(ofmt, NULL);
+    // Fragmented: a die() or a SIGKILL after this point used to leave an mp4 with no
+    // moov atom, which is an unplayable file and a lost take. Fragments are readable
+    // up to wherever the writing stopped.
+    AVDictionary *mux = NULL;
+    av_dict_set(&mux, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+    r = avformat_write_header(ofmt, &mux);
+    av_dict_free(&mux);
     if (r < 0) die("write_header", r);
 
-    drm_frame = av_frame_alloc();
-    drm_frame->format = AV_PIX_FMT_BGRA;
-    drm_frame->width = W; drm_frame->height = H;
     filt_frame = av_frame_alloc();
     pkt = av_packet_alloc();
 }
@@ -385,13 +551,18 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGHUP, on_signal);
 
+    int drm_fd = open(o_render, O_RDWR | O_CLOEXEC);
+    if (drm_fd < 0) die("open render node", 0);
+    gbm = gbm_create_device(drm_fd);
+    if (!gbm) die("gbm_create_device", 0);
+
     dpy = wl_display_connect(NULL);
     if (!dpy) die("no wayland display", 0);
     struct wl_registry *r = wl_display_get_registry(dpy);
     wl_registry_add_listener(r, &reg_l, NULL);
     wl_display_roundtrip(dpy);
     if (!mgr) die("compositor has no hyprland_toplevel_export_manager_v1", 0);
-    if (!shm) die("compositor has no wl_shm", 0);
+    if (!dmabuf) die("compositor has no zwp_linux_dmabuf_v1", 0);
 
     double t0 = now_s();
     shoot();
@@ -420,6 +591,11 @@ int main(int argc, char **argv) {
     }
 
     if (allocated) {
+        pthread_mutex_lock(&q_lock);
+        enc_running = 0;
+        pthread_cond_broadcast(&q_cond);
+        pthread_mutex_unlock(&q_lock);
+        pthread_join(enc_thread, NULL);
         drain(1);
         av_write_trailer(ofmt);
         avio_closep(&ofmt->pb);
@@ -434,9 +610,9 @@ int main(int argc, char **argv) {
             fclose(f);
         }
     }
-    fprintf(stderr, "{\"frames_in\":%lld,\"frames_out\":%lld,\"seconds\":%.3f,"
-                    "\"fps\":%.2f,\"w\":%u,\"h\":%u}\n",
-            (long long)frames_in, (long long)frames_out, el,
+    fprintf(stderr, "{\"frames_in\":%lld,\"frames_out\":%lld,\"dropped\":%lld,"
+                    "\"seconds\":%.3f,\"fps\":%.2f,\"w\":%u,\"h\":%u}\n",
+            (long long)frames_in, (long long)frames_out, (long long)dropped, el,
             el > 0 ? frames_out / el : 0.0, W, H);
     return 0;
 }

@@ -186,6 +186,10 @@ Item {
                 return
             }
             root.transport = false
+            // Backstop for the same two things onPositionChanged handles: if the end
+            // was reached without a position update landing on it, the camera still
+            // has to be put down or it plays on alone.
+            cameraPlayer.pause()
         }
     }
 
@@ -967,6 +971,32 @@ Item {
                 var dest = root.sourceToOutput(cut.end)
                 if (dest >= 0)
                     root.seekFrame(dest)
+                return
+            }
+
+            // Stop one frame SHORT of end-of-media rather than running into it.
+            //
+            // A Qt player that reaches EndOfMedia goes to StoppedState, and a stopped
+            // player clears its VideoOutput -- so the stage went black at the exact
+            // moment the video finished, which is the one moment the last frame should
+            // be sitting there. Pausing holds it.
+            //
+            // The camera is a SEPARATE player with its own duration and nothing was
+            // putting it down, so it carried on rendering after the screen had gone.
+            var lastRecorded = (root.tl.head || 0) + (root.tl.recorded_frames || 0) - 1
+            if (lastRecorded < 0)
+                return
+            var out = root.sourceToOutput(here)
+            if (out < 0 || out < lastRecorded)
+                return
+            screenPlayer.pause()
+            cameraPlayer.pause()
+            if (lastRecorded + 1 < root.outputFrames) {
+                // A tail pad follows: hand the clock to padClock, which plays it.
+                root.outFrame = lastRecorded + 1
+            } else {
+                root.transport = false
+                root.outFrame = lastRecorded
             }
         }
     }

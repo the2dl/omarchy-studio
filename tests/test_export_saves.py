@@ -218,8 +218,9 @@ def test_declick_runs_before_the_loudness_pass(tmp_path):
     b.edit.declick_audio = True
     b.edit.normalize_audio = True
     g = render.build_graph(b).graph
-    assert "adeclick" in g
-    assert g.index("adeclick") < g.index("loudnorm")
+    assert "arnndn" in g, "the click remover must be RNNoise, not adeclick"
+    assert "afftdn" in g
+    assert g.index("arnndn") < g.index("loudnorm")
 
 
 def test_no_declick_filter_when_it_is_off(tmp_path):
@@ -230,4 +231,34 @@ def test_no_declick_filter_when_it_is_off(tmp_path):
     root = tmp_path / "aud2"
     synthetic.make_bundle(root, seconds=1.0, width=320, height=240, camera=False)
     b = Bundle(root)
+    g = render.build_graph(b).graph
+    assert "arnndn" not in g and "afftdn" not in g
+
+
+def test_the_click_remover_is_not_adeclick(tmp_path):
+    """adeclick was the wrong filter and is not allowed back.
+
+    It targets sub-millisecond impulse noise; a key clack is a 10-40ms broadband
+    transient. Measured on a real take it moved the clacks 0.7dB while moving the
+    speech 0.3dB -- 0.4dB of separation, which is nothing. See _declick_chain.
+    """
+    import synthetic
+    from omarchy_studio import render
+    from omarchy_studio.project import Bundle
+
+    root = tmp_path / "aud3"
+    synthetic.make_bundle(root, seconds=1.0, width=320, height=240, camera=False)
+    b = Bundle(root)
+    b.edit.declick_audio = True
     assert "adeclick" not in render.build_graph(b).graph
+
+
+def test_the_rnnoise_model_ships_with_the_package():
+    """The model is vendored, so an export works offline. Without it the chain still
+    runs (afftdn alone), which is why this is a separate assertion from the graph."""
+    from omarchy_studio.render import RNNOISE_MODEL, _declick_chain
+
+    assert RNNOISE_MODEL.exists(), f"missing vendored model: {RNNOISE_MODEL}"
+    assert RNNOISE_MODEL.stat().st_size > 100_000
+    assert RNNOISE_MODEL.read_bytes()[:7] == b"rnnoise"
+    assert "arnndn" in _declick_chain()

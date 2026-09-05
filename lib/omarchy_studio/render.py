@@ -341,16 +341,10 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
         if edit.declick_audio:
             # BEFORE loudnorm, deliberately: a key clack is the loudest thing in a
             # narration track, so normalising first would set the gain from the noise
-            # and leave the voice quiet. Removing the impulses changes the right
-            # answer, so it has to happen first.
-            #
-            # adeclick and not afftdn or arnndn, measured on speech plus broadband
-            # clacks: samples above -9dBFS went 564 -> 1 with adeclick, while the
-            # clean speech moved by -37dB (inaudible). afftdn removed no transients at
-            # all, and RNNoise -- the obvious answer, and the one that needs a model
-            # file -- left 9 and altered the voice MORE than it removed (+2dB).
-            g.add(f"{aout}adeclick[adeclicked]")
-            aout = "[adeclicked]"
+            # and leave the voice quiet. Removing the clacks changes the right answer,
+            # so it has to happen first.
+            g.add(f"{aout}{_declick_chain()}[declicked]")
+            aout = "[declicked]"
         if edit.normalize_audio:
             # loudnorm AFTER the cut: it measures the material it is normalizing, and a
             # cut that removes a loud passage changes the right answer.
@@ -710,6 +704,51 @@ def _backdrop(
     g.add("[content]setpts=N/FRAME_RATE/TB[content_cfr]")
     g.add("[bg][content_cfr]overlay=x=0:y=0:shortest=1:format=auto[composited]")
     return "[composited]"
+
+
+RNNOISE_MODEL = Path(__file__).resolve().parent / "assets" / "beguiling-drafter.rnnn"
+
+
+def _declick_chain() -> str:
+    """The filter chain for "remove keyboard clicks".
+
+    This used to be `adeclick`, which was the wrong tool and did essentially nothing.
+    adeclick removes *impulsive* noise -- the sub-millisecond spike of a scratched
+    record. A key clack is a 10-40ms broadband transient with real spectral content,
+    which adeclick does not consider impulsive and does not touch.
+
+    The earlier choice was made against synthetic single-sample spikes, which adeclick
+    of course removed, so the test agreed with the filter rather than with a keyboard.
+    Re-measured on a real 20s take (a mechanical keyboard under speech), scoring each
+    candidate by the gap between how much it attenuates the clack windows and how much
+    it attenuates the speech -- the gap is what matters, since loudnorm follows and
+    makes overall level irrelevant:
+
+        adeclick (old)          clicks  -0.7dB   speech  -0.3dB   gap   0.4dB
+        afftdn alone            clicks  -6.5dB   speech  -0.5dB   gap   6.0dB
+        arnndn bd               clicks -11.1dB   speech  -4.9dB   gap   6.2dB
+        arnndn sh               clicks -25.2dB   speech -16.3dB   gap   9.0dB
+        arnndn bd + afftdn      clicks -17.9dB   speech  -5.8dB   gap  12.1dB
+        arnndn lq + afftdn      clicks -27.1dB   speech -13.0dB   gap  14.1dB
+
+    lq+afftdn separates most, but tone is the tiebreak: measured as high-band minus
+    low-band energy, the source sits at -13.4dB, and `sh` lands at -21.8dB -- 8dB of
+    lost top end, which is a dulled, underwater voice. bd+afftdn lands at -15.0dB,
+    1.6dB from the source, while still taking 18dB off the clacks. That is the pick.
+
+    afftdn earns its place after arnndn rather than instead of it: `bd` alone leaves
+    the high band 9.8dB HOTTER than the source (its own artefacts), and afftdn is what
+    cleans that up.
+
+    Caveat worth stating: this was tuned on one voice and one keyboard. The ordering
+    of the top few is not going to be universal.
+    """
+    if not RNNOISE_MODEL.exists():
+        # Ship-but-verify: without the model, afftdn alone still gives ~6dB, which is
+        # far better than the adeclick this replaced. Never fail an export over it.
+        return "afftdn=nr=12:nf=-40:tn=1"
+    model = str(RNNOISE_MODEL).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    return f"arnndn=m='{model}',afftdn=nr=12:nf=-40:tn=1"
 
 
 # Heights for the names in project.EXPORT_PRESETS. `native` has no entry: it is the

@@ -184,8 +184,32 @@ resolve_capture_format() {
 # so the baseline reproduces itself (5.99 -> 5M) and everything else scales off a number
 # that was actually tuned rather than invented. /1e9 because the answer is in MEGAbits:
 # the intermediate is ~1.4e10 for a 4K mode, which is why this is 64-bit arithmetic.
+# The camera is composited into a bubble a few hundred pixels across, so a 4K sensor
+# mode is not headroom -- it is 8.3M pixels encoded per frame, and shared with the
+# screen encode on one iGPU, to fill a circle that is at most a third of the canvas.
+# 1440 is still generous (a 30%-height bubble on a 5K canvas is 864px) and cuts the
+# work to 2.6M pixels.
+#
+# HONESTY ABOUT WHAT THIS DOES AND DOES NOT FIX. It was written while chasing a
+# self-view that ran seconds behind, and it is NOT established that it cures that.
+# Measured on this machine, 3840x2160@30 NV12 with both branches live: 300 frames took
+# 10.5s of wall time and 600 took 20.5s -- a CONSTANT half second of startup, not a
+# growing deficit, so the pipeline does keep up at 4K. mpv also kept up as a consumer,
+# alone and under a competing 5K screen encode, with zero queue overflows in either.
+# The cap is kept because encoding 4K for a 360px bubble is waste on any reading; it is
+# not kept because it was proven to fix the latency.
+CAM_RECORD_MAX_H=${OMARCHY_CAMERA_MAX_HEIGHT:-1440}
+
+# The height actually encoded, after that cap.
+camera_encode_height() {
+  if ((CAM_HEIGHT > CAM_RECORD_MAX_H)); then echo "$CAM_RECORD_MAX_H"; else echo "$CAM_HEIGHT"; fi
+}
+
 camera_bitrate() {
-  local bps=$((CAM_WIDTH * CAM_HEIGHT * CAM_FPS * 217 / 1000000000))
+  local h w
+  h=$(camera_encode_height)
+  w=$((CAM_WIDTH * h / CAM_HEIGHT))
+  local bps=$((w * h * CAM_FPS * 217 / 1000000000))
   ((bps < 4)) && bps=4
   ((bps > 40)) && bps=40
   echo "${bps}M"
@@ -409,10 +433,22 @@ start_preview() {
 # mpv relays the FIFO through cat, and the whole pipeline is its own session so a single
 # kill on the process group takes down both halves.
 launch_preview() {
+  # readahead/max-bytes are NOT in mpv's low-latency profile (check with
+  # `mpv --show-profile=low-latency`), and default to 1s and 150MiB. For a stream that
+  # arrives in real time, readahead is latency: mpv fills it before it starts drawing
+  # and then consumes at the rate frames arrive, so the buffer never drains and the
+  # preview sits permanently that far behind.
+  #
+  # UNVERIFIED as the cause of the reported 1-5s lag. What has been measured and ruled
+  # out: the capture pipeline keeps up at 4K (constant 0.5s of startup at both 300 and
+  # 600 frames, not a growing deficit); mpv keeps up as a consumer, alone and against a
+  # competing 5K screen encode, with zero queue overflows; and fd://0 works on this
+  # build. This is the remaining plausible mechanism and the change is one flag.
   setsid bash -c '
     echo $$ >"$3"
     cat "$1" | mpv --demuxer-lavf-format=mpjpeg \
       --profile=low-latency --untimed --no-cache --cache=no \
+      --demuxer-readahead-secs=0 --demuxer-max-bytes=2MiB \
       --title="$4" --wayland-app-id="$4-$2" \
       --script-opts='"$SELF_VIEW_MARKER"' \
       --keepaspect=yes --panscan=1.0 --video-unscaled=no \
@@ -425,6 +461,8 @@ launch_preview() {
     sleep 0.05
     ((waited++))
   done
+
+  echo "$(date +%H:%M:%S.%3N) preview: mpv window mapped after ${waited} polls" >>"$LOG_FILE"
 
   local address
   address=$(hyprctl clients -j | jq -r --arg t "$SELF_VIEW_TITLE" 'first(.[] | select(.title == $t) | .address) // empty')
@@ -531,14 +569,22 @@ start_camera() {
   # swscale pass -- the expensive half of the MJPEG path -- simply does not exist.
   local convert=""
   [[ $CAM_PIXFMT == "nv12" ]] || convert="format=nv12,"
-  local filtergraph="[0:v]${convert}hwupload[enc_hw]"
+  # The cap is applied on the GPU, once, before the split -- so the preview scales from
+  # the already-reduced frame and the expensive branch gets smaller too.
+  local cap=""
+  ((CAM_HEIGHT > CAM_RECORD_MAX_H)) && cap=",scale_vaapi=w=-2:h=$(camera_encode_height)"
+  local filtergraph="[0:v]${convert}hwupload${cap}[enc_hw]"
   if ((${#preview_branch[@]})); then
-    filtergraph="[0:v]${convert}hwupload,split=2[enc_hw][pv_hw];"
+    filtergraph="[0:v]${convert}hwupload${cap},split=2[enc_hw][pv_hw];"
     filtergraph+="[pv_hw]scale_vaapi=w=-2:h=$((PRESET_W * 2)),hwdownload,format=nv12[pv]"
   fi
 
   : >"$LOG_FILE"
-  echo "camera: ${CAM_WIDTH}x${CAM_HEIGHT}@${CAM_FPS} ${CAM_PIXFMT} -> $(camera_bitrate)" >>"$LOG_FILE"
+  # Timestamped, and with the preview's own launch marked, so a report of "the
+  # self-view is seconds behind" has something to measure against instead of a
+  # reconstruction after the fact.
+  echo "$(date +%H:%M:%S.%3N) camera: ${CAM_WIDTH}x${CAM_HEIGHT}@${CAM_FPS} ${CAM_PIXFMT}${
+    } -> encode at $(camera_encode_height)p $(camera_bitrate)" >>"$LOG_FILE"
 
   # The device is routinely still held when a recording starts: the setup window's own
   # preview lets go a beat before this runs, and V4L2 hands the device on a beat after

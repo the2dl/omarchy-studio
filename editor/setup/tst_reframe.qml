@@ -30,7 +30,7 @@ Item {
         property var sel: null
         property bool fullMonitor: false
         property bool windowOnly: false
-        readonly property bool audioAvailable: !(mode === 1 && windowOnly)
+        readonly property bool audioAvailable: true
         property bool micOn: false
         property bool desktopAudio: false
         property bool prompterOn: false
@@ -114,17 +114,12 @@ Item {
             verify(!control().visible, "re-frame is meaningless once the stream is the window")
         }
 
-        function test_audio_is_disabled_where_it_cannot_be_recorded() {
-            // The single-window recorder is video-only. Offering a mic switch that
-            // silently records nothing is the kind of thing found in the editor,
-            // after the take, when it cannot be redone.
+        function test_audio_is_offered_in_every_capture_mode() {
+            // It was gated while the isolated recorder was video-only. Now it records
+            // audio, so a switch that refused would be lying the other way.
             fakeApp.mode = 1
             fakeApp.windowOnly = true
-            verify(!findChild(bar, "ctl:mic-toggle").enabled)
-            verify(!findChild(bar, "ctl:audio-toggle").enabled)
-            fakeApp.windowOnly = false
-            verify(findChild(bar, "ctl:audio-toggle").enabled,
-                   "system audio comes back when the mode can record it")
+            verify(findChild(bar, "ctl:audio-toggle").enabled)
         }
 
         function test_isolating_is_not_offered_for_an_area() {

@@ -233,7 +233,7 @@ Item {
                 text: "Records this window's own pixels. Anything drawn over it \u2014 a "
                     + "dropdown, a notification \u2014 is not in the take, and the frame "
                     + "follows the window if it moves.\nOff records the rectangle it sits "
-                    + "in, whatever ends up on top.\nNo audio yet in this mode."
+                    + "in, whatever ends up on top."
                 delay: 350
                 timeout: -1
                 padding: 0

@@ -27,6 +27,7 @@
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
+#include <libavdevice/avdevice.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
@@ -46,6 +47,7 @@ static const char *o_out, *o_codec = "auto", *o_render = "/dev/dri/renderD128";
 static uint32_t o_handle;
 static int o_fps = 60, o_cursor = 1, o_quality = 23;
 static const char *o_ts;          // gsr-compatible first-frame sidecar
+static const char *o_audio;       // "src" or "src|src", gsr's spelling
 
 // ---------------------------------------------------------------- wayland
 
@@ -101,6 +103,37 @@ static int consec_fail;
 // the last serial link: the compositor could not be asked for the next frame until
 // the previous one had finished ENCODING, on a different engine that was otherwise
 // free to run in parallel.
+// --------------------------------------------------------------- audio
+//
+// In-process rather than a second recorder, because render.py takes audio from
+// capture.screen.has_audio and cuts.cut_chain assumes [0:a] -- a separate file would
+// be a second stream for every stage downstream to learn about.
+//
+// Sources are mixed by adding samples rather than through amix. libavfilter is not
+// safe for concurrent add_frame on one graph, so a filter mix needs a lock around
+// every push and a third thread to pull; s16 addition with clipping is a dozen lines,
+// deterministic, and has no shared graph to protect.
+#define ARATE 48000
+#define ACH 2
+#define AFRAME 1024                       // what the AAC encoder wants per call
+#define ARING (ARATE * ACH * 4)           // ~2s per source
+
+struct asrc {
+    AVFormatContext *fmt;
+    pthread_t th;
+    int16_t ring[ARING];
+    size_t head, len;                     // head is a read cursor into ring
+    pthread_mutex_t m;
+    int stop;
+};
+static struct asrc asrcs[2];
+static int n_asrc;
+static AVCodecContext *aenc;
+static AVStream *astream;
+static pthread_t amix_thread;
+static pthread_mutex_t mux_lock = PTHREAD_MUTEX_INITIALIZER;
+static int audio_running;
+
 static pthread_t enc_thread;
 static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cond = PTHREAD_COND_INITIALIZER;
@@ -140,6 +173,114 @@ static void die(const char *what, int err) {
 
 // ---------------------------------------------------------------- encode
 
+// One writer at a time: the video thread and the audio mixer both reach the muxer,
+// and av_interleaved_write_frame is not safe for concurrent callers.
+static int write_pkt(AVPacket *pk, AVStream *st, AVRational from) {
+    av_packet_rescale_ts(pk, from, st->time_base);
+    pk->stream_index = st->index;
+    pthread_mutex_lock(&mux_lock);
+    int r = av_interleaved_write_frame(ofmt, pk);
+    pthread_mutex_unlock(&mux_lock);
+    return r;
+}
+
+// --- audio capture ------------------------------------------------------------
+
+static void *asrc_main(void *u) {
+    struct asrc *a = u;
+    AVPacket *pk = av_packet_alloc();
+    while (!a->stop && !stop_now) {
+        if (av_read_frame(a->fmt, pk) < 0) break;
+        // The demuxer was opened asking for s16/48k/stereo, so packet data IS the
+        // sample buffer -- no decoder in the way.
+        size_t n = pk->size / sizeof(int16_t);
+        const int16_t *src = (const int16_t *)pk->data;
+        pthread_mutex_lock(&a->m);
+        for (size_t i = 0; i < n; i++) {
+            if (a->len == ARING) {           // overrun: drop the oldest sample
+                a->head = (a->head + 1) % ARING;
+                a->len--;
+            }
+            a->ring[(a->head + a->len) % ARING] = src[i];
+            a->len++;
+        }
+        pthread_mutex_unlock(&a->m);
+        av_packet_unref(pk);
+    }
+    av_packet_free(&pk);
+    return NULL;
+}
+
+// Take up to `want` samples from a source, zero-filling what has not arrived. A
+// source that under-runs must not stall the others or shift the timeline.
+static void asrc_take(struct asrc *a, int16_t *out, size_t want) {
+    pthread_mutex_lock(&a->m);
+    size_t have = a->len < want ? a->len : want;
+    for (size_t i = 0; i < have; i++)
+        out[i] = a->ring[(a->head + i) % ARING];
+    for (size_t i = have; i < want; i++) out[i] = 0;
+    a->head = (a->head + have) % ARING;
+    a->len -= have;
+    pthread_mutex_unlock(&a->m);
+}
+
+static void *amix_main(void *u) {
+    (void)u;
+    const size_t want = AFRAME * ACH;
+    int16_t mixa[AFRAME * ACH], mixb[AFRAME * ACH];
+    AVFrame *fr = av_frame_alloc();
+    fr->format = AV_SAMPLE_FMT_FLTP;
+    fr->nb_samples = AFRAME;
+    av_channel_layout_default(&fr->ch_layout, ACH);
+    fr->sample_rate = ARATE;
+    if (av_frame_get_buffer(fr, 0) < 0) return NULL;
+    AVPacket *pk = av_packet_alloc();
+    int64_t apts = 0;
+
+    while (audio_running && !stop_now) {
+        // Only emit once the first source can fill a frame, so the file does not
+        // open with a block of silence that shifts everything after it.
+        pthread_mutex_lock(&asrcs[0].m);
+        size_t ready = asrcs[0].len;
+        pthread_mutex_unlock(&asrcs[0].m);
+        if (ready < want) {
+            struct timespec ts = { 0, 5 * 1000000L };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        asrc_take(&asrcs[0], mixa, want);
+        if (n_asrc > 1) {
+            asrc_take(&asrcs[1], mixb, want);
+            for (size_t i = 0; i < want; i++) {
+                int v = mixa[i] + mixb[i];      // clip rather than wrap
+                mixa[i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : (int16_t)v);
+            }
+        }
+        if (av_frame_make_writable(fr) < 0) break;
+        // s16 interleaved -> float planar, which is what the AAC encoder takes.
+        for (int c = 0; c < ACH; c++) {
+            float *dst = (float *)fr->data[c];
+            for (int i = 0; i < AFRAME; i++)
+                dst[i] = mixa[i * ACH + c] / 32768.0f;
+        }
+        fr->pts = apts;
+        apts += AFRAME;
+        if (avcodec_send_frame(aenc, fr) < 0) continue;
+        while (avcodec_receive_packet(aenc, pk) == 0) {
+            write_pkt(pk, astream, aenc->time_base);
+            av_packet_unref(pk);
+        }
+    }
+    avcodec_send_frame(aenc, NULL);
+    while (avcodec_receive_packet(aenc, pk) == 0) {
+        write_pkt(pk, astream, aenc->time_base);
+        av_packet_unref(pk);
+    }
+    av_packet_free(&pk);
+    av_frame_free(&fr);
+    return NULL;
+}
+
 static void drain(int flush) {
     int r = avcodec_send_frame(enc, flush ? NULL : filt_frame);
     if (r < 0 && r != AVERROR(EAGAIN)) die("send_frame", r);
@@ -147,9 +288,7 @@ static void drain(int flush) {
         r = avcodec_receive_packet(enc, pkt);
         if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return;
         if (r < 0) die("receive_packet", r);
-        av_packet_rescale_ts(pkt, enc->time_base, vstream->time_base);
-        pkt->stream_index = vstream->index;
-        r = av_interleaved_write_frame(ofmt, pkt);
+        r = write_pkt(pkt, vstream, enc->time_base);
         if (r < 0) die("write_frame", r);
         av_packet_unref(pkt);
         frames_out++;
@@ -294,6 +433,12 @@ static void on_buffer_done(void *u, struct hyprland_toplevel_export_frame_v1 *f)
         enc_running = 1;
         if (pthread_create(&enc_thread, NULL, encoder_main, NULL) != 0)
             die("pthread_create", 0);
+        if (n_asrc > 0) {
+            audio_running = 1;
+            for (int i = 0; i < n_asrc; i++)
+                pthread_create(&asrcs[i].th, NULL, asrc_main, &asrcs[i]);
+            pthread_create(&amix_thread, NULL, amix_main, NULL);
+        }
         cur = hand_off(-1, 0);
     }
     if (cur < 0) {
@@ -557,6 +702,34 @@ static void setup_pipeline(void) {
     enc->hw_frames_ctx = av_buffer_ref(av_buffersink_get_hw_frames_ctx(fsink));
     av_opt_set_int(enc->priv_data, "qp", o_quality, 0);
 
+    // --- audio, before the header is written: streams must all exist by then ---
+    if (o_audio && *o_audio) {
+        avdevice_register_all();
+        const AVInputFormat *pulse = av_find_input_format("pulse");
+        if (!pulse) die("no pulse input device in this ffmpeg", 0);
+        char names[512];
+        snprintf(names, sizeof names, "%s", o_audio);
+        for (char *tok = strtok(names, "|"); tok && n_asrc < 2; tok = strtok(NULL, "|")) {
+            AVDictionary *opt = NULL;
+            av_dict_set_int(&opt, "sample_rate", ARATE, 0);
+            av_dict_set_int(&opt, "channels", ACH, 0);
+            AVFormatContext *ic = NULL;
+            int ar = avformat_open_input(&ic, tok, pulse, &opt);
+            av_dict_free(&opt);
+            if (ar < 0) {
+                // A missing source is not worth losing the take over; the video is
+                // the irreplaceable half.
+                char msg[128] = "";
+                av_strerror(ar, msg, sizeof msg);
+                fprintf(stderr, "omarchy-capture-window: audio source '%s': %s\n", tok, msg);
+                continue;
+            }
+            asrcs[n_asrc].fmt = ic;
+            pthread_mutex_init(&asrcs[n_asrc].m, NULL);
+            n_asrc++;
+        }
+    }
+
     r = avformat_alloc_output_context2(&ofmt, NULL, NULL, o_out);
     if (r < 0) die("output context", r);
     vstream = avformat_new_stream(ofmt, NULL);
@@ -567,6 +740,25 @@ static void setup_pipeline(void) {
     r = avcodec_parameters_from_context(vstream->codecpar, enc);
     if (r < 0) die("stream params", r);
     vstream->time_base = enc->time_base;
+    if (n_asrc > 0) {
+        const AVCodec *ac = avcodec_find_encoder(AV_CODEC_ID_AAC);
+        if (!ac) die("no aac encoder", 0);
+        aenc = avcodec_alloc_context3(ac);
+        aenc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+        aenc->sample_rate = ARATE;
+        av_channel_layout_default(&aenc->ch_layout, ACH);
+        aenc->bit_rate = 160000;
+        aenc->time_base = (AVRational){1, ARATE};
+        if (ofmt->oformat->flags & AVFMT_GLOBALHEADER)
+            aenc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        r = avcodec_open2(aenc, ac, NULL);
+        if (r < 0) die("open aac", r);
+        astream = avformat_new_stream(ofmt, NULL);
+        r = avcodec_parameters_from_context(astream->codecpar, aenc);
+        if (r < 0) die("audio stream params", r);
+        astream->time_base = aenc->time_base;
+    }
+
     r = avio_open(&ofmt->pb, o_out, AVIO_FLAG_WRITE);
     if (r < 0) die("avio_open", r);
     // Fragmented: a die() or a SIGKILL after this point used to leave an mp4 with no
@@ -596,11 +788,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-cursor") && i + 1 < argc)
             o_cursor = !strcmp(argv[++i], "yes");
         else if (!strcmp(argv[i], "-write-first-frame-ts") && i + 1 < argc) o_ts = argv[++i];
+        else if (!strcmp(argv[i], "-a") && i + 1 < argc) o_audio = argv[++i];
         else {
             fprintf(stderr,
                 "usage: omarchy-capture-window -w 0xADDRESS -o out.mp4 [-f 60] "
                 "[-k auto|h264_vaapi|hevc_vaapi] [-q QP] [-cursor yes|no] "
-                "[-write-first-frame-ts FILE]\n");
+                "[-write-first-frame-ts FILE] [-a \"source\" | -a \"src|src\"]\n");
             return 2;
         }
     }
@@ -650,6 +843,17 @@ int main(int argc, char **argv) {
     }
 
     if (allocated) {
+        if (n_asrc > 0) {
+            // Stop the mixer and flush the encoder, then LEAVE the reader threads
+            // where they are. They park in a blocking pulse read that has no
+            // cancellation point, so pthread_cancel does not land and the join hangs
+            // forever -- which it did, taking the whole take with it. They touch only
+            // their own ring buffer, never the muxer, so exiting with them running is
+            // safe; closing their inputs underneath them is what would not be.
+            audio_running = 0;
+            for (int i = 0; i < n_asrc; i++) asrcs[i].stop = 1;
+            pthread_join(amix_thread, NULL);
+        }
         pthread_mutex_lock(&q_lock);
         enc_running = 0;
         pthread_cond_broadcast(&q_cond);

@@ -753,6 +753,26 @@ start_screenrecording() {
 
   [[ $WEBCAM == "true" && $BURN_IN == "true" ]] && start_webcam_overlay "$target"
 
+  # gsr understands "default_output"/"default_input" as aliases; libavdevice's pulse
+  # demuxer does NOT -- it accepts any name and quietly falls back to the default
+  # SOURCE. So "record the desktop" recorded the microphone, with no error anywhere.
+  # The toplevel recorder gets real PulseAudio names.
+  resolve_pulse_alias() {
+    case "$1" in
+    default_output) local sink; sink=$(pactl get-default-sink 2>/dev/null) &&
+                    [[ -n $sink ]] && echo "$sink.monitor" || echo "$1" ;;
+    default_input)  pactl get-default-source 2>/dev/null || echo "$1" ;;
+    *) echo "$1" ;;
+    esac
+  }
+
+  # libavdevice's pulse demuxer accepts ANY name and falls back to the default
+  # source, so a typo does not fail -- it records the microphone and says nothing.
+  # The only place that can be caught is before it is handed over.
+  pulse_source_exists() {
+    pactl list short sources 2>/dev/null | cut -f2 | grep -Fxq "$1"
+  }
+
   local audio_devices=""
   local audio_args=()
   [[ $DESKTOP_AUDIO == "true" ]] && audio_devices+="default_output"
@@ -788,9 +808,27 @@ start_screenrecording() {
     #
     # No -ipc: it has no control socket, and does not need one -- SIGTERM finalises the
     # file. The stop path already signals before it talks to the socket.
+    local iso_audio=""
+    if [[ -n $audio_devices ]]; then
+      local part
+      while IFS= read -r part; do
+        [[ -z $part ]] && continue
+        local resolved
+        resolved=$(resolve_pulse_alias "$part")
+        if ! pulse_source_exists "$resolved"; then
+          trail "audio: no PulseAudio source named '$resolved'; recording without it"
+          omarchy-notification-send -u normal -t 4000 "Audio source not found" \
+            "Recording without '$resolved'."
+          continue
+        fi
+        [[ -n $iso_audio ]] && iso_audio+="|"
+        iso_audio+="$resolved"
+      done < <(tr '|' '\n' <<<"$audio_devices")
+    fi
     "$WINDOW_RECORDER" -w "$SETUP_WINDOW" \
       -k "${CAPTURE_CODEC:-auto}" -f "$capture_fps" \
       -cursor "$CURSOR_CAPTURE" \
+      ${iso_audio:+-a "$iso_audio"} \
       -write-first-frame-ts "$master.ts" \
       -o "$master" 2> >(tee -a "$GSR_STDERR" >>"$LOG_FILE") &
   else

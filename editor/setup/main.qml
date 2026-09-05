@@ -175,11 +175,10 @@ ApplicationWindow {
     // Capture the window itself rather than the rectangle it sits in. Window picks
     // only -- an area has no toplevel behind it to export.
     property bool windowOnly: false
-    // The single-window recorder captures video only. Rather than record silence and
-    // let it be discovered in the editor, the audio switches turn themselves off and
-    // say why while this mode is on.
-    readonly property bool audioAvailable: !(mode === 1 && windowOnly)
-    onWindowOnlyChanged: if (windowOnly) { micOn = false; desktopAudio = false }
+    // The isolated recorder captures audio too, so nothing to gate any more. Kept as
+    // a property rather than deleted: it is the one place that would say so again if
+    // some future capture mode cannot carry sound.
+    readonly property bool audioAvailable: true
 
     readonly property var micEntry: entryFor(sources.mics, micDevice, "name")
     readonly property var cameraEntry: entryFor(sources.cameras, cameraDevice, "device")

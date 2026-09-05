@@ -1039,3 +1039,20 @@ def test_a_render_with_a_cut_and_a_cursor_keeps_its_length(bundle, tmp_path):
     plan = render.build_graph(bundle)
     render.run_plan(plan, out)
     assert probe.frame_count(out) == plan.total_frames
+
+
+def test_the_cursor_overlay_drops_to_yuv420_once_the_export_downscales():
+    """yuv444 buys whole-pixel overlay positioning, because yuv420 snaps x/y to EVEN
+    pixels. That is worth paying for at the master's size -- but once the export
+    downscales 2x or more, an even MASTER pixel is at most one OUTPUT pixel, which is
+    the same granularity for free. Measured: -16s on a 1440p export from a 5K master,
+    with the cursor indistinguishable at 4x.
+
+    A `native` export does not downscale, so it keeps yuv444 and its whole-pixel steps.
+    """
+    from omarchy_studio.render import cursor_overlay_format
+
+    assert cursor_overlay_format(1.0) == "yuv444"   # native: no downscale
+    assert cursor_overlay_format(0.75) == "yuv444"  # not enough headroom
+    assert cursor_overlay_format(0.5) == "yuv420"   # 1440p from a 5K master
+    assert cursor_overlay_format(0.375) == "yuv420" # 1080p from a 5K master

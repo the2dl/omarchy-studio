@@ -263,8 +263,15 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
             cam_label = "[cam_padded]"
         registry.bind("camera", cam_label)
 
+    # Decided before the cursor, not after it: the cursor's overlay format depends on how
+    # far this export downscales. Nothing is emitted at the smaller size until after the
+    # zoom -- see below.
+    comp, pixel_scale = composite_canvas(canvas, edit, for_proxy=for_proxy)
+
     cur = _pad_ends(g, cur, cutmap, edit, tb)
-    cur = _cursor(g, cur, bundle, cutmap, registry)
+    cur = _cursor(
+        g, cur, bundle, cutmap, registry, cursor_overlay_format(pixel_scale)
+    )
 
     zf = zoom_filter(_segments(bundle, cutmap), canvas, tb)
     if zf:
@@ -274,7 +281,6 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
     # From here down the composite is built at the size it will be delivered at, not at
     # the master's. The zoom above ran at full resolution, which is the only stage that
     # needed it. See `composite_canvas`.
-    comp, pixel_scale = composite_canvas(canvas, edit, for_proxy=for_proxy)
     if comp != canvas and not edit.backdrop.enabled:
         # With a backdrop, `_backdrop`'s inset scale IS this downscale and doing it here
         # too would resample the picture twice. Without one there is nothing else to do
@@ -467,6 +473,25 @@ def _segments(bundle: Bundle, cutmap: CutMap):
 # positioning for 3.4 ms/frame and still undercuts doing the same overlay in rgba.
 _CURSOR_OVERLAY_FORMAT = "yuv444"
 
+# ...but only while the composite is near the master's size. `overlay`'s even-pixel snap
+# is in the coordinates of the frame it draws on, so once the export downscales by 2x or
+# more, an even MASTER pixel is at most one OUTPUT pixel -- exactly the granularity yuv444
+# was bought to get, now free. Below 0.5 it is finer still. Measured: -16s on a 1440p
+# export from a 5K master, with the cursor crop indistinguishable at 4x and text edge
+# width unchanged (3.857 -> 3.849).
+#
+# The chroma also survives: the inset lands at 2444x1324, so 4:2:0 gives it 1222x662 of
+# chroma, while the master carries 2560x1440 -- and 1422x800 even inside the deepest 1.8x
+# viewport. The output never asks for more chroma than the master has.
+#
+# Gated, because a `native` export does not downscale at all and would get the 2-pixel
+# staircase back.
+_CURSOR_YUV420_MAX_SCALE = 0.5
+
+
+def cursor_overlay_format(pixel_scale: float) -> str:
+    return "yuv420" if pixel_scale <= _CURSOR_YUV420_MAX_SCALE else _CURSOR_OVERLAY_FORMAT
+
 
 def _cursor(
     g: _Graph,
@@ -474,6 +499,7 @@ def _cursor(
     bundle: Bundle,
     cutmap: CutMap,
     registry: layers_mod.InputRegistry,
+    overlay_format: str = _CURSOR_OVERLAY_FORMAT,
 ) -> str:
     """Composite the synthetic pointer, or return the frame untouched.
 
@@ -526,7 +552,7 @@ def _cursor(
         # every input ends and the looped filmstrip never does.
         g.add(
             f"{cur}[cur_ripple]overlay=x='{rx}':y='{ry}'"
-            f":shortest=1:format={_CURSOR_OVERLAY_FORMAT}[cur_rippled]"
+            f":shortest=1:format={overlay_format}[cur_rippled]"
         )
         cur = "[cur_rippled]"
 
@@ -537,7 +563,7 @@ def _cursor(
     # that is an expression, so there is nothing to loop.
     g.add(
         f"{cur}[{idx}:v]overlay=x='{ax}':y='{ay}'"
-        f":format={_CURSOR_OVERLAY_FORMAT}[cursored]"
+        f":format={overlay_format}[cursored]"
     )
     return "[cursored]"
 

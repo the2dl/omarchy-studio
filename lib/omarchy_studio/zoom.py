@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .events import MappedClick
-from .exprs import balanced_sum
+from .exprs import balanced_sum, frame_gate
 from .geometry import Canvas, Zoom
 from .project import ZoomSettings
 from .timebase import CutMap, FrameRange, Timebase
@@ -280,8 +280,20 @@ def zoom_filter(segments: list[ZoomSegment], canvas: Canvas, tb: Timebase) -> st
     """The `perspective` filter for a whole timeline, or "" when there is no zoom.
 
     "" rather than an identity filter: `perspective` costs its full 8.4 ms/frame even
-    when the quad is the frame, and `enable` would not help -- a gated filter still
-    processes every frame.
+    when the quad is the frame. It is gated with `enable` so that it costs that only on
+    the frames a zoom is actually in flight -- `ffmpeg -filters` lists it `TS`, and the
+    `T` is timeline support, so a disabled frame never enters the filter at all.
+
+    This docstring used to claim the opposite -- "`enable` would not help, a gated filter
+    still processes every frame" -- and that was simply wrong. It is what kept the filter
+    running over every frame of the take: on a 510-frame export with two zooms, 434
+    frames were paying full price for a warp that is the identity. Gating took the whole
+    export from 56.2s to 31.2s with the output bit-identical (framemd5).
+
+    The gate is inclusive of both ends of `t`. The envelope is 0 AT `t.start` and 0 again
+    AT `t.end`, so those two frames are already the identity and need not be inside the
+    gate at all; they are included because a gate that is one frame too wide costs one
+    identity warp, and a gate one frame too narrow drops a real one.
 
     The emitted expression uses `perspective`'s own `W`/`H` rather than the canvas
     dimensions, so the identical string is correct against the 1080p preview proxy and
@@ -334,7 +346,28 @@ def zoom_filter(segments: list[ZoomSegment], canvas: Canvas, tb: Timebase) -> st
         f"x2='{left}':y2='{bottom}':"
         f"x3='{right}':y3='{bottom}':"
         "sense=source:eval=frame:interpolation=cubic"
+        f":enable='{_gate_expr(live)}'"
     )
+
+
+def _gate_expr(live: list[ZoomSegment]) -> str:
+    """The frames on which `perspective` has anything to do.
+
+    `n` here is the filter's own 0-based input count, and the quad expressions are
+    written against `(on-1)`, the 0-based OUTPUT count. For a 1:1 filter those are the
+    same number, including across disabled frames -- `on` keeps counting through them,
+    which is what makes the gate safe rather than a source of drift.
+
+    Through `frame_gate` rather than joining the terms here: it emits a BALANCED tree,
+    and a flat left-deep `a+b+c+...` is what ffmpeg's expression parser cannot allocate.
+    A 150-click project has 150 segments, and a hand-rolled join took the whole graph
+    down with "Cannot allocate memory" -- the same trap `balanced_sum` exists for, three
+    functions up. The suite caught it.
+
+    `t.end + 1` because `frame_gate` is half-open and the envelope only returns to 0 AT
+    `t.end`: half-open would stop one frame short of the frame that closes the move.
+    """
+    return frame_gate([FrameRange(s.t.start, s.t.end + 1) for s in live])
 
 
 def _viewport_is_sane(s: ZoomSegment, canvas: Canvas) -> bool:

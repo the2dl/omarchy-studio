@@ -309,3 +309,45 @@ def test_a_malformed_chrome_rect_is_ignored_not_fatal():
     cap = _cap_with_chrome([{"nonsense": 1}, {"x": "a", "y": 0, "width": 5, "height": 5}])
     clicks = [Click(t_us=1_000_000, button="left", x=800, y=400)]
     assert len(map_clicks(clicks, cap, Timebase(60, 1))) == 1
+
+
+def test_the_zoom_is_gated_to_the_frames_it_moves_on():
+    """`perspective` costs its full per-frame price even for an identity quad, so it is
+    switched off outside the move. On a 510-frame take with two zooms that is 434 frames
+    that were paying for nothing: 56.2s -> 31.2s, output bit-identical.
+
+    zoom.py used to assert the opposite in its own docstring -- "`enable` would not help,
+    a gated filter still processes every frame". `ffmpeg -filters` lists perspective as
+    `TS`; the `T` is timeline support, and a disabled frame never enters the filter.
+    """
+    from omarchy_studio.geometry import Canvas, Zoom
+    from omarchy_studio.timebase import FrameRange, Timebase
+    from omarchy_studio.zoom import ZoomSegment, zoom_filter
+
+    tb = Timebase(fps_num=30, fps_den=1)
+    seg = ZoomSegment(t=FrameRange(100, 160), zoom=Zoom(1.8, 0.5, 0.5),
+                      ease_in=10, ease_out=10)
+    f = zoom_filter([seg], Canvas(1920, 1080), tb)
+    assert ":enable='" in f
+    # inclusive of t.end: the envelope only returns to 0 ON that frame
+    assert "gte(n,100)" in f and "lt(n,161)" in f
+
+
+def test_the_gate_is_a_balanced_tree_not_a_flat_join():
+    """A flat `a+b+c+...` over 150 segments is a left-deep parse tree, and ffmpeg answers
+    "Cannot allocate memory" and takes the whole graph down. That is what `balanced_sum`
+    and `frame_gate` exist for, and a hand-rolled join in the gate reintroduced it."""
+    from omarchy_studio.geometry import Canvas, Zoom
+    from omarchy_studio.timebase import FrameRange, Timebase
+    from omarchy_studio.zoom import ZoomSegment, zoom_filter
+
+    segs = [
+        ZoomSegment(t=FrameRange(i * 20, i * 20 + 10), zoom=Zoom(1.5, 0.5, 0.5),
+                    ease_in=3, ease_out=3)
+        for i in range(150)
+    ]
+    f = zoom_filter(segs, Canvas(1920, 1080), Timebase(fps_num=30, fps_den=1))
+    gate = f.split(":enable='")[1].rsplit("'", 1)[0]
+    # a balanced tree nests; a flat join does not
+    assert gate.count("max(") >= 100
+    assert "+gte(n," not in gate, "flat join is back"

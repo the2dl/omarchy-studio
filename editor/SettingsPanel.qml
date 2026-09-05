@@ -73,6 +73,10 @@ ScrollView {
         Bridge.op("set_webcam", args)
     }
 
+    readonly property int zoomSuppressedCount: {
+        var tr = st.zoom_track
+        return tr && tr.suppressed ? tr.suppressed.length : 0
+    }
     readonly property int selZoom: preview ? preview.selectedZoomIndex : -1
     readonly property var selSeg: preview && selZoom >= 0 && selZoom < preview.zoomSegments.length
                                   ? preview.zoomSegments[selZoom] : null
@@ -183,6 +187,18 @@ ScrollView {
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fsCaption
             }
+            // Auto-zoom is derived from the clicks, so the only way to be rid of one
+            // move used to be to turn the whole feature off. This deletes just this one,
+            // keyed on the click that starts it so it stays deleted through later edits.
+            C.GhostButton {
+                text: "Delete"
+                visible: root.selSeg !== null && root.selSeg.anchor >= 0
+                onClicked: {
+                    Bridge.op("set_zoom", { suppress: root.selSeg.anchor })
+                    if (root.preview)
+                        root.preview.selectedZoomIndex = -1
+                }
+            }
         }
 
         // ====================================================================
@@ -282,6 +298,15 @@ ScrollView {
             RowLayout {
                 Layout.fillWidth: true
                 C.Caption { text: "zoom"; Layout.fillWidth: true }
+                // Only when there is something to bring back. A deleted move is
+                // otherwise invisible -- there is no gap on the timeline to click.
+                C.GhostButton {
+                    text: (root.zoomSuppressedCount === 1)
+                          ? "restore 1 deleted"
+                          : ("restore " + root.zoomSuppressedCount + " deleted")
+                    visible: root.zoomSuppressedCount > 0
+                    onClicked: Bridge.op("set_zoom", { restore: "all" })
+                }
                 Text {
                     text: (st.clicks ? st.clicks.length : 0) + " clicks"
                     color: Theme.text5

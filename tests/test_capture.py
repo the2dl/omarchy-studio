@@ -469,3 +469,79 @@ def test_the_watcher_finalizes_when_nobody_else_did():
     # The marker is the interlock: the normal stop removes it as it finalizes, so its
     # presence afterwards is what says nobody did.
     assert "BUNDLE_FILE" in watcher
+
+
+def test_finalize_folds_the_hud_rect_into_the_chrome_it_ignores(tmp_path):
+    """The Stop button was landing in every take -- not as pixels, but as a click.
+
+    no_screen_share keeps the pill out of the frame, so auto-zoom was the only thing
+    that saw it: every recording ended with a zoom and a ripple lunging at a button the
+    viewer cannot see. `hyprctl monitors` does not cover it, because those rects are the
+    compositor's RESERVED edges and the HUD floats above its own strip. Measured on a
+    real take: reserved was y=1406..1440 and the Stop click landed at y=1386.
+    """
+    import json
+    import synthetic
+    from omarchy_studio import capture as C
+
+    root = tmp_path / "take"
+    synthetic.make_bundle(root, seconds=1.0, width=320, height=240, camera=False)
+    (root / "events").mkdir(exist_ok=True)
+    (root / "events" / "chrome.json").write_text(
+        json.dumps([{"x": 100, "y": 200, "width": 120, "height": 30}])
+    )
+    C.finalize(root)
+    rects = json.loads((root / "capture.json").read_text())["chrome_rects"]
+    assert {"x": 100, "y": 200, "width": 120, "height": 30} in rects
+
+
+def test_a_broken_hud_rect_never_costs_the_take(tmp_path):
+    """One ignored rectangle is worth losing; a finalize that raises is not."""
+    import json
+    import synthetic
+    from omarchy_studio import capture as C
+
+    for payload in ("not json at all", "{}", '[{"x": "x"}]', '[{"width": 0}]'):
+        root = tmp_path / f"take{abs(hash(payload))}"
+        synthetic.make_bundle(root, seconds=1.0, width=320, height=240, camera=False)
+        (root / "events").mkdir(exist_ok=True)
+        (root / "events" / "chrome.json").write_text(payload)
+        C.finalize(root)  # must not raise
+        json.loads((root / "capture.json").read_text())
+
+
+def test_the_stop_click_stops_producing_a_zoom(tmp_path):
+    """End to end, in the coordinates the real take actually used."""
+    import json
+    import synthetic
+    from omarchy_studio import capture as C, events as E, zoom as Z
+    from omarchy_studio.project import Bundle
+    from omarchy_studio.timebase import CutMap
+
+    root = tmp_path / "hud"
+    synthetic.make_bundle(root, seconds=4.0, width=2560, height=1440, camera=False,
+                          clicks=())
+    (root / "events").mkdir(exist_ok=True)
+    (root / "events" / "chrome.json").write_text(
+        json.dumps([{"x": 1180, "y": 1330, "width": 460, "height": 80}])
+    )
+    C.finalize(root)
+    # Clicks are CLOCK_MONOTONIC and mean nothing without the anchor for frame 0. The
+    # synthetic bundle has no gsr .ts sidecar to derive one from, so pin it here.
+    cap = json.loads((root / "capture.json").read_text())
+    cap["screen"]["anchor_us"] = 0
+    (root / "capture.json").write_text(json.dumps(cap))
+    anchor = 0
+    (root / "events" / "input.jsonl").write_text(
+        '{"t_us":%d,"type":"click","button":"left","x":912,"y":975}\n'
+        '{"t_us":%d,"type":"click","button":"left","x":1411,"y":1386}\n'
+        % (anchor + 1_000_000, anchor + 3_000_000)
+    )
+    b = Bundle(root)
+    b.edit.zoom.enabled = True
+    clicks = E.map_clicks(E.read_clicks(b.events_dir / "input.jsonl"),
+                          b.capture, b.timebase)
+    segs = Z.zoom_segments(clicks, b.edit.zoom, b.timebase, CutMap([], 600))
+    assert len(segs) == 1, f"expected only the real click to zoom, got {len(segs)}"
+    # ~1s in at 30fps; the Stop click at ~3s must not have produced anything
+    assert segs[0].anchor < 60

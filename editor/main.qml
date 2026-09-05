@@ -481,8 +481,21 @@ ApplicationWindow {
         sequences: [StandardKey.Delete]
         // Guarded by previewMode: with the ring hidden there is no visible selection,
         // and deleting an invisible selection is how work gets lost.
-        onActivated: if (!app.previewMode && preview.selectedId !== "")
-                         Bridge.op("delete_layer", { id: preview.selectedId })
+        onActivated: {
+            if (app.previewMode)
+                return
+            if (preview.selectedId !== "") {
+                Bridge.op("delete_layer", { id: preview.selectedId })
+            } else if (preview.selectedZoomSegment
+                       && preview.selectedZoomSegment.anchor >= 0) {
+                // A zoom is not a layer -- it is derived from the click track -- so it
+                // is deleted by remembering NOT to make it, keyed on the source frame of
+                // the click that starts it. Same key, Delete, because from the user's
+                // side it is the same gesture on the same kind of selected thing.
+                Bridge.op("set_zoom", { suppress: preview.selectedZoomSegment.anchor })
+                preview.selectedZoomIndex = -1
+            }
+        }
     }
     // Split the camera segment under the playhead, which is how a head that is on for
     // the whole take becomes one that goes away. Deleting the right-hand half is then

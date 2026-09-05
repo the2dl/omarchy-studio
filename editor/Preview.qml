@@ -205,6 +205,9 @@ Item {
     // one sample at a time from zoomAt(), never from these.
     readonly property var zoomSegments: computeZoomSegments(st.zoom_track)
     property int selectedZoomIndex: -1
+    readonly property var selectedZoomSegment:
+        selectedZoomIndex >= 0 && selectedZoomIndex < zoomSegments.length
+        ? zoomSegments[selectedZoomIndex] : null
 
     function computeZoomSegments(tr) {
         var out = []
@@ -219,8 +222,14 @@ Item {
                 continue
             }
             if (tr.scale[peak] > 1.0001)
+                // `anchor` names the move in the project -- the source frame of the
+                // click that starts it -- so the panel can delete THIS zoom and have it
+                // stay deleted through cuts and re-renders. It rides on the sample
+                // rather than being looked up by index, because this reconstruction and
+                // the segment list it came from must not be able to disagree.
                 out.push({ start: tr.frames[start], end: tr.frames[i - 1] + 1,
-                           scale: tr.scale[peak], x: tr.x[peak], y: tr.y[peak] })
+                           scale: tr.scale[peak], x: tr.x[peak], y: tr.y[peak],
+                           anchor: tr.anchor ? tr.anchor[peak] : -1 })
             start = i
             peak = i
         }

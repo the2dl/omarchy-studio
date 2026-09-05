@@ -351,3 +351,59 @@ def test_the_gate_is_a_balanced_tree_not_a_flat_join():
     # a balanced tree nests; a flat join does not
     assert gate.count("max(") >= 100
     assert "+gte(n," not in gate, "flat join is back"
+
+
+def _clicks_at(frames):
+    from omarchy_studio.events import MappedClick
+
+    return [MappedClick(frame=f, px=100.0, py=100.0, cx=0.5, cy=0.5, button="left")
+            for f in frames]
+
+
+def _segs(frames, suppressed=(), gap=90):
+    from omarchy_studio.project import ZoomSettings
+    from omarchy_studio.timebase import CutMap, Timebase
+    from omarchy_studio.zoom import zoom_segments
+
+    tb = Timebase(fps_num=30, fps_den=1)
+    st = ZoomSettings(enabled=True, merge_gap_frames=gap, suppressed=suppressed)
+    return zoom_segments(_clicks_at(frames), st, tb, CutMap([], 2000))
+
+
+def test_one_zoom_can_be_deleted_without_losing_the_others():
+    """The whole feature was previously one on/off switch, so a single unwanted move --
+    almost always the click on the HUD's Stop button -- meant turning off auto-zoom."""
+    all_three = _segs([100, 600, 1100])
+    assert len(all_three) == 3
+    kept = _segs([100, 600, 1100], suppressed=(all_three[1].anchor,))
+    assert [s.anchor for s in kept] == [all_three[0].anchor, all_three[2].anchor]
+
+
+def test_a_zoom_is_named_by_source_frame_so_a_cut_cannot_move_it():
+    """The anchor has to survive every other edit. An index shifts when an earlier move
+    goes; an output range shifts when a cut lands ahead of it. The click track is part
+    of the capture and never changes."""
+    from omarchy_studio.project import ZoomSettings
+    from omarchy_studio.timebase import CutMap, FrameRange, Timebase
+    from omarchy_studio.zoom import zoom_segments
+
+    tb = Timebase(fps_num=30, fps_den=1)
+    st = ZoomSettings(enabled=True)
+    clicks = _clicks_at([300, 900])
+    plain = zoom_segments(clicks, st, tb, CutMap([], 2000))
+    # cut 60 frames out ahead of both clicks: output ranges move, anchors must not
+    cut = zoom_segments(clicks, st, tb, CutMap([FrameRange(50, 110)], 2000))
+    assert [s.anchor for s in cut] == [s.anchor for s in plain] == [300, 900]
+    assert cut[0].t.start != plain[0].t.start, "the cut should have moved the output range"
+
+
+def test_deleting_every_zoom_leaves_no_filter_at_all():
+    """Not an identity `perspective` on every frame -- nothing. Same path as zoom off."""
+    from omarchy_studio.geometry import Canvas
+    from omarchy_studio.timebase import Timebase
+    from omarchy_studio.zoom import zoom_filter
+
+    segs = _segs([100, 600])
+    gone = _segs([100, 600], suppressed=tuple(s.anchor for s in segs))
+    assert gone == []
+    assert zoom_filter(gone, Canvas(1920, 1080), Timebase(fps_num=30, fps_den=1)) == ""

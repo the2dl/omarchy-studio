@@ -79,6 +79,11 @@ class ZoomSegment:
     zoom: Zoom
     ease_in: int
     ease_out: int
+    # SOURCE frame of the first click in the cluster. The stable name of this move: the
+    # output range shifts whenever a cut is added, and the index in the list shifts
+    # whenever any earlier move appears or goes, so neither can address a zoom across an
+    # edit. The click track is part of the capture and never changes.
+    anchor: int = -1
 
     def __post_init__(self) -> None:
         if self.ease_in < 0 or self.ease_out < 0:
@@ -140,16 +145,18 @@ def zoom_segments(
     if settings.amount <= 1.0:
         return []
 
-    pts: list[tuple[int, float, float]] = []
+    # (output frame, cx, cy, SOURCE frame) -- the source frame rides along so the
+    # cluster can be named by something that survives a cut.
+    pts: list[tuple[int, float, float, int]] = []
     for c in clicks:
         out = cutmap.to_output(c.frame)
         if out is not None:
-            pts.append((out, c.cx, c.cy))
+            pts.append((out, c.cx, c.cy, c.frame))
     if not pts:
         return []
     pts.sort(key=lambda p: p[0])
 
-    clusters: list[list[tuple[int, float, float]]] = []
+    clusters: list[list[tuple[int, float, float, int]]] = []
     for p in pts:
         if clusters and p[0] - clusters[-1][-1][0] <= settings.merge_gap_frames:
             clusters[-1].append(p)
@@ -162,7 +169,7 @@ def zoom_segments(
     # keeps every envelope disjoint, which is what lets the filter expression be a plain
     # sum with no denominator.
     while True:
-        merged: list[list[tuple[int, float, float]]] = [clusters[0]]
+        merged: list[list[tuple[int, float, float, int]]] = [clusters[0]]
         collided = False
         for c in clusters[1:]:
             if _span(merged[-1], settings)[1] > _span(c, settings)[0]:
@@ -177,7 +184,14 @@ def zoom_segments(
     min_len = max(2, round(tb.fps * _MIN_SEGMENT_SECONDS))
     total = cutmap.output_frames
     segments: list[ZoomSegment] = []
+    suppressed = set(settings.suppressed)
     for c in clusters:
+        anchor = min(p[3] for p in c)
+        if anchor in suppressed:
+            # Deleted by hand in the editor. Dropped here rather than filtered later so
+            # that nothing downstream -- the gate, the preview track, the filtergraph --
+            # ever learns this move existed.
+            continue
         start, end = _span(c, settings)
         end = min(end, total)
         if end - start < min_len:
@@ -196,12 +210,13 @@ def zoom_segments(
                 ),
                 ease_in=ease_in,
                 ease_out=ease_out,
+                anchor=anchor,
             )
         )
     return segments
 
 
-def _span(cluster: list[tuple[int, float, float]], s: ZoomSettings) -> tuple[int, int]:
+def _span(cluster: list[tuple[int, float, float, int]], s: ZoomSettings) -> tuple[int, int]:
     """[start, end) of the move a cluster produces, before clamping.
 
     The ease-in starts ON the first click rather than before it: the frames leading up to

@@ -442,12 +442,14 @@ def zoom_track(bundle: Bundle) -> dict:
     cutmap = CutMap(bundle.edit.cuts, total)
     segments = _zoom.zoom_segments(clicks, bundle.edit.zoom, bundle.timebase, cutmap)
     if not segments:
-        return {"frames": [], "scale": [], "x": [], "y": []}
+        return {"frames": [], "scale": [], "x": [], "y": [], "anchor": [],
+                "suppressed": list(bundle.edit.zoom.suppressed)}
 
     frames: list[int] = []
     scales: list[float] = []
     xs: list[float] = []
     ys: list[float] = []
+    anchors: list[int] = []
     # Segments are on the OUTPUT timeline and disjoint, so walking each one's own span
     # visits every non-identity frame exactly once without scanning the whole recording.
     # Each sample is then mapped BACK to source time, because the preview plays the
@@ -467,9 +469,24 @@ def zoom_track(bundle: Bundle) -> dict:
             scales.append(q["scale"])
             xs.append(q["x"])
             ys.append(q["y"])
+            anchors.append(seg.anchor)
             if len(frames) >= _MAX_ZOOM_SAMPLES:
-                return {"frames": frames, "scale": scales, "x": xs, "y": ys}
-    return {"frames": frames, "scale": scales, "x": xs, "y": ys}
+                return _track(bundle, frames, scales, xs, ys, anchors)
+    return _track(bundle, frames, scales, xs, ys, anchors)
+
+
+def _track(bundle, frames, scales, xs, ys, anchors) -> dict:
+    """The sampled track plus, per sample, the anchor of the move it belongs to.
+
+    Per SAMPLE rather than per segment: QML rebuilds the segment list itself out of
+    contiguous runs, and an index into a separate per-segment array would have to agree
+    with that reconstruction. Carrying the anchor alongside the sample means the two can
+    never disagree -- the move under the playhead names itself.
+    """
+    return {
+        "frames": frames, "scale": scales, "x": xs, "y": ys, "anchor": anchors,
+        "suppressed": list(bundle.edit.zoom.suppressed),
+    }
 
 
 # --- the state dump ----------------------------------------------------------
@@ -802,6 +819,24 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         for key, ms in (("hold_frames", "hold_ms"), ("ease_frames", "ease_ms"), ("merge_gap_frames", "merge_gap_ms")):
             if ms in args:
                 setattr(z, key, max(1, tb.to_frame(float(args[ms]) / 1000.0)))
+        # Deleting one move, by the SOURCE frame of the click that starts it. Anything
+        # else -- its index, its output range -- moves under the user as soon as another
+        # edit lands, and they would find they had deleted a different zoom.
+        if "suppress" in args:
+            try:
+                z.suppressed = tuple(sorted(set(z.suppressed) | {int(args["suppress"])}))
+            except (TypeError, ValueError):
+                pass
+        if "restore" in args:
+            if args["restore"] == "all":
+                z.suppressed = ()
+            else:
+                try:
+                    z.suppressed = tuple(
+                        a for a in z.suppressed if a != int(args["restore"])
+                    )
+                except (TypeError, ValueError):
+                    pass
 
     elif op == "set_cursor":
         c = edit.cursor

@@ -242,7 +242,7 @@ class Layer:
 
 @dataclass
 class ZoomSettings:
-    """Auto-zoom derived from the click track. Toggleable as a whole."""
+    """Auto-zoom derived from the click track, with individual moves removable."""
 
     enabled: bool = False
     amount: float = 1.8
@@ -250,6 +250,28 @@ class ZoomSettings:
     ease_frames: int = 18  # ~0.3s
     # Clicks closer together than this merge into one zoom rather than pumping.
     merge_gap_frames: int = 90
+    # SOURCE frames of the clicks that begin moves the user deleted. Source, because a
+    # zoom has to stay deleted across every other edit: its output range moves whenever a
+    # cut is added ahead of it, and its index in the list moves whenever any earlier move
+    # appears or goes. The click track is part of the capture and never changes, so the
+    # frame a move started on is the one name that holds still.
+    #
+    # A deleted move can come back if `merge_gap_frames` is changed enough to re-cluster
+    # the clicks -- the anchor stops being an anchor and matches nothing. That is the
+    # honest behaviour: the moves are not the same moves any more.
+    suppressed: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        # JSON gives a list, and a hand-edited file can give anything. Normalized to a
+        # sorted tuple of ints so the set lookup in zoom_segments cannot raise and
+        # `asdict` round-trips.
+        vals = []
+        for v in self.suppressed or ():
+            try:
+                vals.append(int(v))
+            except (TypeError, ValueError):
+                continue
+        self.suppressed = tuple(sorted(set(vals)))
 
 
 @dataclass

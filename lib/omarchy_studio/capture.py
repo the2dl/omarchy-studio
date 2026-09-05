@@ -493,8 +493,49 @@ def finalize(
             capture.camera = None
             fault = str(e)
 
+    capture.chrome_rects = _merge_chrome(root, capture.chrome_rects)
+
     (root / "capture.json").write_text(json.dumps(capture.to_dict(), indent=2) + "\n")
     return Bundle(root), fault
+
+
+def _merge_chrome(root: Path, existing: list) -> list:
+    """Fold the recording HUD's own rectangle into the chrome the click track ignores.
+
+    The HUD writes `events/chrome.json` once it knows where it landed, which cannot be
+    known when the bundle is created: it places itself above or below the capture rect
+    depending on what fits, and sometimes declines to appear at all.
+
+    Why it is needed at all: the compositor's `reserved` edges -- the only chrome the
+    bundle starts with -- describe the strip the HUD RESERVES, not the pill that floats
+    above it. On a real take the reserved strip was y=1406..1440 while the Stop click
+    landed at y=1386, so every recording ended with auto-zoom lunging at a button the
+    viewer cannot even see.
+
+    Never fatal. A missing or corrupt file costs one ignored rectangle; refusing to
+    finalize over it would cost the whole take.
+    """
+    path = root / "events" / "chrome.json"
+    if not path.exists():
+        return existing
+    try:
+        extra = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return existing
+    if not isinstance(extra, list):
+        return existing
+    out = list(existing)
+    for r in extra:
+        try:
+            rect = {
+                "x": int(r["x"]), "y": int(r["y"]),
+                "width": int(r["width"]), "height": int(r["height"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+        if rect["width"] > 0 and rect["height"] > 0 and rect not in out:
+            out.append(rect)
+    return out
 
 
 # --- CLI --------------------------------------------------------------------

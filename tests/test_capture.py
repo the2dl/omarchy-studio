@@ -545,3 +545,38 @@ def test_the_stop_click_stops_producing_a_zoom(tmp_path):
     assert len(segs) == 1, f"expected only the real click to zoom, got {len(segs)}"
     # ~1s in at 30fps; the Stop click at ~3s must not have produced anything
     assert segs[0].anchor < 60
+
+
+def test_a_lost_self_view_is_explained_rather_than_silent():
+    """The realistic hyprpm failure is silence, not breakage.
+
+    A Hyprland update leaves the screenshare plugin unbuilt until `hyprpm update`
+    runs, so it stops loading and the live self-view stops appearing. Nothing is
+    broken -- the camera is still recorded and the take is fine -- but an unexplained
+    "it used to show my face" goes uninvestigated for weeks. Exactly how hyprexpo was
+    lost on this machine.
+    """
+    src = (Path(__file__).resolve().parents[1]
+           / "bin" / "omarchy-capture-screenrecording").read_text()
+    i = src.index("Recording without a live self-view")
+    guard = src[src.index('if [[ $self_view_mode == "off"'):i]
+    # only when a camera was asked for, and only for the missing-exclusion reason
+    assert "$WEBCAM ==" in guard
+    assert "$BURN_IN !=" in guard
+    assert "! self_view_exclusion_available" in guard
+    # and it must name the way out
+    assert "hyprpm update" in src[i:i + 400]
+
+
+def test_the_plugin_installer_never_updates_every_repo():
+    """`hyprpm update` rebuilds EVERY registered repository, and a foreign plugin whose
+    upstream no longer builds gets unloaded from the live session as collateral. That
+    is how a working hyprexpo build was destroyed on this machine, so our installer
+    re-registers only its own repo."""
+    src = (Path(__file__).resolve().parents[1] / "contrib"
+           / "hyprland-studio-screenshare" / "install.sh").read_text()
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert "hyprpm update" not in stripped, f"installer runs a global update: {line}"

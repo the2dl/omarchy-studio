@@ -689,6 +689,22 @@ start_screenrecording() {
     fi
   fi
 
+  # SAY SO when the camera was asked for and there will be no live self-view because
+  # the compositor cannot hide it. Silence is the actual hazard with a hyprpm plugin:
+  # a Hyprland update leaves it unbuilt until `hyprpm update` runs, it stops loading,
+  # and the bubble simply never appears again. Nothing is broken -- the recording is
+  # fine and the camera is still recorded -- but "it used to show my face and now it
+  # does not" is the kind of thing that goes uninvestigated for weeks.
+  #
+  # Only when a camera was actually requested, and only for the missing-exclusion
+  # reason: `off` is also the ordinary answer for a burned-in camera or no webcam.
+  if [[ $self_view_mode == "off" && $WEBCAM == "true" && $BURN_IN != "true" ]] \
+     && ! self_view_exclusion_available; then
+    trail "self-view: off -- no room beside the capture and no exclusion available"
+    omarchy-notification-send -u normal -t 5000 "Recording without a live self-view" \
+      "Your camera is still being recorded. The preview needs the omarchy-studio-screenshare plugin, which is not loaded -- a Hyprland update usually means running: hyprpm update && hyprpm reload"
+  fi
+
   # ASKED FOR, never assumed. Recording the display and carrying the selection as a
   # crop is what makes the framing editable afterwards -- it is the only way a window
   # that moved can be followed, since gsr cannot capture a window on Wayland

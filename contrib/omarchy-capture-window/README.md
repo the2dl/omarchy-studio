@@ -90,6 +90,19 @@ the window alone, clean and undimmed.
 `handle` is the window's Hyprland address truncated to its low 32 bits -- the same
 truncation xdph does when it builds its picker list.
 
+## Building it
+
+    ./build.sh
+
+Generates the protocol glue and compiles. The Hyprland extension XML ships here
+because it is not in wayland-protocols; linux-dmabuf comes from the system so it
+tracks the installed wayland-protocols rather than going stale in the checkout.
+
+`wlr-stub.c` is in the link line and is not optional: the Hyprland extension's XML
+references `zwlr_foreign_toplevel_handle_v1`, so the generated code needs that symbol
+even though this recorder addresses windows by address and never binds the
+foreign-toplevel protocol.
+
 ## record.c -- the recorder
 
 Works end to end: captures one window, encodes h264/hevc through VAAPI, muxes an

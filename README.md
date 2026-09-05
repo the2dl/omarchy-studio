@@ -69,6 +69,35 @@ Hyprland (tested on 0.56.2, Lua config), plus:
 
 Python 3.12+. The optional caption engine (`faster-whisper`) lives in the repo venv.
 
+## Installing it on another machine
+
+The core needs no build step -- it runs out of the checkout, on the system Python.
+A venv is only for the optional caption engine; every entry point falls back to
+`python3` when there is none.
+
+    git clone https://github.com/the2dl/omarchy-studio
+    sudo pacman -S --needed gpu-screen-recorder ffmpeg qt6-declarative mpv \
+                            slurp jq wayland wayland-protocols
+
+Then bind a key, as under "Using it".
+
+Two optional native pieces, in the order they are worth having:
+
+    contrib/omarchy-capture-window/build.sh            true single-window capture
+    contrib/hyprland-studio-screenshare/install.sh     exclusion instead of blackout
+
+Neither is required and neither fails loudly, which is the point of listing what you
+give up. Without the first, "just this window" records the window's RECTANGLE, so
+anything on top of it lands in the take; the dispatch detects the missing binary and
+falls back on its own. Without the second, `no_screen_share` still works -- it is
+stock Hyprland -- but it paints black rectangles over excluded windows rather than
+showing what is behind them, so a portal capture gets a black box where the camera
+self-view was.
+
+The plugin's install script deliberately stops short of loading it. Read the comment
+at the top of that script before running it; the first load wants a session you can
+afford to lose.
+
 ## Using it
 
     bin/omarchy-capture-screenrecording      # opens the setup bar; again to stop

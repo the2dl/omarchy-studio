@@ -105,6 +105,19 @@ The plugin's install script deliberately stops short of loading it. Read the com
 at the top of that script before running it; the first load wants a session you can
 afford to lose.
 
+A Hyprland update leaves that plugin stale until it is rebuilt, and the built-in
+answer -- `hyprpm update` -- rebuilds EVERY registered repository, which is how a
+working hyprexpo build was destroyed here. So there is a hook that rebuilds only this
+one, for `exec_on_start` alongside the usual `hyprpm reload`:
+
+    o.exec_on_start(".../contrib/hyprland-studio-screenshare/ensure-loaded.sh")
+
+Loaded already, which is every login but the first after an update, it is one IPC
+call and an exit (7ms). Otherwise it reloads, and rebuilds only if that was not
+enough. Skipping it costs the live camera preview and nothing else: the recorder asks
+the compositor at record time and parks or drops the self-view when exclusion is
+missing, so a stale plugin cannot reach a recording.
+
 ## Using it
 
     bin/omarchy-capture-screenrecording      # opens the setup bar; again to stop

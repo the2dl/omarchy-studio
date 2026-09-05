@@ -568,15 +568,26 @@ def test_a_lost_self_view_is_explained_rather_than_silent():
     assert "hyprpm update" in src[i:i + 400]
 
 
-def test_the_plugin_installer_never_updates_every_repo():
+def test_no_plugin_script_ever_updates_every_repo():
     """`hyprpm update` rebuilds EVERY registered repository, and a foreign plugin whose
     upstream no longer builds gets unloaded from the live session as collateral. That
     is how a working hyprexpo build was destroyed on this machine, so our installer
     re-registers only its own repo."""
+    d = Path(__file__).resolve().parents[1] / "contrib" / "hyprland-studio-screenshare"
+    for name in ("install.sh", "ensure-loaded.sh"):
+        for line in (d / name).read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            assert "hyprpm update" not in stripped, f"{name} runs a global update: {line}"
+
+
+def test_the_autostart_hook_is_a_no_op_when_the_plugin_is_loaded():
+    """It is meant for `exec_on_start`, so the common path -- every login after the
+    first -- must be one hyprctl call and an exit, not a build."""
     src = (Path(__file__).resolve().parents[1] / "contrib"
-           / "hyprland-studio-screenshare" / "install.sh").read_text()
-    for line in src.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        assert "hyprpm update" not in stripped, f"installer runs a global update: {line}"
+           / "hyprland-studio-screenshare" / "ensure-loaded.sh").read_text()
+    body = src[src.index("loaded && exit 0"):]
+    # the cheap exit comes before anything that builds or reloads
+    assert body.index("loaded && exit 0") < body.index("install.sh")
+    assert "hyprctl -j plugin list" in src

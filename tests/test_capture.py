@@ -431,3 +431,41 @@ def _camera_registry():
     reg = InputRegistry()
     reg.bind("camera", "[cam]")
     return reg
+
+
+# --- a take must survive being stopped by something else ----------------------
+
+
+def test_the_dispatch_recovers_an_orphaned_take():
+    """The bar's recording indicator is stock Omarchy and its stop is
+    `pkill -SIGINT -f "^gpu-screen-recorder"`. Anything that ends the recorder without
+    going through this script leaves media on disk, no streams in capture.json, no
+    editor and an uncleared marker -- and --stop-recording used to exit 1 rather than
+    finish it, which made the take unrecoverable except by running finalize by hand.
+    A real recording was lost that way before this branch existed.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] /
+           "bin" / "omarchy-capture-screenrecording").read_text()
+    dispatch = src[src.index("if screenrecording_active; then"):]
+    # The recorder being gone is not the same question as the take being finished.
+    assert 'elif [[ -f $BUNDLE_FILE ]]; then' in dispatch
+    assert dispatch.index('elif [[ -f $BUNDLE_FILE ]]') < dispatch.index('exit 1'), \
+        "recovery has to be tried before the give-up branch"
+
+
+def test_the_watcher_finalizes_when_nobody_else_did():
+    """Second layer: the detached watcher already stopped the camera and the event
+    daemon when gsr died. It finalizes too now, so a take is finished even if nothing
+    ever runs --stop-recording."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] /
+           "bin" / "omarchy-capture-screenrecording").read_text()
+    watcher = src[src.index("while kill -0 '\"$GSR_PID\"'"):]
+    watcher = watcher[:watcher.index("' >/dev/null 2>&1 < /dev/null &")]
+    assert "--stop-recording" in watcher
+    # The marker is the interlock: the normal stop removes it as it finalizes, so its
+    # presence afterwards is what says nobody did.
+    assert "BUNDLE_FILE" in watcher

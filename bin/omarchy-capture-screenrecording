@@ -958,11 +958,32 @@ start_screenrecording() {
   #
   # Detached on purpose: it has to outlive this script, which returns immediately.
   # Both stops are idempotent, so racing the normal stop path costs nothing.
+  #
+  # It also FINALIZES a take that something else stopped. gsr can be ended by things
+  # that know nothing about this bundle -- the bar's own recording indicator runs the
+  # stock recorder's stop, which is `pkill -SIGINT -f "^gpu-screen-recorder"` -- and
+  # that saves the video while leaving everything this script does afterwards undone:
+  # no streams in capture.json, no editor, and a stale bundle marker. Cost a real take
+  # (2026-09-05, 09:53) before it was understood, and the bundle had to be finalized by
+  # hand to get it back.
+  #
+  # Fixing it HERE rather than in the bar is the point. The bar's indicator is stock
+  # Omarchy, shared with every other recorder, and asking a user to clone and patch a
+  # shell plugin to keep their recordings is not a fix. A take should survive being
+  # stopped by anything.
+  #
+  # The marker is the interlock: the normal stop path removes it when it finalizes, so
+  # its continued presence 10s after gsr exited means nobody finalized this take.
   setsid bash -c '
     while kill -0 '"$GSR_PID"' 2>/dev/null; do sleep 1; done
     omarchy-capture-camera stop >/dev/null 2>&1
     command -v omarchy-capture-input-events >/dev/null &&
       omarchy-capture-input-events stop >/dev/null 2>&1
+    for _ in $(seq 20); do
+      [[ -f '"$BUNDLE_FILE"' ]] || exit 0
+      sleep 0.5
+    done
+    '"$STUDIO_ROOT"'/bin/omarchy-capture-screenrecording --stop-recording >/dev/null 2>&1
   ' >/dev/null 2>&1 < /dev/null &
   toggle_screenrecording_indicator
 
@@ -1214,6 +1235,27 @@ screenrecording_active() {
 }
 
 if screenrecording_active; then
+  STOPPED_DELIBERATELY="true"
+  stop_screenrecording
+elif [[ -f $BUNDLE_FILE ]]; then
+  # THE RECORDER IS GONE AND THE TAKE WAS NEVER FINISHED.
+  #
+  # This branch did not exist, and its absence is how a recording gets lost. The
+  # dispatch asked only "is gpu-screen-recorder running?" -- so anything that ended gsr
+  # without going through this script left a bundle with media in it, no streams in
+  # capture.json, no editor, and a marker nobody cleared. `--stop-recording` then exited
+  # 1 and finalized nothing, which made the take unrecoverable except by running
+  # finalize by hand.
+  #
+  # The bar's own recording indicator does exactly that: it is stock Omarchy, shared
+  # with every recorder on the system, and its stop is
+  # `pkill -SIGINT -f "^gpu-screen-recorder"`. A user clicking the obvious button lost
+  # their recording (2026-09-05, 09:53). Asking them to patch a shell plugin instead is
+  # not a fix -- a take has to survive being stopped by anything.
+  #
+  # stop_screenrecording copes with a dead recorder: every wait falls through and it
+  # goes straight to finalize.
+  trail "recovering: gpu-screen-recorder is gone but the take was never finalized"
   STOPPED_DELIBERATELY="true"
   stop_screenrecording
 elif [[ $STOP_RECORDING == "true" ]]; then

@@ -18,6 +18,15 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _lift_the_suite_wide_suppression(monkeypatch):
+    """conftest sets OMARCHY_STUDIO_NO_REVEAL for every test, so that a run cannot open
+    a window on the machine running it. This module is the one that tests reveal()
+    itself, so it has to look at the real behaviour -- otherwise every case here would
+    pass trivially by returning "suppressed"."""
+    monkeypatch.delenv("OMARCHY_STUDIO_NO_REVEAL", raising=False)
+
 from omarchy_studio import reveal as R
 
 FLEA = "com.thisisgm.flea.desktop"
@@ -120,3 +129,22 @@ def test_the_owner_is_read_from_disk_not_asked_over_the_bus(tmp_path, monkeypatc
 def test_a_missing_service_file_is_not_an_error(monkeypatch):
     monkeypatch.setattr(R, "_SERVICE_FILES", ("/nonexistent/x.service",))
     assert R._filemanager1_binary() == ""
+
+
+def test_reveal_can_be_suppressed_so_a_test_run_opens_no_window(tmp_path, monkeypatch):
+    """The suite sets this in conftest. Without it a full run opened the real file
+    manager and left it on screen, plus an orphaned xdg-open behind it."""
+    from omarchy_studio import reveal as R
+
+    called = []
+    monkeypatch.setattr(R, "_spawn", lambda argv: called.append(argv))
+    f = tmp_path / "out.mp4"
+    f.write_text("x")
+
+    monkeypatch.setenv("OMARCHY_STUDIO_NO_REVEAL", "1")
+    assert R.reveal(f) == "suppressed"
+    assert called == [], "nothing may be spawned while suppressed"
+
+    # and the guard is opt-in: unset, it behaves as before
+    monkeypatch.delenv("OMARCHY_STUDIO_NO_REVEAL")
+    assert R.reveal(f) != "suppressed"

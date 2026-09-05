@@ -24,6 +24,7 @@ perfect framing in the wrong one.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -94,6 +95,14 @@ def reveal(path: str | Path) -> str:
     Never raises: this runs after a render has already succeeded, and failing to
     open a window must not turn a finished export into an error.
     """
+    # An escape hatch that the test suite sets, because this function's whole job is a
+    # side effect on someone's desktop. Running the suite opened a real file-manager
+    # window -- Flea, on workspace 2 -- and left it there along with an orphaned
+    # xdg-open. A test must not reach out of the process and put a window in front of
+    # the person running it.
+    if os.environ.get("OMARCHY_STUDIO_NO_REVEAL"):
+        return "suppressed"
+
     p = Path(path)
     folder = p if p.is_dir() else p.parent
     try:

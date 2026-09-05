@@ -481,6 +481,25 @@ self_view_exclusion_available() {
 #            sits inside the capture; portal backend (whole monitor only: a region that
 #            leaves no room is not a thing, --match-monitor turns a full one into monitor:*).
 # off     -- neither; the camera is still recorded, there is just no live preview.
+# The bar, as absolute logical rectangles -- one per reserved edge that is non-zero.
+#
+# WHY THE RECORDER WORKS THIS OUT. The bar carries a recording indicator, and clicking
+# it is how a take gets stopped. That click is real and lands in the recording, so
+# auto-zoom would push in on the stop button as the final thing the viewer sees. The
+# compositor knows where its own reserved area is; nothing downstream can work it out
+# afterwards, so it is recorded now. See events.map_clicks.
+chrome_rects_for_monitor() {
+  hyprctl monitors -j 2>/dev/null | jq -r --arg n "$1" '
+    .[] | select(.name == $n)
+    | (.width / .scale | floor) as $w | (.height / .scale | floor) as $h
+    | .reserved as $r
+    | [ (if $r[0] > 0 then "\($w)x\($r[0])+\(.x)+\(.y)" else empty end),
+        (if $r[1] > 0 then "\($w)x\($r[1])+\(.x)+\(.y + $h - $r[1])" else empty end),
+        (if $r[2] > 0 then "\($r[2])x\($h)+\(.x)+\(.y)" else empty end),
+        (if $r[3] > 0 then "\($r[3])x\($h)+\(.x + $w - $r[3])+\(.y)" else empty end) ]
+    | .[]' 2>/dev/null
+}
+
 # The full logical rectangle of the monitor a capture sits on, as WxH+X+Y.
 monitor_logical_geometry() {
   hyprctl monitors -j 2>/dev/null | jq -r --arg n "$MONITOR_NAME" \
@@ -714,6 +733,7 @@ start_screenrecording() {
     --scale "$MONITOR_SCALE" \
     ${SOURCE_LOGICAL:+--source-logical "$SOURCE_LOGICAL"} \
     $([[ $isolated == "true" ]] && echo --window-isolated) \
+    $(chrome_rects_for_monitor "$MONITOR_NAME" | sed 's/^/--chrome-rect /') \
     "${burned_in_flag[@]}" "${camera_placement_args[@]}") || {
     trail "begin: FAILED to create the bundle"
     omarchy-notification-send -u critical -t 3000 "Screen recording error" "Could not create the recording bundle"

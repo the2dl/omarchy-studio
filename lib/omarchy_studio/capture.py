@@ -372,6 +372,7 @@ def begin(
     camera_shape: str = "circle",
     source_logical: dict | None = None,
     window_isolated: bool = False,
+    chrome_rects: list | None = None,
 ) -> Bundle:
     """Lay out the bundle and record everything that is only knowable now.
 
@@ -410,6 +411,7 @@ def begin(
         camera_burned_in=bool(camera_burned_in),
         source_crop=source_crop,
         window_isolated=bool(window_isolated),
+        chrome_rects=list(chrome_rects or []),
     )
     bundle = project.create(Path(root), capture)
     if camera_rect:
@@ -522,6 +524,12 @@ def main(argv: list[str] | None = None) -> int:
                         "A region that needs a live self-view records the whole monitor "
                         "through the portal -- the only backend that can hide the "
                         "bubble -- and the renderer crops back to --logical.")
+    b.add_argument("--chrome-rect", action="append", metavar="WxH+X+Y",
+                   help="an absolute logical rectangle that is desktop chrome rather "
+                        "than content -- the bar. Clicks landing in one are dropped "
+                        "before they can steer the zoom: the bar carries the stop "
+                        "control, and a take should not end by zooming into the button "
+                        "that ended it. Repeatable.")
     b.add_argument("--window-isolated", action="store_true",
                    help="the stream is one window's own surface tree, captured through "
                         "hyprland_toplevel_export_v1 rather than as a rectangle of the "
@@ -624,6 +632,7 @@ def main(argv: list[str] | None = None) -> int:
             camera_shape=a.camera_shape,
             source_logical=parse_geometry(a.source_logical) if a.source_logical else None,
             window_isolated=a.window_isolated,
+            chrome_rects=[parse_geometry(r) for r in (a.chrome_rect or [])],
         )
         # The grid gsr actually ENCODES, which is the stream, not the frame. When the
         # capture records more than it shows -- a region that needs a self-view, a

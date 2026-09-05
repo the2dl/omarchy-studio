@@ -140,13 +140,28 @@ ApplicationWindow {
             // The accent file rather than the currentcolor one: Qt's SVG renderer has
             // no CSS inheritance, so stroke="currentColor" would resolve to black. The
             // colour is baked in and is Theme.accent by construction.
-            Image {
-                source: "assets/mark-small-accent.svg"
-                sourceSize.width: 40      // 2x, to stay crisp on a HiDPI display
-                sourceSize.height: 40
-                width: 20
-                height: 20
-                smooth: true
+            // An Item the layout sizes, with the Image filling it.
+            //
+            // Both simpler forms failed: plain `width` on an Image inside a RowLayout
+            // is ignored (qmllint says so as Quick.layout-positioning), and
+            // Layout.preferredWidth did not override the implicit size that sourceSize
+            // gives an Image either. Measured both times -- the mark rendered at its
+            // 40px sourceSize and sat 8px right of the rail beneath it.
+            Item {
+                readonly property int size: 20
+                Layout.preferredWidth: size
+                Layout.preferredHeight: size
+                // Centred over the tool rail below rather than merely left-aligned:
+                // the rail's icons sit at railWidth/2 and the bar's content starts a
+                // pad in. Computed, so it survives a change to either constant.
+                Layout.leftMargin: Style.railWidth / 2 - Style.pad - size / 2
+                Image {
+                    anchors.fill: parent
+                    source: "assets/mark-small-accent.svg"
+                    sourceSize.width: parent.size * 2   // 2x for a HiDPI display
+                    sourceSize.height: parent.size * 2
+                    smooth: true
+                }
             }
             Text {
                 text: app.st.name || "loading…"

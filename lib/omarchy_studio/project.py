@@ -117,6 +117,11 @@ class Capture:
     # was drawn over the window is in these frames, and the frame followed the window
     # without needing a track -- so `follow` has nothing to offer such a bundle.
     window_isolated: bool = False
+    # Absolute logical rectangles that are DESKTOP CHROME rather than content -- the
+    # bar, principally. Recorded at begin time because the compositor knows it then and
+    # nothing downstream can work it out later. A click landing in one of these is a
+    # click on the recorder's own controls, not on the thing being demonstrated.
+    chrome_rects: list = field(default_factory=list)
 
     @property
     def canvas(self) -> Canvas:

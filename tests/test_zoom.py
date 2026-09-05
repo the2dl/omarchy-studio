@@ -258,3 +258,54 @@ def test_the_graph_survives_being_passed_as_a_file(tmp_path):
 
     r = run_graph(graph, tmp_path, inputs=[SRC], frames=1)
     assert r.returncode == 0, r.stderr[-3000:]
+
+
+# --- clicks on the bar are not content ----------------------------------------
+
+
+def _cap_with_chrome(chrome):
+    from omarchy_studio.project import Capture, Stream
+    return Capture(
+        screen=Stream(path="s.mp4", width=2560, height=1440, fps_num=60, fps_den=1,
+                      anchor_us=0),
+        logical_geometry={"x": 0, "y": 0, "width": 2560, "height": 1440},
+        physical_geometry={"x": 0, "y": 0, "width": 2560, "height": 1440},
+        monitor_scale=1.0,
+        chrome_rects=chrome,
+    )
+
+
+def test_a_click_on_the_bar_never_steers_the_zoom():
+    """The bar carries the recording indicator, and clicking it is how a take gets
+    stopped. That click is real and lands in the recording, so without this the video
+    ends by zooming into the button that ended it."""
+    from omarchy_studio.events import Click, map_clicks
+    from omarchy_studio.timebase import Timebase
+
+    cap = _cap_with_chrome([{"x": 0, "y": 1406, "width": 2560, "height": 34}])
+    tb = Timebase(60, 1)
+    clicks = [Click(t_us=1_000_000, button="left", x=800, y=400),      # content
+              Click(t_us=2_000_000, button="left", x=1200, y=1420)]    # the bar
+    mapped = map_clicks(clicks, cap, tb)
+    assert len(mapped) == 1, "the bar click should not survive mapping"
+    assert mapped[0].px == 800
+
+
+def test_without_chrome_recorded_nothing_is_dropped():
+    """Older bundles carry no chrome_rects, and must behave exactly as before."""
+    from omarchy_studio.events import Click, map_clicks
+    from omarchy_studio.timebase import Timebase
+
+    cap = _cap_with_chrome([])
+    clicks = [Click(t_us=1_000_000, button="left", x=800, y=400),
+              Click(t_us=2_000_000, button="left", x=1200, y=1420)]
+    assert len(map_clicks(clicks, cap, Timebase(60, 1))) == 2
+
+
+def test_a_malformed_chrome_rect_is_ignored_not_fatal():
+    from omarchy_studio.events import Click, map_clicks
+    from omarchy_studio.timebase import Timebase
+
+    cap = _cap_with_chrome([{"nonsense": 1}, {"x": "a", "y": 0, "width": 5, "height": 5}])
+    clicks = [Click(t_us=1_000_000, button="left", x=800, y=400)]
+    assert len(map_clicks(clicks, cap, Timebase(60, 1))) == 1

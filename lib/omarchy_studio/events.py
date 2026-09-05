@@ -497,8 +497,27 @@ def map_clicks(
         )
     latency_us = round(capture.calibration_c_ms * 1000.0)
 
+    # Clicks on desktop chrome are dropped here, at the one place raw clicks become
+    # canvas coordinates, so the editor and the export cannot disagree about it.
+    #
+    # The case this exists for: the bar carries a recording indicator, and clicking it
+    # is how a take is stopped. That click is real, it lands in the recording, and
+    # auto-zoom would then push in on the stop button as the last thing the viewer
+    # sees. Nobody wants a video that ends by zooming into the button that ended it.
+    chrome = []
+    for r in (capture.chrome_rects or []):
+        try:
+            chrome.append((int(r["x"]), int(r["y"]), int(r["width"]), int(r["height"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    def is_chrome(cx: int, cy: int) -> bool:
+        return any(x <= cx < x + w and y <= cy < y + h for x, y, w, h in chrome)
+
     out: list[MappedClick] = []
     for c in clicks:
+        if is_chrome(c.x, c.y):
+            continue
         t_rel_us = c.t_us - screen.anchor_us + latency_us
         frame = tb.to_frame(t_rel_us / 1e6) if t_rel_us > 0 else 0
         # Both spaces are logical, so this is a pure ratio -- monitor_scale cancels out

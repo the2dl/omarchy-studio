@@ -81,6 +81,8 @@ class RenderPlan:
     maps: list[str]
     output_args: list[str]
     total_frames: int
+    # The size the graph DELIVERS, which is the export size -- not the capture's.
+    # The composite is built at the delivered size; see `composite_canvas`.
     canvas: Canvas
     head_trim_seconds: float = 0.0
     # One argv group per ffmpeg input, in index order; `inputs` is this flattened.
@@ -269,6 +271,17 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
         g.add(f"{cur}{zf}[zoomed]")
         cur = "[zoomed]"
 
+    # From here down the composite is built at the size it will be delivered at, not at
+    # the master's. The zoom above ran at full resolution, which is the only stage that
+    # needed it. See `composite_canvas`.
+    comp, pixel_scale = composite_canvas(canvas, edit, for_proxy=for_proxy)
+    if comp != canvas and not edit.backdrop.enabled:
+        # With a backdrop, `_backdrop`'s inset scale IS this downscale and doing it here
+        # too would resample the picture twice. Without one there is nothing else to do
+        # it, so it happens here -- still exactly once.
+        g.add(f"{cur}scale={comp.width}:{comp.height}:flags=lanczos[fitted]")
+        cur = "[fitted]"
+
     layer_list = _layer_list(bundle, registry)
 
     # One camera, several segments: ffmpeg consumes a labelled pad exactly once, so N
@@ -281,14 +294,14 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
         registry.bind_fanout("camera", outs)
 
     if edit.backdrop.enabled:
-        cur = _backdrop(g, cur, canvas, tb, edit.backdrop)
+        cur = _backdrop(g, cur, comp, tb, edit.backdrop, pixel_scale)
     elif layer_list:
         g.add(f"{cur}format=rgba[canvas]")
         cur = "[canvas]"
 
     for layer in layer_list:
         frag = layers_mod.compile_layer(
-            layer, canvas, cutmap, tb, registry, label_in=cur
+            layer, comp, cutmap, tb, registry, label_in=cur, pixel_scale=pixel_scale
         )
         if frag is None:
             continue
@@ -305,19 +318,12 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
     for orphan in registry.unconsumed("camera"):
         g.add(f"{orphan}nullsink")
 
-    tail = "format=yuv420p"
-    if for_proxy and canvas.width > 1920:
-        tail = "scale=1920:-2:flags=bicubic," + tail
-    elif not for_proxy:
-        # The export size, last thing before the encoder, so every stage above it -- the
-        # zoom especially -- composes at the master's full resolution and only the
-        # finished frame is resampled. lanczos rather than bicubic: this is the one
-        # downscale a viewer actually sees, and it is where text either stays crisp or
-        # does not.
-        out_h = export_height(bundle.edit.export_preset, canvas)
-        if out_h is not None:
-            tail = f"scale=-2:{out_h}:flags=lanczos," + tail
-    g.add(f"{cur}{tail}[vout]")
+    # No scale here any more. The frame arrived at the delivered size, resampled exactly
+    # once on the way -- by `_backdrop`'s inset scale, or by the `fitted` scale above it.
+    # This used to be where the whole 14.7-megapixel composite was squeezed down to the
+    # export height, with a comment claiming it was the only resample in the graph. It
+    # was not: `_backdrop` has always scaled the inset as well, so text went through two.
+    g.add(f"{cur}format=yuv420p[vout]")
 
     maps = ["-map", "[vout]"]
     if has_audio:
@@ -359,7 +365,7 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
         maps=maps,
         output_args=_output_args(cutmap.output_frames, has_audio, for_proxy=for_proxy),
         total_frames=cutmap.output_frames,
-        canvas=canvas,
+        canvas=comp,
         head_trim_seconds=head_trim,
         input_specs=registry.inputs,
     )
@@ -645,7 +651,12 @@ def _ground(bg: backgrounds.Background, W: int, H: int, rate: str) -> str:
 
 
 def _backdrop(
-    g: _Graph, cur: str, canvas: Canvas, tb: Timebase, bd: BackdropSettings
+    g: _Graph,
+    cur: str,
+    canvas: Canvas,
+    tb: Timebase,
+    bd: BackdropSettings,
+    pixel_scale: float = 1.0,
 ) -> str:
     """Inset the video on a coloured ground, with rounded corners and a drop shadow.
 
@@ -666,7 +677,13 @@ def _backdrop(
 
     g.add(_ground(backgrounds.resolve(bd, canvas), W, H, rate) + ",format=rgba[bgi]")
 
-    g.add(f"{cur}scale={dw}:{dh}:flags=bicubic,format=rgba[inset]")
+    # THE one downscale, and lanczos because of it. When the export composites at the
+    # finished size this scale takes the zoomed master straight to the inset -- 5120x2880
+    # to 2444x1324 in one step -- instead of resampling to the export height and then
+    # bicubic-ing again to make room for the padding. The old comment on the tail claimed
+    # "only the finished frame is resampled"; it was never true with a backdrop on,
+    # because this line was always here.
+    g.add(f"{cur}scale={dw}:{dh}:flags=lanczos,format=rgba[inset]")
     g.add(
         f"color=c=black:s={dw}x{dh}:r=1:d=1,format=gray,"
         f"geq=lum='{_rounded_rect_mask(dw, dh, radius)}'[maskraw]"
@@ -676,7 +693,9 @@ def _backdrop(
     g.add(f"[rounded]pad={W}:{H}:{px}:{py}:color=black@0.0,format=rgba[content]")
 
     if bd.shadow:
-        m = max(radius * 2, 48)
+        # The 48 floor is in pixels, so it has to follow the composite canvas or a
+        # 1440p composite gets a relatively fatter shadow than the 5K one did.
+        m = max(radius * 2, int(round(48 * pixel_scale)))
         g.add(
             f"[mask_b]pad={dw + 2 * m}:{dh + 2 * m}:{m}:{m}:color=black,"
             f"gblur=sigma={m / 3.0:.3f}:steps=3[shadow_a]"
@@ -749,6 +768,47 @@ def _declick_chain() -> str:
         return "afftdn=nr=12:nf=-40:tn=1"
     model = str(RNNOISE_MODEL).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
     return f"arnndn=m='{model}',afftdn=nr=12:nf=-40:tn=1"
+
+
+# The draft the editor scrubs. Wide enough to read, small enough to build fast.
+PROXY_WIDTH = 1920
+
+
+def composite_canvas(canvas: Canvas, edit, *, for_proxy: bool) -> tuple[Canvas, float]:
+    """The canvas the composite is BUILT on, and its scale against the capture canvas.
+
+    Everything above the zoom -- the cursor, the zoom itself -- stays at the master's
+    resolution, because `perspective` outputs at its input size and so needs at least
+    `export_height * deepest_zoom` pixels to keep the deepest hold at 1:1. Everything
+    below it does not: the ground is a band-limited gradient, the shadow is a gblur whose
+    sigma is proportional to the radius, and the corner mask is analytic coverage. All
+    three are resolution-independent by construction, so building them at 14.7 megapixels
+    and then throwing three quarters of it away buys nothing at all.
+
+    It cost 30 of 88 seconds on a 17-second export. Measured, on a 5120x2880 master:
+
+        decode + downscale + encode, nothing else      4s   <- the floor
+        full export, x264 preset medium               88s
+        full export, x264 preset ultrafast            89s   <- the encoder is not it
+        backdrop disabled                             50s
+
+    Not a quality tradeoff -- a quality IMPROVEMENT, which is the part I had backwards.
+    See the scale in `_backdrop`.
+    """
+    if for_proxy:
+        if canvas.width <= PROXY_WIDTH:
+            return canvas, 1.0
+        w = PROXY_WIDTH
+        h = ((round(canvas.height * w / canvas.width)) // 2) * 2
+    else:
+        out_h = export_height(edit.export_preset, canvas)
+        if out_h is None:
+            return canvas, 1.0
+        h = out_h
+        w = ((round(canvas.width * h / canvas.height)) // 2) * 2
+    if w < 2 or h < 2:
+        return canvas, 1.0
+    return Canvas(w, h), w / canvas.width
 
 
 # Heights for the names in project.EXPORT_PRESETS. `native` has no entry: it is the

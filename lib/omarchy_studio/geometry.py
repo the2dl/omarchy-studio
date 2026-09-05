@@ -231,10 +231,19 @@ def qml_blur(preset: str) -> dict:
     }
 
 
-def ffmpeg_blur(preset: str) -> str:
+def ffmpeg_blur(preset: str, pixel_scale: float = 1.0) -> str:
     """gblur, not boxblur -- a Gaussian is the same kernel family as Qt's, so preview and
-    export stay comparable across presets. boxblur diverges badly at high radius."""
-    return f"gblur=sigma={_fmt(blur_sigma(preset))}:steps=3"
+    export stay comparable across presets. boxblur diverges badly at high radius.
+
+    `pixel_scale` is the composite canvas over the capture canvas, and it exists because
+    this sigma is in PIXELS while `pixelate_block_px` is a fraction of canvas width. When
+    the export composites at 1440p instead of the 5K master, an unscaled sigma would blur
+    twice as much of the picture as it used to -- and, worse, the 1080p proxy and the
+    1440p export would disagree about how much a redaction hides, which is the exact
+    class of bug `pixelate_block_px` was written to prevent. Scaling here keeps the
+    finished frame identical to what a master-resolution composite produced.
+    """
+    return f"gblur=sigma={_fmt(blur_sigma(preset) * pixel_scale)}:steps=3"
 
 
 def pixelate_block_px(preset: str, canvas: Canvas) -> int:

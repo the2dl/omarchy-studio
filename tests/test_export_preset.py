@@ -78,14 +78,50 @@ def _graph(tmp_path, preset: str, *, width: int, height: int) -> str:
 
 
 @needs_ffmpeg
-def test_the_downscale_is_the_last_thing_before_the_encoder(tmp_path):
-    """Everything above it -- the zoom especially -- composes at full resolution.
+def test_the_picture_is_resampled_exactly_once(tmp_path):
+    """The invariant that matters for text is ONE resample, not a late one.
 
-    Scaling earlier would magnify an already-resampled frame, which is the whole reason
-    capturing native is worth it.
+    This used to assert the downscale was the last filter before the encoder, on the
+    theory that composing at the master's resolution and squeezing at the end was the
+    way to keep text crisp. It was not even true: `_backdrop` scales the inset as well,
+    so with a backdrop on -- the default -- every frame went through two resamples.
+    Composing at the delivered size means the one remaining scale takes the zoomed
+    master straight to its final size.
     """
     g = _graph(tmp_path, "1080p", width=3840, height=2160)
-    assert "scale=-2:1080:flags=lanczos,format=yuv420p[vout]" in g
+    assert g.count("lanczos") == 1, g
+    assert "scale=1920:1080:flags=lanczos" in g
+    assert "format=yuv420p[vout]" in g
+    # and nothing rescales it afterwards
+    assert "scale" not in g.split("[fitted]")[-1]
+
+
+@needs_ffmpeg
+def test_the_backdrop_inset_is_the_only_scale_when_there_is_a_backdrop(tmp_path):
+    """With a backdrop the inset scale IS the downscale; adding another would resample
+    the picture twice, which is the bug this replaced."""
+    root = tmp_path / "bd"
+    synthetic.make_bundle(root, seconds=1.0, width=3840, height=2160, camera=False)
+    b = Bundle(root)
+    b.edit.export_preset = "1080p"
+    b.edit.backdrop.enabled = True
+    g = render.build_graph(b).graph
+    assert "[fitted]" not in g, "a second downscale crept back in"
+    assert g.count("flags=lanczos") == 1, g
+
+
+@needs_ffmpeg
+def test_a_redaction_hides_the_same_pixels_at_any_composite_size(tmp_path):
+    """The blur sigma is in pixels while the composite canvas is not, so it has to be
+    scaled or a 1440p composite blurs twice as much of the frame as the 5K master did --
+    and the proxy and the export would disagree about what a redaction hides."""
+    from omarchy_studio.geometry import ffmpeg_blur
+
+    full = ffmpeg_blur("strong", 1.0)
+    half = ffmpeg_blur("strong", 0.5)
+    assert full != half
+    sig = lambda f: float(f.split("sigma=")[1].split(":")[0])
+    assert abs(sig(half) * 2 - sig(full)) < 1e-6
 
 
 @needs_ffmpeg

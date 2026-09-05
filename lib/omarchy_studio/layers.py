@@ -351,6 +351,7 @@ def compile_layer(
     inputs: InputRegistry,
     *,
     label_in: str | None = None,
+    pixel_scale: float = 1.0,
 ) -> LayerFragment | None:
     """Compile one layer into a filtergraph fragment.
 
@@ -410,7 +411,7 @@ def compile_layer(
         return None
 
     if layer.type in _REDACT_TYPES:
-        return _compile_redaction(layer, name, canvas, gate, lin)
+        return _compile_redaction(layer, name, canvas, gate, lin, pixel_scale)
     return _compile_overlay(layer, name, canvas, cutmap, tb, inputs, gate, ramp_span, lin)
 
 
@@ -661,7 +662,8 @@ def _tile_webcam(
 
 
 def _compile_redaction(
-    layer: Layer, name: str, canvas: Canvas, gate: str, lin: str
+    layer: Layer, name: str, canvas: Canvas, gate: str, lin: str,
+    pixel_scale: float = 1.0,
 ) -> LayerFragment | None:
     # Clamped, unlike an overlay: `crop` outside the frame is a hard error.
     rect = layer.placement.resolve(canvas).clamped_to(canvas).to_even()
@@ -677,7 +679,7 @@ def _compile_redaction(
     if layer.type == "blur":
         # gblur, not boxblur: the same Gaussian kernel family as Qt's MultiEffect, so
         # preview and export track each other across presets.
-        op = ffmpeg_blur(preset)
+        op = ffmpeg_blur(preset, pixel_scale)
     else:
         # Pixelate rides the SAME preset ladder as blur. It used to take a continuous
         # `block` prop, which is a slider by another name -- and it is the path that

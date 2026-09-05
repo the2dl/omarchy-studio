@@ -100,6 +100,14 @@ static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cond = PTHREAD_COND_INITIALIZER;
 static int enc_running;
 static int64_t dropped;
+
+// A FIFO of buffer indices, not a scan for "the first one marked FILLED".
+//
+// Scanning by array index hands the encoder whichever buffer sits lowest in the
+// array, which is arrival order only by accident. It reordered frames within a few
+// hundred milliseconds and the muxer rejected the take outright: "Application provided
+// invalid, non monotonically increasing dts to muxer in stream 0: 2560 >= 2304".
+static int q[NBUF], qhead, qtail, qcount;
 static int64_t frames_in, frames_out;
 static int64_t first_frame_mono_us, first_frame_real_us, frame_mono_us, last_pts = -1;
 static int have_first;
@@ -167,14 +175,13 @@ static void *encoder_main(void *u) {
     (void)u;
     for (;;) {
         pthread_mutex_lock(&q_lock);
-        int i = -1;
-        while (i < 0) {
-            for (int k = 0; k < nbufs; k++)
-                if (bufs[k].state == B_FILLED) { i = k; break; }
-            if (i >= 0) break;
+        while (qcount == 0) {
             if (!enc_running) { pthread_mutex_unlock(&q_lock); return NULL; }
             pthread_cond_wait(&q_cond, &q_lock);
         }
+        int i = q[qhead];
+        qhead = (qhead + 1) % NBUF;
+        qcount--;
         bufs[i].state = B_ENCODING;
         int64_t pts = bufs[i].pts;
         pthread_mutex_unlock(&q_lock);
@@ -197,12 +204,30 @@ static int hand_off(int filled, int64_t pts) {
     if (filled >= 0) {
         bufs[filled].pts = pts;
         bufs[filled].state = B_FILLED;
+        q[qtail] = filled;
+        qtail = (qtail + 1) % NBUF;
+        qcount++;
         pthread_cond_broadcast(&q_cond);
     }
+    // Backpressure, not a retry loop. Asking the compositor for another frame while
+    // every buffer is busy and immediately throwing it away spun hot -- 41k "drops"
+    // in six seconds, which was the retry rate, not a frame rate. Waiting for a
+    // buffer means the next frame is simply not REQUESTED until there is somewhere to
+    // put it, so capture paces itself to the encoder.
     int next = -1;
-    for (int k = 0; k < nbufs; k++)
-        if (bufs[k].state == B_FREE) { next = k; bufs[k].state = B_CAPTURING; break; }
-    if (next < 0) dropped++;
+    for (;;) {
+        for (int k = 0; k < nbufs; k++)
+            if (bufs[k].state == B_FREE) { next = k; bufs[k].state = B_CAPTURING; break; }
+        if (next >= 0 || stop_now) break;
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 100 * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+        if (pthread_cond_timedwait(&q_cond, &q_lock, &deadline) == ETIMEDOUT) {
+            dropped++;      // the encoder is wedged, not merely busy
+            break;
+        }
+    }
     pthread_mutex_unlock(&q_lock);
     return next;
 }
@@ -604,9 +629,14 @@ int main(int argc, char **argv) {
 
     if (o_ts && have_first) {
         // gsr's two-column sidecar, read by omarchy_studio.capture.read_gsr_ts.
+        // gsr's exact layout: a header naming the columns, then one tab-separated
+        // row. capture.read_gsr_ts skips the header and wants both numbers on ONE
+        // line -- two lines of one number each parse to nothing and the anchor is
+        // lost, which puts every event track at the wrong offset.
         FILE *f = fopen(o_ts, "w");
         if (f) {
-            fprintf(f, "%ld\n%ld\n", (long)first_frame_mono_us, (long)first_frame_real_us);
+            fprintf(f, "monotonic_microsec\trealtime_microsec\n%lld\t%lld\n",
+                    (long long)first_frame_mono_us, (long long)first_frame_real_us);
             fclose(f);
         }
     }

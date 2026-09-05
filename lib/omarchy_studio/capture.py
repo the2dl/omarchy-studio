@@ -371,6 +371,7 @@ def begin(
     camera_rect: dict | None = None,
     camera_shape: str = "circle",
     source_logical: dict | None = None,
+    window_isolated: bool = False,
 ) -> Bundle:
     """Lay out the bundle and record everything that is only knowable now.
 
@@ -408,6 +409,7 @@ def begin(
         calibration_c_ms=float(calibration_c_ms),
         camera_burned_in=bool(camera_burned_in),
         source_crop=source_crop,
+        window_isolated=bool(window_isolated),
     )
     bundle = project.create(Path(root), capture)
     if camera_rect:
@@ -520,6 +522,11 @@ def main(argv: list[str] | None = None) -> int:
                         "A region that needs a live self-view records the whole monitor "
                         "through the portal -- the only backend that can hide the "
                         "bubble -- and the renderer crops back to --logical.")
+    b.add_argument("--window-isolated", action="store_true",
+                   help="the stream is one window's own surface tree, captured through "
+                        "hyprland_toplevel_export_v1 rather than as a rectangle of the "
+                        "screen. Nothing drawn over the window is in it, and the frame "
+                        "followed the window without a track.")
     b.add_argument("--camera-shape", default="circle",
                    choices=["circle", "rounded", "rect"])
 
@@ -595,6 +602,9 @@ def main(argv: list[str] | None = None) -> int:
             # framing stays editable afterwards. Off means capture only what was
             # selected, which is what picking one window usually MEANS.
             "SETUP_FULL_MONITOR": "true" if cfg.get("full_monitor") else "false",
+            # Capture the window's own pixels rather than the rectangle it sits in.
+            # A different backend entirely -- see the recorder's capture_backend.
+            "SETUP_WINDOW_ISOLATED": "true" if cfg.get("window_isolated") else "false",
             "SETUP_COUNTDOWN_S": str(int(cfg.get("countdown") or 0)),
         }
         for k, v in emit.items():
@@ -613,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
             camera_rect=parse_geometry(a.camera_rect) if a.camera_rect else None,
             camera_shape=a.camera_shape,
             source_logical=parse_geometry(a.source_logical) if a.source_logical else None,
+            window_isolated=a.window_isolated,
         )
         # The grid gsr actually ENCODES, which is the stream, not the frame. When the
         # capture records more than it shows -- a region that needs a self-view, a

@@ -232,7 +232,7 @@ def config(target: str, mic: bool, desktop_audio: bool,
            camera: str, camera_device: str | None,
            countdown: int = 3, mic_device: str | None = None,
            camera_rect: Any = None, window: str | None = None,
-           full_monitor: bool = False) -> dict[str, Any]:
+           full_monitor: bool = False, window_isolated: bool = False) -> dict[str, Any]:
     """The one line bin/omarchy-capture-setup prints, validated.
 
     Keys are always all present (the consumer must not need .get defaults):
@@ -256,6 +256,15 @@ def config(target: str, mic: bool, desktop_audio: bool,
                      lets the recorder log where the window actually went, so the
                      framing stays a decision and not a snapshot. Null for a monitor
                      or a hand-drawn region: there is no window to follow.
+      window_isolated  capture ONLY the chosen window's own pixels, via Hyprland's
+                     toplevel-export protocol, rather than the rectangle it occupies.
+                     Anything drawn over that rectangle -- a dropdown, a notification,
+                     the compositor's dim behind a special workspace -- is absent, and
+                     the frame follows the window without a track. Requires a window
+                     target with an address; meaningless for an area, which has no
+                     toplevel to export, and for a display, which is not one window.
+                     Mutually exclusive with full_monitor: there is nothing to re-frame
+                     when the stream IS the window.
       full_monitor   record the whole display and carry the selection as a crop,
                      rather than capturing only the selected rectangle. False by
                      default and deliberately: picking one window is often a
@@ -287,8 +296,12 @@ def config(target: str, mic: bool, desktop_audio: bool,
     # constrained to exactly the shape Hyprland emits and nothing else.
     if window is not None and not re.match(r"^0x[0-9a-f]{1,16}$", window):
         raise ValueError(f"bad window address: {window!r}")
-    # Same rule as the address: only a region has an outside to keep.
-    full_monitor = bool(full_monitor) and parsed["kind"] == "region"
+    # Only a real window can be isolated -- an area is a rectangle by definition and
+    # has no toplevel behind it to export.
+    window_isolated = bool(window_isolated) and window is not None and parsed["kind"] == "region"
+    # Same rule as the address: only a region has an outside to keep. And isolating
+    # wins: the stream is the window, so there is no surrounding pixel to re-frame into.
+    full_monitor = bool(full_monitor) and parsed["kind"] == "region" and not window_isolated
     if window is not None and parsed["kind"] != "region":
         # Only a region target has an outside to re-frame into. Following a window
         # on a full-monitor or camera target is meaningless, and silently keeping
@@ -312,6 +325,7 @@ def config(target: str, mic: bool, desktop_audio: bool,
         "camera_device": camera_device,
         "camera_rect": rect,
         "window": window,
+        "window_isolated": window_isolated,
         "full_monitor": full_monitor,
         "countdown": countdown,
     }

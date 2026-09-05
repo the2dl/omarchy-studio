@@ -112,6 +112,11 @@ class Capture:
     # It also means the framing stops being a decision made before recording: the whole
     # monitor is on disk, so the crop can be moved afterwards.
     source_crop: dict = field(default_factory=dict)
+    # The stream IS the window's own surface tree, captured through Hyprland's
+    # toplevel-export protocol rather than as a rectangle of the screen. Nothing that
+    # was drawn over the window is in these frames, and the frame followed the window
+    # without needing a track -- so `follow` has nothing to offer such a bundle.
+    window_isolated: bool = False
 
     @property
     def canvas(self) -> Canvas:

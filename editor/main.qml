@@ -489,9 +489,9 @@ ApplicationWindow {
             } else if (preview.selectedZoomSegment
                        && preview.selectedZoomSegment.anchor >= 0) {
                 // A zoom is not a layer -- it is derived from the click track -- so it
-                // is deleted by remembering NOT to make it, keyed on the source frame of
-                // the click that starts it. Same key, Delete, because from the user's
-                // side it is the same gesture on the same kind of selected thing.
+                // is deleted by remembering not to make it: the bridge marks every
+                // click in the move. Same key, Delete, because from the user's side it
+                // is the same gesture on the same kind of selected thing.
                 Bridge.op("set_zoom", { suppress: preview.selectedZoomSegment.anchor })
                 preview.selectedZoomIndex = -1
             }

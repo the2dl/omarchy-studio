@@ -404,6 +404,32 @@ def click_events(bundle: Bundle) -> list[dict]:
     ]
 
 
+def _zoom_segments_now(bundle: Bundle) -> list:
+    """The zoom moves as they currently stand, for naming one of them.
+
+    Shares `zoom_track`'s tolerance for a bundle whose media is missing or still being
+    written: a delete must work in the editor regardless of whether the master can be
+    probed this second.
+    """
+    path = bundle.events_dir / "input.jsonl"
+    if not path.exists():
+        return []
+    try:
+        clicks = _events.map_clicks(
+            _events.read_clicks(path), bundle.capture, bundle.timebase
+        )
+    except _events.EventsError:
+        return []
+    total = _safe_source_frames(bundle)
+    if bundle.edit.cuts:
+        total = max(total, max(c.end for c in bundle.edit.cuts))
+    if clicks:
+        total = max(total, max(c.frame for c in clicks) + 1)
+    return _zoom.zoom_segments(
+        clicks, bundle.edit.zoom, bundle.timebase, CutMap(bundle.edit.cuts, total)
+    )
+
+
 def zoom_track(bundle: Bundle) -> dict:
     """Per-frame resolved zoom, as parallel arrays, sampled from the EXPORT's envelope.
 
@@ -819,14 +845,24 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         for key, ms in (("hold_frames", "hold_ms"), ("ease_frames", "ease_ms"), ("merge_gap_frames", "merge_gap_ms")):
             if ms in args:
                 setattr(z, key, max(1, tb.to_frame(float(args[ms]) / 1000.0)))
-        # Deleting one move, by the SOURCE frame of the click that starts it. Anything
-        # else -- its index, its output range -- moves under the user as soon as another
-        # edit lands, and they would find they had deleted a different zoom.
+        # Deleting one move. The UI names it by anchor; what is STORED is every click
+        # in it, keyed on source frame. Anything else -- an index, an output range --
+        # moves under the user as soon as another edit lands.
         if "suppress" in args:
+            # The UI names one move by its anchor; what gets stored is every CLICK in it.
+            # Storing the anchor alone was a bug: re-clustering after a merge-gap change
+            # left the anchor matching nothing and the deleted move reappeared.
             try:
-                z.suppressed = tuple(sorted(set(z.suppressed) | {int(args["suppress"])}))
+                anchor = int(args["suppress"])
             except (TypeError, ValueError):
-                pass
+                anchor = None
+            if anchor is not None:
+                doomed = {anchor}
+                for seg in _zoom_segments_now(bundle):
+                    if seg.anchor == anchor:
+                        doomed |= set(seg.sources)
+                        break
+                z.suppressed = tuple(sorted(set(z.suppressed) | doomed))
         if "restore" in args:
             if args["restore"] == "all":
                 z.suppressed = ()

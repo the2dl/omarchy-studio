@@ -407,3 +407,52 @@ def test_deleting_every_zoom_leaves_no_filter_at_all():
     gone = _segs([100, 600], suppressed=tuple(s.anchor for s in segs))
     assert gone == []
     assert zoom_filter(gone, Canvas(1920, 1080), Timebase(fps_num=30, fps_den=1)) == ""
+
+
+def test_a_deleted_zoom_stays_deleted_when_the_merge_gap_changes():
+    """The regression that made this click-keyed instead of cluster-keyed.
+
+    Suppression used to be stored as the anchor of a cluster. Changing merge_gap_frames
+    re-clusters the clicks, so the stored anchor stopped being any cluster's anchor,
+    matched nothing, and the move the user deleted came back. A delete that undeletes
+    itself is worse than no delete at all.
+    """
+    from omarchy_studio.project import ZoomSettings
+    from omarchy_studio.timebase import CutMap, Timebase
+    from omarchy_studio.zoom import zoom_segments
+
+    tb = Timebase(fps_num=30, fps_den=1)
+    # a burst that clusters as ONE move at gap=90 and as THREE at gap=10
+    burst = _clicks_at([500, 530, 560])
+    one = zoom_segments(burst, ZoomSettings(enabled=True, merge_gap_frames=90),
+                        tb, CutMap([], 2000))
+    assert len(one) == 1, "expected the burst to merge into a single move"
+
+    # delete it the way the bridge does: every click in the move, not just the anchor
+    dead = tuple(one[0].sources)
+    assert dead == (500, 530, 560)
+
+    for gap in (10, 30, 90, 200):
+        segs = zoom_segments(
+            burst, ZoomSettings(enabled=True, merge_gap_frames=gap, suppressed=dead),
+            tb, CutMap([], 2000),
+        )
+        assert segs == [], f"the deleted move came back at merge_gap_frames={gap}"
+
+
+def test_deleting_one_move_leaves_a_neighbouring_click_alone():
+    """Suppression is per click, so it must not spill onto clicks outside the move."""
+    from omarchy_studio.project import ZoomSettings
+    from omarchy_studio.timebase import CutMap, Timebase
+    from omarchy_studio.zoom import zoom_segments
+
+    tb = Timebase(fps_num=30, fps_den=1)
+    clicks = _clicks_at([500, 530, 1500])
+    segs = zoom_segments(clicks, ZoomSettings(enabled=True), tb, CutMap([], 3000))
+    assert len(segs) == 2
+    kept = zoom_segments(
+        clicks,
+        ZoomSettings(enabled=True, suppressed=tuple(segs[0].sources)),
+        tb, CutMap([], 3000),
+    )
+    assert [s.anchor for s in kept] == [1500]

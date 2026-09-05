@@ -188,8 +188,8 @@ ScrollView {
                 font.pixelSize: Theme.fsCaption
             }
             // Auto-zoom is derived from the clicks, so the only way to be rid of one
-            // move used to be to turn the whole feature off. This deletes just this one,
-            // keyed on the click that starts it so it stays deleted through later edits.
+            // move used to be to turn the whole feature off. This deletes just this one
+            // and it stays deleted through every later edit, including a merge-gap change.
             C.GhostButton {
                 text: "Delete"
                 visible: root.selSeg !== null && root.selSeg.anchor >= 0

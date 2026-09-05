@@ -222,11 +222,10 @@ Item {
                 continue
             }
             if (tr.scale[peak] > 1.0001)
-                // `anchor` names the move in the project -- the source frame of the
-                // click that starts it -- so the panel can delete THIS zoom and have it
-                // stay deleted through cuts and re-renders. It rides on the sample
-                // rather than being looked up by index, because this reconstruction and
-                // the segment list it came from must not be able to disagree.
+                // `anchor` names the move so the panel can delete THIS zoom; the bridge
+                // turns that name into the set of clicks to forget. It rides on the
+                // sample rather than being looked up by index, because this
+                // reconstruction and the segment list it came from must not disagree.
                 out.push({ start: tr.frames[start], end: tr.frames[i - 1] + 1,
                            scale: tr.scale[peak], x: tr.x[peak], y: tr.y[peak],
                            anchor: tr.anchor ? tr.anchor[peak] : -1 })

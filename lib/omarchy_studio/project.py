@@ -250,15 +250,16 @@ class ZoomSettings:
     ease_frames: int = 18  # ~0.3s
     # Clicks closer together than this merge into one zoom rather than pumping.
     merge_gap_frames: int = 90
-    # SOURCE frames of the clicks that begin moves the user deleted. Source, because a
+    # SOURCE frames of EVERY click inside a move the user deleted. Source, because a
     # zoom has to stay deleted across every other edit: its output range moves whenever a
     # cut is added ahead of it, and its index in the list moves whenever any earlier move
-    # appears or goes. The click track is part of the capture and never changes, so the
-    # frame a move started on is the one name that holds still.
+    # appears or goes. The click track is part of the capture and never changes.
     #
-    # A deleted move can come back if `merge_gap_frames` is changed enough to re-cluster
-    # the clicks -- the anchor stops being an anchor and matches nothing. That is the
-    # honest behaviour: the moves are not the same moves any more.
+    # Every click rather than just the one that starts the move, which is what this
+    # stored first and was a bug: changing `merge_gap_frames` re-clusters the clicks, so
+    # the stored anchor stopped being an anchor, matched nothing, and a deleted move came
+    # quietly back. "Do not zoom here" is a fact about the clicks; stored against the
+    # clicks, nothing downstream can rebuild a move out of clicks that are gone.
     suppressed: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:

@@ -84,6 +84,9 @@ class ZoomSegment:
     # whenever any earlier move appears or goes, so neither can address a zoom across an
     # edit. The click track is part of the capture and never changes.
     anchor: int = -1
+    # SOURCE frames of every click in the cluster, not just the first. Deleting the move
+    # suppresses all of them, which is what makes the deletion survive re-clustering.
+    sources: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.ease_in < 0 or self.ease_out < 0:
@@ -145,10 +148,21 @@ def zoom_segments(
     if settings.amount <= 1.0:
         return []
 
+    # Deleted moves are dropped HERE, one click at a time, before anything is clustered.
+    #
+    # The first version of this suppressed whole clusters by their anchor, and that was
+    # a bug: changing merge_gap_frames re-clusters the clicks, the anchor stops being an
+    # anchor, and a move the user deleted quietly came back. A deletion that undeletes
+    # itself is worse than no deletion. "Do not zoom here" is a fact about the CLICKS,
+    # so it is stored and applied against the clicks, and no amount of re-clustering can
+    # rebuild a move out of clicks that are not there.
+    suppressed = set(settings.suppressed)
     # (output frame, cx, cy, SOURCE frame) -- the source frame rides along so the
     # cluster can be named by something that survives a cut.
     pts: list[tuple[int, float, float, int]] = []
     for c in clicks:
+        if c.frame in suppressed:
+            continue
         out = cutmap.to_output(c.frame)
         if out is not None:
             pts.append((out, c.cx, c.cy, c.frame))
@@ -184,14 +198,8 @@ def zoom_segments(
     min_len = max(2, round(tb.fps * _MIN_SEGMENT_SECONDS))
     total = cutmap.output_frames
     segments: list[ZoomSegment] = []
-    suppressed = set(settings.suppressed)
     for c in clusters:
         anchor = min(p[3] for p in c)
-        if anchor in suppressed:
-            # Deleted by hand in the editor. Dropped here rather than filtered later so
-            # that nothing downstream -- the gate, the preview track, the filtergraph --
-            # ever learns this move existed.
-            continue
         start, end = _span(c, settings)
         end = min(end, total)
         if end - start < min_len:
@@ -211,6 +219,7 @@ def zoom_segments(
                 ease_in=ease_in,
                 ease_out=ease_out,
                 anchor=anchor,
+                sources=tuple(sorted(p[3] for p in c)),
             )
         )
     return segments

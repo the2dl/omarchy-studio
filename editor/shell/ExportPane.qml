@@ -89,11 +89,36 @@ Item {
         return (Math.abs(f - Math.round(f)) < 0.005 ? Math.round(f) : f.toFixed(2)) + " fps"
     }
 
-    Column {
-        x: 0
-        y: 0
-        width: parent.width
-        spacing: 0
+    // The pane's content is taller than the pane on a small screen: FORMAT through
+    // DESTINATION plus the render progress does not fit a 932px-tall editor, and a bare
+    // Column simply clipped the remainder away -- the Export button sat below the render
+    // line, off the bottom, unreachable. The visible symptom is not a layout glitch, it
+    // is "I cannot export again": there is no other control that starts a render, since
+    // the top bar's Export button only opens this pane.
+    //
+    // So the content scrolls and the action does NOT. Pinning the primary action is the
+    // whole point -- a button you cannot reach is the same as a button that is not there.
+    Flickable {
+        id: scroller
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: footer.top
+        clip: true
+        contentWidth: width
+        contentHeight: content.height
+        boundsBehavior: Flickable.StopAtBounds
+        QC.ScrollBar.vertical: QC.ScrollBar {
+            policy: scroller.contentHeight > scroller.height ? QC.ScrollBar.AsNeeded
+                                                             : QC.ScrollBar.AlwaysOff
+        }
+
+        Column {
+            id: content
+            x: 0
+            y: 0
+            width: scroller.width
+            spacing: 0
 
         // -- header (mock 1f: title + close on the card's own bar) ------------
         Item {
@@ -487,25 +512,42 @@ Item {
         }
 
         Item { width: 1; height: 16 }
+        }
+    }
 
-        // -- footer action -----------------------------------------------------
-        Item {
-            x: Style.pad
-            width: parent.width - 2 * Style.pad
-            height: 32
+    // -- footer action: pinned, outside the Flickable above ------------------
+    Item {
+        id: footer
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        height: 32 + 2 * Style.pad
 
-            C.PrimaryButton {
-                anchors.right: parent.right
-                visible: !root.running
-                text: root.ex.state === "error" ? "Retry" : "Export"
-                onClicked: Bridge.startExport(root.output !== "" ? root.output : null)
-            }
-            C.GhostButton {
-                anchors.right: parent.right
-                visible: root.running
-                text: "Cancel render"
-                onClicked: Bridge.cancelExport()
-            }
+        // Opaque, or the scrolled content reads through the action row.
+        Rectangle { anchors.fill: parent; color: Theme.bg }
+        Rectangle {
+            anchors.top: parent.top
+            width: parent.width; height: 1
+            color: Theme.hairline
+            // Only while there is something above to be cut off by it.
+            visible: scroller.contentHeight > scroller.height
+        }
+
+        C.PrimaryButton {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.pad
+            anchors.verticalCenter: parent.verticalCenter
+            visible: !root.running
+            text: root.ex.state === "error" ? "Retry" : "Export"
+            onClicked: Bridge.startExport(root.output !== "" ? root.output : null)
+        }
+        C.GhostButton {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.pad
+            anchors.verticalCenter: parent.verticalCenter
+            visible: root.running
+            text: "Cancel render"
+            onClicked: Bridge.cancelExport()
         }
     }
 

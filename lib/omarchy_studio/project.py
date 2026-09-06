@@ -405,6 +405,12 @@ class BackdropSettings:
     else). A catalogue id as the default would silently outrank both.
     """
 
+    # OFF on a bare Edit, ON for a real recording -- and the seam is deliberate.
+    # `capture.create` turns it on for a new bundle (see NEW_RECORDING_BACKDROP there),
+    # because "a recording should look composed out of the box" is a fact about
+    # RECORDINGS, not about this dataclass. Defaulting it here instead changed what
+    # every CLI caller and every test bundle composites, which is a much bigger promise
+    # than the one being made.
     enabled: bool = False
     background: str = backgrounds.CUSTOM
     color: str = "#1b1d24"

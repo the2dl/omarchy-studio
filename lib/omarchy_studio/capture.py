@@ -414,12 +414,42 @@ def begin(
         chrome_rects=list(chrome_rects or []),
     )
     bundle = project.create(Path(root), capture)
+    for field, value in NEW_RECORDING_BACKDROP.items():
+        setattr(bundle.edit.backdrop, field, value)
+    bundle.save_edit()
     if camera_rect:
         placement = camera_placement(camera_rect, logical_geometry, camera_shape)
         for field, value in placement.items():
             setattr(bundle.edit.webcam, field, value)
         bundle.save_edit()
     return bundle
+
+
+# What a NEW recording's backdrop starts as. A bare `Edit()` leaves it off -- that is
+# the neutral default for a CLI caller or a test -- but a take someone just recorded
+# should look composed the moment the editor opens, which is what every tool in this
+# class does and the single thing that makes a raw capture read as a finished video.
+#
+# It is also the only way either drop shadow is visible at all. A shadow needs
+# something to fall on; with no plate the picture and the camera sit straight on the
+# footage, and on a dark terminal -- luma 11 of 255, measured on a real take -- nothing
+# can show, at any strength.
+#
+# `fog`'s colours rather than its catalogue id: `background` has to stay CUSTOM,
+# because every edit.json written before the library existed carries only
+# color/gradient, and so does everything the headless editor writes today. A catalogue
+# id here would silently outrank both.
+#
+# Light rather than dark, which is the counter-intuitive part for a tool whose users
+# record dark terminals. Measured on a real take at 1080p: a dark plate leaves the
+# inset dissolving into its own background (plate luma 26, the shadow band 15) while
+# this one makes it pop (78 against 63). Neutral rather than warm so it imposes no
+# colour temperature on anyone's footage; `sandstone` is the warm one, one click away.
+NEW_RECORDING_BACKDROP = {
+    "enabled": True,
+    "color": "#dcd8d1",
+    "gradient": "#b4b0a9",
+}
 
 
 def _stream(root: Path, rel: str, anchor_us: int | None) -> Stream:

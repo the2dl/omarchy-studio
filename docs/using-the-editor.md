@@ -143,6 +143,11 @@ becomes one that goes away partway.
 A colour or gradient behind the video, with rounded corners and a drop shadow. The
 padding, corner radius and background are all adjustable.
 
+**A new recording opens with one on** — a light neutral plate. It is what makes a raw
+capture read as a finished video, and it is also the only way either drop shadow is
+visible: a shadow needs something to fall on, and dark terminal footage gives it
+nothing. Turn it off per recording if you want the bare capture.
+
 ### Export
 
 Pick a size — **1080p**, **1440p**, **4k** or **native** — and press Export. A preset is

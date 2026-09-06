@@ -308,10 +308,17 @@ def test_begin_cli_emits_the_native_sentinel_when_no_cap_applies(tmp_path, capsy
     assert out["PHYSICAL"] == "3200x1800+400+400"
 
 
-def test_capture_json_is_the_only_thing_begin_writes(tmp_path):
+def test_begin_writes_the_manifest_and_the_seeded_edit(tmp_path):
+    """`begin` used to write capture.json and nothing else. It now also seeds edit.json
+    with the backdrop a new recording opens with -- the same way it has always seeded a
+    camera placement when one was chosen. Seeding it is what keeps the choice visible in
+    the file and revertible, and confines it to NEW takes; making it a default on
+    `Edit()` instead would have changed how every existing bundle without an edit.json
+    renders, and what 21 test bundles composite."""
     root = tmp_path / "rec"
     capture.begin(root, logical_geometry=capture.parse_geometry("800x600+0+0"))
-    assert sorted(p.name for p in root.iterdir()) == ["assets", "capture.json", "events", "media"]
+    assert sorted(p.name for p in root.iterdir()) == [
+        "assets", "capture.json", "edit.json", "events", "media"]
     assert json.loads((root / "capture.json").read_text())["version"] == project.CAPTURE_VERSION
 
 
@@ -397,8 +404,11 @@ def test_begin_without_a_placement_leaves_the_defaults_alone(tmp_path):
         tmp_path / "rec",
         logical_geometry=capture.parse_geometry("2560x1440+0+0"),
     )
-    assert not bundle.edit_path.exists()   # nothing written where nothing was chosen
+    # edit.json exists now -- begin seeds the backdrop into it -- but nothing about the
+    # CAMERA was chosen here, so nothing about the camera may have moved.
     assert bundle.edit.webcam.x == project.WebcamSettings().x
+    assert bundle.edit.webcam.y == project.WebcamSettings().y
+    assert bundle.edit.webcam.shape == project.WebcamSettings().shape
 
 
 def test_every_bar_shape_maps_to_a_shape_the_export_can_draw():
@@ -611,3 +621,28 @@ def test_the_autostart_hook_is_a_no_op_when_the_plugin_is_loaded():
     # the cheap exit comes before anything that builds or reloads
     assert body.index("loaded && exit 0") < body.index("install.sh")
     assert "hyprctl -j plugin list" in src
+
+
+def test_a_new_recording_opens_with_a_backdrop(tmp_path):
+    """A take should look composed the moment the editor opens, and it is also the only
+    way either drop shadow is visible: a shadow needs something to fall on, and on a
+    dark terminal -- luma 11 of 255 on a real take -- nothing shows at any strength."""
+    from omarchy_studio import capture as C
+    from omarchy_studio.project import Bundle
+
+    root = tmp_path / "fresh"
+    C.begin(root, logical_geometry=C.parse_geometry("2560x1440+0+0"))
+    bd = Bundle(root).edit.backdrop
+    assert bd.enabled is True
+    assert bd.color == C.NEW_RECORDING_BACKDROP["color"]
+    assert bd.gradient == C.NEW_RECORDING_BACKDROP["gradient"]
+
+
+def test_a_bare_edit_still_has_no_backdrop():
+    """The neutral default for a CLI caller or a test bundle. Turning it on HERE instead
+    of at recording time changed what every one of those composites -- 21 tests, from
+    camera-alignment decodes to preview/export parity -- which is a far bigger promise
+    than the one being made."""
+    from omarchy_studio.project import Edit
+
+    assert Edit().backdrop.enabled is False

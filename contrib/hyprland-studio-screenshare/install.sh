@@ -31,14 +31,36 @@ need hyprpm "hyprpm -- ships with hyprland"
 need cmake "cmake -- the plugin's build, see hyprpm.toml"
 need g++ "base-devel"
 
-# Hyprland's plugin hooking is x86_64-only (CFunctionHook::hook returns false on
-# every other architecture), so the plugin builds here and then dies in init. Say so
-# rather than leaving someone to work out why an installed, enabled plugin never loads.
-if [[ $(uname -m) != x86_64 ]]; then
-  echo "note: Hyprland plugins only load on x86_64 -- this will build and install," >&2
-  echo "      but will not load on $(uname -m). The recorder handles its absence:" >&2
-  echo "      the self-view parks outside the capture, or is dropped." >&2
-fi
+# The plugin needs function hooking, and Hyprland's own is x86_64-ONLY:
+# CFunctionHook::hook() returns false outright on every other architecture. So the
+# three cases differ and each has to say something different.
+#
+#   x86_64            stock HyprlandAPI hooks, nothing to check.
+#   aarch64/arm64     the vendored funchook does the hooking instead (see
+#                     vendor/funchook/README.omarchy-studio.md), which wants a C
+#                     compiler, an assembler for prehook-arm64-gas.S and the SYSTEM
+#                     capstone. Checked here so a missing package is a named failure
+#                     rather than a cmake error from inside hyprpm's build output.
+#   anything else     funchook has no backend either, so this still builds, installs,
+#                     and then dies in init. Say so rather than leaving someone to
+#                     work out why an installed, enabled plugin never loads.
+case "$(uname -m)" in
+x86_64) ;;
+aarch64 | arm64)
+  need cc "base-devel -- compiles the vendored funchook on aarch64"
+  need pkg-config "pkgconf -- locates capstone"
+  pkg-config --exists capstone || {
+    echo "missing: capstone  (pacman -S capstone -- funchook's disassembler on aarch64)" >&2
+    exit 1
+  }
+  ;;
+*)
+  echo "note: Hyprland hooks only work on x86_64, and this plugin only carries a" >&2
+  echo "      funchook backend for aarch64 -- on $(uname -m) it will build and" >&2
+  echo "      install, but will not load. The recorder handles its absence: the" >&2
+  echo "      self-view parks outside the capture, or is dropped." >&2
+  ;;
+esac
 
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 STAGE=${OMARCHY_STUDIO_HYPRPM_STAGE:-"$HOME/.local/share/omarchy-studio/hyprpm/omarchy-studio-screenshare"}

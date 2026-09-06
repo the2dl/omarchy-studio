@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.27)
 project(omarchy-studio-screenshare
         DESCRIPTION "Exclude no_screen_share windows from screenshares instead of blacking them out"
         VERSION 1.0
-        LANGUAGES CXX C ASM)
+        LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,6 +27,12 @@ set_target_properties(omarchy-studio-screenshare PROPERTIES PREFIX "")
 # an AArch64 trampoline, relocates the displaced PC-relative instructions and flushes
 # the i-cache. See vendor/funchook/README.omarchy-studio.md.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    # Enabled HERE rather than in project(), so an x86-64 build needs neither a C
+    # compiler nor an assembler it would never use. Only the vendored funchook wants
+    # them, and only this branch builds it.
+    enable_language(C)
+    enable_language(ASM)
+
     pkg_check_modules(capstone REQUIRED IMPORTED_TARGET capstone)
 
     add_library(funchook_arm64 STATIC

@@ -91,6 +91,9 @@ somewhere in the middle of a build. Between them they want:
 
     sudo pacman -S --needed base-devel cmake rsync
 
+    # aarch64 only, for the screenshare plugin -- see "On aarch64" below
+    sudo pacman -S --needed capstone
+
 Everything else they link against is already on a machine running Hyprland.
 
 Neither is required and neither fails loudly, which is the point of listing what you
@@ -100,6 +103,40 @@ falls back on its own. Without the second, `no_screen_share` still works -- it i
 stock Hyprland -- but it paints black rectangles over excluded windows rather than
 showing what is behind them, so a portal capture gets a black box where the camera
 self-view was.
+
+### On aarch64 (Apple silicon under Asahi)
+
+Both native pieces build and run, and the recorder needs no flags to work here. Two
+things differ, and neither needs anything from you beyond the extra package above.
+
+**The screenshare plugin hooks differently.** Hyprland's own function hooking is
+x86-64 ONLY -- `CFunctionHook::hook()` in `src/plugins/HookSystem.cpp` opens with
+
+    // check for unsupported platforms
+    #if !defined(__x86_64__)
+        return false;
+    #endif
+
+because the mechanism is an inline trampoline assembled from raw x86 opcodes, with
+the displaced prologue decoded by the udis86 *x86* disassembler. None of it ports:
+aarch64 has fixed 4-byte instructions, no absolute branch, a pile of PC-relative
+forms that need re-encoding when moved, and a non-coherent i-cache. Upstream is not
+going to fix it (hyprwm/Hyprland#15684 is low prio with nobody on it).
+
+So on aarch64 the plugin hooks with **funchook** instead, vendored at
+`contrib/hyprland-studio-screenshare/vendor/funchook/` (arm64+unix+capstone subset
+only, GPL-2 with a linking exception). It links the SYSTEM capstone, which is the one
+extra package. x86-64 is untouched and still uses `HyprlandAPI::createFunctionHook`.
+The CMake guard is on `CMAKE_SYSTEM_PROCESSOR`, so the same `install.sh` does the
+right thing on either architecture with no flags.
+
+**The camera encodes on the CPU.** There is no hardware video encoder reachable from
+Linux on Apple silicon: no libva driver for the GPU, no Vulkan video-encode queue, no
+V4L2 M2M encoder, and `apple_avd` is a *decoder*. Asahi's own feature table lists
+Video Encoder as TBA. `bin/omarchy-capture-camera` probes for VAAPI once and falls
+back to libx264 in the same one-graph shape -- measured at 110-129% of one core at
+1920x1440@30 with the live preview running. The screen side already did this via
+gpu-screen-recorder's `-fallback-cpu-encoding`.
 
 The plugin's install script deliberately stops short of loading it. Read the comment
 at the top of that script before running it; the first load wants a session you can

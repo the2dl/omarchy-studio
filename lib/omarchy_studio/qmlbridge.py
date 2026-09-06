@@ -857,6 +857,27 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
             if shape not in ("circle", "rounded", "rect"):
                 raise BridgeError(f"unknown webcam shape {args['shape']!r}")
             cam.shape = shape
+
+        # AND INTO EVERY SEGMENT. The whole-take settings stop being what the renderer
+        # reads the moment a segment layer exists, because webcam_segments prefers
+        # explicit layers -- and a layer is materialized by the first op that names one,
+        # which is any click on the bubble. After that the panel, with nothing selected,
+        # went on writing to a value nothing rendered: the chips moved and the picture
+        # did not. Reported as "when you interact with the shadow stuff at all, the
+        # ability to re-shape is broken", and the shadow toggle is only how it was
+        # reached -- every control here had the same hole.
+        #
+        # These five are exactly the props a segment carries, so they are the ones that
+        # can disagree. Position is not among them: it lives in the layer's own rect.
+        # Selecting a segment still edits only that segment; this is the no-selection
+        # path, where the panel is showing the whole-take value and means all of them.
+        for key in ("shape", "corner_radius", "mirror", "shadow", "shadow_depth"):
+            if key not in args:
+                continue
+            value = getattr(cam, key)
+            for seg in edit.layers:
+                if seg.type == "webcam":
+                    seg.props[key] = value
         if "corner_radius" in args:
             cam.corner_radius = float(args["corner_radius"])
 

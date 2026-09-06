@@ -478,3 +478,60 @@ def _one_pixel_png() -> bytes:
     return base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
     )
+
+
+def test_a_whole_take_edit_still_reaches_a_materialized_segment(tmp_path):
+    """Every webcam control went dead once anything created a segment layer.
+
+    `webcam_segments` prefers explicit layers, and a layer is materialized by the first
+    op that names one -- which any click on the bubble does. After that the panel, with
+    nothing selected, went on writing to `edit.webcam`, which nothing rendered: the
+    shape chips moved and the picture did not. Reported as "when you interact with the
+    shadow stuff at all, the ability to re-shape is broken"; the shadow toggle was only
+    the easiest way to reach it.
+    """
+    import synthetic
+    from omarchy_studio import layers as L, qmlbridge as Q
+    from omarchy_studio.project import Bundle
+
+    root = tmp_path / "seg"
+    synthetic.make_bundle(root, seconds=2.0, width=1280, height=720)
+    b = Bundle(root)
+    b.edit.webcam.enabled = True
+    b.edit.webcam.shape = "rounded"
+
+    seg_id = Q.project_state(b)["webcam_track"]["segments"][0]["id"]
+    # touching ANY per-segment control materializes the track
+    Q.apply_op(b, "set_webcam", {"id": seg_id, "shadow": False})
+    assert [l.id for l in b.edit.layers if l.type == "webcam"], "expected a real segment"
+
+    def rendered():
+        segs = L.webcam_segments(b.edit, b.canvas, Q._safe_source_frames(b))
+        return segs[0].props.get("shape")
+
+    for shape in ("circle", "rect", "rounded"):
+        Q.apply_op(b, "set_webcam", {"shape": shape})     # no id: nothing selected
+        assert rendered() == shape, f"{shape} never reached the renderer"
+
+
+def test_selecting_a_segment_still_edits_only_that_segment(tmp_path):
+    """The no-selection path applies to all; a selection must stay surgical, or
+    splitting the camera to give one stretch its own look would be pointless."""
+    import synthetic
+    from omarchy_studio import qmlbridge as Q
+    from omarchy_studio.project import Bundle
+
+    root = tmp_path / "seg2"
+    synthetic.make_bundle(root, seconds=4.0, width=1280, height=720)
+    b = Bundle(root)
+    b.edit.webcam.enabled = True
+
+    seg_id = Q.project_state(b)["webcam_track"]["segments"][0]["id"]
+    Q.apply_op(b, "set_webcam", {"id": seg_id, "shape": "circle"})
+    Q.apply_op(b, "split_webcam", {"at_ms": 2000.0})
+    segs = [l for l in b.edit.layers if l.type == "webcam"]
+    assert len(segs) == 2
+
+    Q.apply_op(b, "set_webcam", {"id": segs[1].id, "shape": "rect"})
+    assert segs[0].props.get("shape") == "circle", "the other segment was clobbered"
+    assert segs[1].props.get("shape") == "rect"

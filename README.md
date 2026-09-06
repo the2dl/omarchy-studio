@@ -71,7 +71,8 @@ Python 3.12+. The optional caption engine (`faster-whisper`) lives in the repo v
 
 ## Documentation
 
-Full docs, and a rendered version for GitHub Pages:
+**[the2dl.github.io/omarchy-studio](https://the2dl.github.io/omarchy-studio/)** — all of
+it as one page. The same content lives in the repo:
 
     docs/how-it-works.md      the model: bundles, the four stages, why the stage order
     docs/engines.md           capture backends, render, audio, redaction -- and the numbers

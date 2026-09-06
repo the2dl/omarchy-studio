@@ -147,6 +147,34 @@ resolve_device() {
 # advertises a mode it can deliver over the link it is attached to, so trusting the
 # descriptors is the right call. MJPEG stays for the many cameras that offer nothing
 # else, where the decode is cheap anyway.
+# Can this machine encode with VAAPI at all?
+#
+# On Apple silicon under Linux, no: there is no libva driver for the GPU (no
+# asahi_drv_video.so, only virtio_gpu's), no Vulkan VK_KHR_video_encode_queue, no V4L2
+# M2M encoder, and apple_avd is a stateless DECODER whose firmware does not even load.
+# So /dev/dri/renderD128 opens and then every h264_vaapi encode fails, taking the whole
+# filtergraph with it -- hwupload and scale_vaapi are just as unavailable as the encoder.
+#
+# The screen side already meets this and already solves it: the recorder passes
+# gpu-screen-recorder -fallback-cpu-encoding yes, which is the only reason a screen
+# capture works on such a machine at all. The camera was simply the one path that never
+# got the same treatment.
+#
+# Probed rather than assumed -- a 64x64 lavfi frame straight through the real encoder,
+# about 23ms -- because "which machine has VAAPI" is not something to hardcode.
+vaapi_encode_available() {
+  [[ -n ${VAAPI_ENCODE_OK:-} ]] || {
+    if ffmpeg -v error -init_hw_device vaapi=va:/dev/dri/renderD128 \
+      -f lavfi -i color=size=64x64:rate=1 -frames:v 1 \
+      -vf format=nv12,hwupload -c:v h264_vaapi -f null - >/dev/null 2>&1; then
+      VAAPI_ENCODE_OK=yes
+    else
+      VAAPI_ENCODE_OK=no
+    fi
+  }
+  [[ $VAAPI_ENCODE_OK == "yes" ]]
+}
+
 resolve_capture_format() {
   local formats best
   formats=$(v4l2-ctl --list-formats-ext -d "$DEVICE" 2>/dev/null)
@@ -154,6 +182,13 @@ resolve_capture_format() {
   # One "pixels pref width height fps fmt" row per (usable size, interval) pair. Stepwise
   # and continuous sizes are skipped -- they have no enumerated modes to compare, and
   # every UVC webcam publishes discrete ones alongside them. `pref` breaks ties to nv12.
+  #
+  # -k3,3nr (wider first) is the LAST key and it matters: a device can publish the same
+  # mode in both orientations -- Apple's ISP offers 1920x1440 AND 1440x1920, identical
+  # area, identical rate, both nv12 -- and with every key tied, GNU sort falls back to
+  # comparing whole lines, which put the PORTRAIT one first. That is the wrong shape for
+  # a camera bubble and the more expensive encode. UVC webcams never publish portrait
+  # modes, so nothing caught this until the ISP on an Apple machine did.
   best=$(awk '
     /^[[:space:]]*\[[0-9]+\]/ {
       fmt = ($0 ~ /MJPG/) ? "mjpeg" : (($0 ~ /NV12/) ? "nv12" : "")
@@ -164,7 +199,7 @@ resolve_capture_format() {
       f = $0; sub(/.*\(/, "", f); sub(/[[:space:]]*fps\).*/, "", f)
       printf "%d %d %d %d %d %s\n", w * h, (fmt == "nv12" ? 1 : 0), w, h, f + 0, fmt
     }
-  ' <<<"$formats" | sort -k1,1nr -k5,5nr -k2,2nr | head -1)
+  ' <<<"$formats" | sort -k1,1nr -k5,5nr -k2,2nr -k3,3nr | head -1)
 
   [[ -n $best ]] || return 1
   read -r _ _ CAM_WIDTH CAM_HEIGHT CAM_FPS CAM_PIXFMT <<<"$best"
@@ -569,14 +604,41 @@ start_camera() {
   # swscale pass -- the expensive half of the MJPEG path -- simply does not exist.
   local convert=""
   [[ $CAM_PIXFMT == "nv12" ]] || convert="format=nv12,"
-  # The cap is applied on the GPU, once, before the split -- so the preview scales from
-  # the already-reduced frame and the expensive branch gets smaller too.
-  local cap=""
-  ((CAM_HEIGHT > CAM_RECORD_MAX_H)) && cap=",scale_vaapi=w=-2:h=$(camera_encode_height)"
-  local filtergraph="[0:v]${convert}hwupload${cap}[enc_hw]"
-  if ((${#preview_branch[@]})); then
-    filtergraph="[0:v]${convert}hwupload${cap},split=2[enc_hw][pv_hw];"
-    filtergraph+="[pv_hw]scale_vaapi=w=-2:h=$((PRESET_W * 2)),hwdownload,format=nv12[pv]"
+  # The cap is applied once, before the split -- so the preview scales from the
+  # already-reduced frame and the expensive branch gets smaller too.
+  local cap="" filtergraph
+  local hw_args=() encode_args=()
+  if vaapi_encode_available; then
+    ((CAM_HEIGHT > CAM_RECORD_MAX_H)) && cap=",scale_vaapi=w=-2:h=$(camera_encode_height)"
+    filtergraph="[0:v]${convert}hwupload${cap}[enc]"
+    if ((${#preview_branch[@]})); then
+      filtergraph="[0:v]${convert}hwupload${cap},split=2[enc][pv_hw];"
+      filtergraph+="[pv_hw]scale_vaapi=w=-2:h=$((PRESET_W * 2)),hwdownload,format=nv12[pv]"
+    fi
+    hw_args=(-vaapi_device /dev/dri/renderD128)
+    encode_args=(-c:v h264_vaapi)
+  else
+    # No hardware encoder on this machine (see vaapi_encode_available). Same ONE graph --
+    # one decode, one split, both branches still reading a single result -- with the GPU
+    # upload and the two scale_vaapi filters swapped for their CPU equivalents. There is
+    # no hwdownload on the preview branch because nothing ever went up.
+    #
+    # ultrafast, not superfast: superfast restores CABAC for about +58% CPU, and at this
+    # bitrate that buys nothing visible in a master which is re-encoded at export anyway.
+    # What it does cost is the headroom keeping the SCREEN encode above realtime, and a
+    # dropped frame is a worse quality loss than no CABAC. Override with
+    # OMARCHY_CAMERA_X264_PRESET if a machine has cores to spare.
+    #
+    # -threads 4 rather than unbounded: measured 110-129% of a core against 125-143%
+    # here, at 1920x1440@30 with the preview branch live. Do NOT add sliced-threads,
+    # which made it worse (160-182%).
+    ((CAM_HEIGHT > CAM_RECORD_MAX_H)) && cap=",scale=w=-2:h=$(camera_encode_height)"
+    filtergraph="[0:v]format=nv12${cap}[enc]"
+    if ((${#preview_branch[@]})); then
+      filtergraph="[0:v]format=nv12${cap},split=2[enc][pv_src];"
+      filtergraph+="[pv_src]scale=w=-2:h=$((PRESET_W * 2))[pv]"
+    fi
+    encode_args=(-c:v libx264 -preset "${OMARCHY_CAMERA_X264_PRESET:-ultrafast}" -threads 4)
   fi
 
   : >"$LOG_FILE"
@@ -584,7 +646,7 @@ start_camera() {
   # self-view is seconds behind" has something to measure against instead of a
   # reconstruction after the fact.
   echo "$(date +%H:%M:%S.%3N) camera: ${CAM_WIDTH}x${CAM_HEIGHT}@${CAM_FPS} ${CAM_PIXFMT}${
-    } -> encode at $(camera_encode_height)p $(camera_bitrate)" >>"$LOG_FILE"
+    } -> encode at $(camera_encode_height)p $(camera_bitrate) via ${encode_args[1]}" >>"$LOG_FILE"
 
   # The device is routinely still held when a recording starts: the setup window's own
   # preview lets go a beat before this runs, and V4L2 hands the device on a beat after
@@ -599,11 +661,11 @@ start_camera() {
     # ffmpeg holds the lock for the whole recording and every stop deadlocks against it.
     setsid bash -c 'echo $$ >"$1"; shift; exec "$@"' _ "$PID_FILE" \
       ffmpeg -hide_banner -loglevel warning -y \
-      -vaapi_device /dev/dri/renderD128 \
+      "${hw_args[@]}" \
       -copyts -f v4l2 -ts abs -input_format "$CAM_PIXFMT" \
       -video_size "${CAM_WIDTH}x${CAM_HEIGHT}" -framerate "$CAM_FPS" -i "$DEVICE" \
       -filter_complex "$filtergraph" \
-      -map "[enc_hw]" -c:v h264_vaapi -b:v "$(camera_bitrate)" "$bundle/media/cam.mp4" \
+      -map "[enc]" "${encode_args[@]}" -b:v "$(camera_bitrate)" "$bundle/media/cam.mp4" \
       -map 0:v -c:v copy -f mkvtimestamp_v2 "$bundle/media/cam.tsv" \
       "${preview_branch[@]}" \
       >>"$LOG_FILE" 2>&1 9>&- &

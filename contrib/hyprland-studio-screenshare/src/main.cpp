@@ -56,6 +56,10 @@
 
 #include <GLES3/gl32.h>
 
+#if defined(OMARCHY_STUDIO_FUNCHOOK)
+#include <funchook.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -78,12 +82,39 @@ inline bool g_inScreenshareFrame = false;
 
 inline CHyprSignalListener g_lRenderPre, g_lMonitorRemoved;
 
-inline CFunctionHook* g_hkRenderMonitor        = nullptr;
-inline CFunctionHook* g_hkShouldRenderWindow   = nullptr;
-inline CFunctionHook* g_hkNeedsUnmodifiedCopy  = nullptr;
-inline CFunctionHook* g_hkRenderWindow         = nullptr;
-inline CFunctionHook* g_hkSurfaceOpaqueRegion  = nullptr;
-inline CFunctionHook* g_hkDrawClear            = nullptr;
+// --- hook backend -------------------------------------------------------------
+//
+// Hyprland's CFunctionHook is x86-64 ONLY. CFunctionHook::hook() opens with
+// `#if !defined(__x86_64__) return false;` (src/plugins/HookSystem.cpp, unchanged in
+// v0.56.1 and main) because the mechanism is an inline trampoline assembled from raw
+// x86 opcodes, with the displaced prologue decoded by the udis86 x86 disassembler. On
+// aarch64 every hook() returns false, so all six fail and the plugin dies in init with
+// "hooks refused to install" -- which reads like a bug in this plugin and is not one.
+//
+// So the hooks go through a handle that keeps CFunctionHook's shape -- an m_original to
+// call through -- with two backends behind it:
+//
+//   x86-64 : HyprlandAPI::createFunctionHook, exactly as before. It is the proven path
+//            and Hyprland owns the unhooking when the plugin unloads.
+//   else   : vendored funchook (vendor/funchook/), which emits an AArch64 trampoline,
+//            relocates the displaced PC-relative instructions and flushes the i-cache.
+//            Here WE own the unhooking -- see PLUGIN_EXIT, which must uninstall before
+//            this .so is closed or the patched call sites jump into freed memory.
+struct CStudioHook {
+    void* m_source      = nullptr;
+    void* m_destination = nullptr;
+    void* m_original    = nullptr; // valid once installStudioHooks() has returned true
+};
+
+inline CStudioHook* g_hkRenderMonitor        = nullptr;
+inline CStudioHook* g_hkShouldRenderWindow   = nullptr;
+inline CStudioHook* g_hkNeedsUnmodifiedCopy  = nullptr;
+inline CStudioHook* g_hkRenderWindow         = nullptr;
+inline CStudioHook* g_hkSurfaceOpaqueRegion  = nullptr;
+inline CStudioHook* g_hkDrawClear            = nullptr;
+
+// Why the hooks could not be installed, for the notification and the throw.
+inline std::string g_hookError;
 
 static bool excludedWindow(const PHLWINDOW& w) {
     return w && w->m_ruleApplicator && w->m_ruleApplicator->noScreenShare().valueOrDefault();
@@ -338,6 +369,52 @@ static void* findFunction(const std::string& name, const std::string& mustContai
     return nullptr;
 }
 
+#if defined(OMARCHY_STUDIO_FUNCHOOK)
+inline funchook_t* g_funchook = nullptr;
+#endif
+
+// Installs every hook or leaves none installed. On the funchook path that is literal:
+// prepare() only stages, and the single install() call patches all six or none.
+static bool installStudioHooks(const std::vector<CStudioHook*>& hooks) {
+#if defined(OMARCHY_STUDIO_FUNCHOOK)
+    g_funchook = funchook_create();
+    if (!g_funchook) {
+        g_hookError = "funchook_create failed";
+        return false;
+    }
+
+    const auto FAIL = [&](const char* what) {
+        g_hookError = std::string(what) + ": " + funchook_error_message(g_funchook);
+        funchook_destroy(g_funchook);
+        g_funchook = nullptr;
+        return false;
+    };
+
+    for (auto* h : hooks) {
+        // funchook_prepare() takes the target in and hands the trampoline back out
+        // through the same pointer, which is exactly what m_original wants to be.
+        h->m_original = h->m_source;
+        if (funchook_prepare(g_funchook, &h->m_original, h->m_destination) != FUNCHOOK_ERROR_SUCCESS)
+            return FAIL("funchook_prepare");
+    }
+
+    if (funchook_install(g_funchook, 0) != FUNCHOOK_ERROR_SUCCESS)
+        return FAIL("funchook_install");
+
+    return true;
+#else
+    for (auto* h : hooks) {
+        const auto HOOK = HyprlandAPI::createFunctionHook(PHANDLE, h->m_source, h->m_destination);
+        if (!HOOK || !HOOK->hook()) {
+            g_hookError = "CFunctionHook::hook() refused";
+            return false;
+        }
+        h->m_original = HOOK->m_original;
+    }
+    return true;
+#endif
+}
+
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     PHANDLE = handle;
 
@@ -365,17 +442,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error("[omarchy-studio-screenshare] missing hook targets");
     }
 
-    g_hkRenderMonitor       = HyprlandAPI::createFunctionHook(PHANDLE, RENDER_MONITOR, (void*)&hkScreenshareRenderMonitor);
-    g_hkShouldRenderWindow  = HyprlandAPI::createFunctionHook(PHANDLE, SHOULD_RENDER, (void*)&hkShouldRenderWindow);
-    g_hkNeedsUnmodifiedCopy = HyprlandAPI::createFunctionHook(PHANDLE, NEEDS_COPY, (void*)&hkNeedsUnmodifiedCopy);
-    g_hkRenderWindow        = HyprlandAPI::createFunctionHook(PHANDLE, RENDER_WINDOW, (void*)&hkRenderWindow);
-    g_hkSurfaceOpaqueRegion = HyprlandAPI::createFunctionHook(PHANDLE, OPAQUE_REGION, (void*)&hkSurfaceOpaqueRegion);
-    g_hkDrawClear           = HyprlandAPI::createFunctionHook(PHANDLE, DRAW_CLEAR, (void*)&hkDrawClear);
+    g_hkRenderMonitor       = new CStudioHook{RENDER_MONITOR, (void*)&hkScreenshareRenderMonitor};
+    g_hkShouldRenderWindow  = new CStudioHook{SHOULD_RENDER, (void*)&hkShouldRenderWindow};
+    g_hkNeedsUnmodifiedCopy = new CStudioHook{NEEDS_COPY, (void*)&hkNeedsUnmodifiedCopy};
+    g_hkRenderWindow        = new CStudioHook{RENDER_WINDOW, (void*)&hkRenderWindow};
+    g_hkSurfaceOpaqueRegion = new CStudioHook{OPAQUE_REGION, (void*)&hkSurfaceOpaqueRegion};
+    g_hkDrawClear           = new CStudioHook{DRAW_CLEAR, (void*)&hkDrawClear};
 
-    if (!g_hkRenderMonitor->hook() || !g_hkShouldRenderWindow->hook() || !g_hkNeedsUnmodifiedCopy->hook() || !g_hkRenderWindow->hook() || !g_hkSurfaceOpaqueRegion->hook() ||
-        !g_hkDrawClear->hook()) {
-        HyprlandAPI::addNotification(PHANDLE, "[omarchy-studio] hooks refused to install", CHyprColor{1.0, 0.2, 0.2, 1.0}, 6000);
-        throw std::runtime_error("[omarchy-studio-screenshare] hook install failed");
+    if (!installStudioHooks({g_hkRenderMonitor, g_hkShouldRenderWindow, g_hkNeedsUnmodifiedCopy, g_hkRenderWindow, g_hkSurfaceOpaqueRegion, g_hkDrawClear})) {
+        HyprlandAPI::addNotification(PHANDLE, "[omarchy-studio] hooks refused to install: " + g_hookError, CHyprColor{1.0, 0.2, 0.2, 1.0}, 6000);
+        throw std::runtime_error("[omarchy-studio-screenshare] hook install failed: " + g_hookError);
     }
 
     g_lRenderPre   = Event::bus()->m_events.render.pre.listen([](PHLMONITOR m) { onRenderPre(m); });
@@ -390,6 +466,17 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+#if defined(OMARCHY_STUDIO_FUNCHOOK)
+    // Ours to undo. Unlike the HyprlandAPI hooks, nothing else knows these exist, and
+    // the patched call sites must stop pointing into this .so before it is dlclosed.
+    // First, so no in-flight call enters plugin code after the state below is gone.
+    if (g_funchook) {
+        funchook_uninstall(g_funchook, 0);
+        funchook_destroy(g_funchook);
+        g_funchook = nullptr;
+    }
+#endif
+
     g_lRenderPre.reset();
     g_lMonitorRemoved.reset();
     g_excluding.clear();

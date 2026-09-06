@@ -13,8 +13,8 @@ Item {
     property bool open: false
     signal toggled()
 
-    implicitWidth: Math.min(190, row.implicitWidth + 20)
-    implicitHeight: 27
+    implicitWidth: Math.min(Style.dp(190), row.implicitWidth + Style.dp(20))
+    implicitHeight: Style.dp(27)
 
     Rectangle {
         anchors.fill: parent
@@ -28,21 +28,21 @@ Item {
         Row {
             id: row
             anchors.centerIn: parent
-            spacing: 6
+            spacing: Style.dp(6)
 
             Text {
-                width: Math.min(implicitWidth, root.width - 32)
+                width: Math.min(implicitWidth, root.width - Style.dp(32))
                 elide: Text.ElideRight
                 text: root.label
                 color: root.enabled ? Theme.text2 : Theme.text5
                 font.family: Theme.fontFamily
-                font.pixelSize: Theme.fsRow
+                font.pixelSize: Style.dp(Theme.fsRow)
             }
             Text {           // nf-fa-angle_up: the list opens upward, off this bar
                 text: ""
                 color: Theme.text4
                 font.family: Theme.fontFamily
-                font.pixelSize: Theme.fsRow
+                font.pixelSize: Style.dp(Theme.fsRow)
             }
         }
     }

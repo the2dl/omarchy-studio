@@ -25,4 +25,36 @@ QtObject {
     readonly property int clicksRowH: 16
     readonly property int audioRowH: 30
     readonly property int timelineHeight: 38 + 18 + 40 + 26 + 16 + 30 + 3 * 7 + 16 + 1
+
+    // --- responsive scale ---------------------------------------------------------
+    //
+    // Every number above is drawn for a surface about 1600 logical px wide, which is
+    // what the desktop this was built on gives. A 13" laptop at scale 2 gives 1440, and
+    // the setup bar -- one row that sizes itself to its own contents -- simply ran off
+    // BOTH edges there, clipped by the compositor with no warning and no error: the
+    // mode chips lost their first letter on the left while the shape picker lost its
+    // last on the right.
+    //
+    // So: one factor, and one dp() that applies it. Widths, heights, spacings, paddings
+    // and font sizes go through dp(). 1px hairlines and the corner radii deliberately do
+    // NOT -- a 0.9px hairline is a blurry hairline, and the radii already read fine at
+    // every width in this range.
+    readonly property int refWidth: 1600
+
+    // Never above 1: a wider screen earns more room, not bigger chrome. Never below
+    // 0.8: past that the labels stop being legible and the honest answer is a different
+    // layout, not a smaller one.
+    property real uiScale: 1.0
+
+    // Called by each surface as it learns its own width. The NARROWEST one wins, so a
+    // bar that has to fit on two different monitors fits on both of them.
+    function noteAvailableWidth(w) {
+        if (w > 0) {
+            var s = Math.max(0.8, Math.min(1.0, w / refWidth))
+            if (s < uiScale)
+                uiScale = s
+        }
+    }
+
+    function dp(v) { return Math.round(v * uiScale) }
 }

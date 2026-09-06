@@ -28,8 +28,8 @@ Item {
 
     property var app                     // the state holder (setup/main.qml)
 
-    implicitWidth: barRow.implicitWidth + 36
-    implicitHeight: 70
+    implicitWidth: barRow.implicitWidth + Style.dp(36)
+    implicitHeight: Style.dp(70)
     width: implicitWidth
     height: implicitHeight
 
@@ -50,18 +50,18 @@ Item {
     RowLayout {
         id: barRow
         anchors.centerIn: parent
-        spacing: 14
+        spacing: Style.dp(14)
 
         Row {   // mode chips (register of the mock's tabs: 7x13 padding chips)
-            spacing: 4
+            spacing: Style.dp(4)
             Repeater {
                 model: app.modeNames
                 delegate: Rectangle {
                     required property int index
                     required property var modelData
                     objectName: "ctl:mode-" + modelData
-                    width: modeLabel.implicitWidth + 26
-                    height: 27
+                    width: modeLabel.implicitWidth + Style.dp(26)
+                    height: Style.dp(27)
                     radius: Theme.radiusRow
                     color: index === app.mode ? Theme.fillHover : "transparent"
                     Behavior on color { ColorAnimation { duration: Theme.durFast } }
@@ -71,7 +71,7 @@ Item {
                         text: modelData
                         color: index === app.mode ? Theme.text : Theme.text4
                         font.family: Theme.fontFamily
-                        font.pixelSize: Theme.fsRow
+                        font.pixelSize: Style.dp(Theme.fsRow)
                         Behavior on color { ColorAnimation { duration: Theme.durFast } }
                     }
                     MouseArea {
@@ -83,13 +83,13 @@ Item {
             }
         }
 
-        Rectangle { width: 1; height: 26; color: Theme.hairline }
+        Rectangle { width: 1; height: Style.dp(26); color: Theme.hairline }
 
         Text {   // mic glyph doubles as the state light
             text: "\uf130"
             color: app.micOn && app.sources.mic !== null ? Theme.accent : Theme.text4
             font.family: Theme.fontFamily
-            font.pixelSize: 17
+            font.pixelSize: Style.dp(17)
         }
         DeviceChip {
             id: micChip
@@ -100,7 +100,7 @@ Item {
             onToggled: app.togglePicker("mic", micChip)
         }
         MicMeter {
-            Layout.preferredWidth: 130
+            Layout.preferredWidth: Style.dp(130)
             level: app.micLevel
             active: app.micOn && app.sources.mic !== null
         }
@@ -110,8 +110,8 @@ Item {
                   : "muted"
             color: Theme.text5
             font.family: Theme.fontFamily
-            font.pixelSize: Theme.fsHint
-            Layout.preferredWidth: 44
+            font.pixelSize: Style.dp(Theme.fsHint)
+            Layout.preferredWidth: Style.dp(44)
             horizontalAlignment: Text.AlignRight
         }
         C.Toggle {
@@ -124,13 +124,13 @@ Item {
             onToggled: function (v) { if (app.audioAvailable) app.micOn = v }
         }
 
-        Rectangle { width: 1; height: 26; color: Theme.hairline }
+        Rectangle { width: 1; height: Style.dp(26); color: Theme.hairline }
 
         Text {   // system audio
             text: "\uf028"
             color: app.desktopAudio ? Theme.accent : Theme.text4
             font.family: Theme.fontFamily
-            font.pixelSize: 16
+            font.pixelSize: Style.dp(16)
         }
         C.Toggle {
             objectName: "ctl:audio-toggle"
@@ -140,13 +140,13 @@ Item {
             onToggled: function (v) { if (app.audioAvailable) app.desktopAudio = v }
         }
 
-        Rectangle { width: 1; height: 26; color: Theme.hairline }
+        Rectangle { width: 1; height: Style.dp(26); color: Theme.hairline }
 
         Text {   // camera overlay shape
             text: "\uf03d"
             color: app.cameraMode > 0 ? Theme.accent : Theme.text4
             font.family: Theme.fontFamily
-            font.pixelSize: 16
+            font.pixelSize: Style.dp(16)
         }
         DeviceChip {
             id: camChip
@@ -156,7 +156,7 @@ Item {
             open: app.pickerOpen === "camera"
             onToggled: app.togglePicker("camera", camChip)
         }
-        Rectangle { width: 1; height: 26; color: Theme.hairline }
+        Rectangle { width: 1; height: Style.dp(26); color: Theme.hairline }
 
         // Re-framing. Only for a window or an area: a display capture is already the
         // whole display, so the choice would be between a thing and itself.
@@ -178,16 +178,16 @@ Item {
             // toplevel behind it to export.
             visible: app.mode === 1
             implicitWidth: windowOnlyContent.implicitWidth
-            implicitHeight: 26
+            implicitHeight: Style.dp(26)
             Layout.preferredWidth: implicitWidth
             Layout.preferredHeight: implicitHeight
 
             Row {
                 id: windowOnlyContent
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: 8
+                spacing: Style.dp(8)
                 Rectangle {
-                    width: 16; height: 16
+                    width: Style.dp(16); height: Style.dp(16)
                     anchors.verticalCenter: parent.verticalCenter
                     radius: 4
                     color: app.windowOnly ? Theme.accent : "transparent"
@@ -201,7 +201,7 @@ Item {
                         visible: app.windowOnly
                         color: Theme.bg
                         font.family: Theme.fontFamily
-                        font.pixelSize: 10
+                        font.pixelSize: Style.dp(10)
                     }
                 }
                 Text {
@@ -210,7 +210,7 @@ Item {
                     color: app.windowOnly ? Theme.text2
                          : windowOnlyMa.containsMouse ? Theme.text3 : Theme.text4
                     font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fsRow
+                    font.pixelSize: Style.dp(Theme.fsRow)
                 }
             }
             MouseArea {
@@ -250,8 +250,8 @@ Item {
                     text: windowOnlyTip.text
                     color: Theme.text2
                     font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fsRow
-                    leftPadding: 10; rightPadding: 10
+                    font.pixelSize: Style.dp(Theme.fsRow)
+                    leftPadding: Style.dp(10); rightPadding: Style.dp(10)
                     topPadding: 7; bottomPadding: 7
                     lineHeight: 1.25
                 }
@@ -277,17 +277,17 @@ Item {
             // every screenshot had a selection the real flow never has.
             visible: app.mode !== 0 && !app.windowOnly
             implicitWidth: reframeContent.implicitWidth
-            implicitHeight: 26
+            implicitHeight: Style.dp(26)
             Layout.preferredWidth: implicitWidth
             Layout.preferredHeight: implicitHeight
 
             Row {
                 id: reframeContent
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: 8
+                spacing: Style.dp(8)
 
                 Rectangle {
-                    width: 16; height: 16
+                    width: Style.dp(16); height: Style.dp(16)
                     anchors.verticalCenter: parent.verticalCenter
                     radius: 4
                     color: app.fullMonitor ? Theme.accent : "transparent"
@@ -301,7 +301,7 @@ Item {
                         visible: app.fullMonitor
                         color: Theme.bg
                         font.family: Theme.fontFamily
-                        font.pixelSize: 10
+                        font.pixelSize: Style.dp(10)
                     }
                 }
                 Text {
@@ -310,7 +310,7 @@ Item {
                     color: app.fullMonitor ? Theme.text2
                          : reframeMa.containsMouse ? Theme.text3 : Theme.text4
                     font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fsRow
+                    font.pixelSize: Style.dp(Theme.fsRow)
                 }
             }
 
@@ -360,15 +360,15 @@ Item {
                     text: reframeTip.text
                     color: Theme.text2
                     font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fsRow
-                    leftPadding: 10; rightPadding: 10
+                    font.pixelSize: Style.dp(Theme.fsRow)
+                    leftPadding: Style.dp(10); rightPadding: Style.dp(10)
                     topPadding: 7; bottomPadding: 7
                     lineHeight: 1.25
                 }
             }
         }
         Rectangle {
-            width: 1; height: 26; color: Theme.hairline
+            width: 1; height: Style.dp(26); color: Theme.hairline
             visible: app.mode !== 0
         }
 
@@ -386,10 +386,10 @@ Item {
             text: "Script"
             color: app.prompterOn ? Theme.text2 : Theme.text4
             font.family: Theme.fontFamily
-            font.pixelSize: Theme.fsRow
+            font.pixelSize: Style.dp(Theme.fsRow)
         }
 
-        Rectangle { width: 1; height: 26; color: Theme.hairline }
+        Rectangle { width: 1; height: Style.dp(26); color: Theme.hairline }
 
         C.Segmented {
             objectName: "ctl:camera-shape"

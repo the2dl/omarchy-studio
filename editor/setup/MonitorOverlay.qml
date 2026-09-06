@@ -13,6 +13,11 @@ import "../controls" as C
 Window {
     id: ov
 
+    // The sheet is monitor-sized, so this IS the width every surface on it has to fit
+    // inside. Style keeps the narrowest across monitors -- see Style.noteAvailableWidth.
+    onWidthChanged: Style.noteAvailableWidth(width)
+    Component.onCompleted: Style.noteAvailableWidth(width)
+
     property var app          // the bar window: state, selection, actions
     property var mon          // one entry of sources.monitors
     property int monIndex: 0

@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>omarchy-studio</title>
+<meta name="description" content="A Screen Studio-style non-destructive screen recorder for Linux and Hyprland. How it works, the engines behind it, and how to use the editor.">
+<link rel="icon" href="media/logo/png/mark-64.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+/* ── tokens ───────────────────────────────────────────────────────────────
+   Dark-first: the bare :root IS the dark palette, because this is a tool people
+   use in a dark editor. Light is the deliberate second theme, defined by the same
+   token names so no component ever reaches past them. */
+:root {
+  --ground:      #121316;
+  --surface:     #1a1b1f;
+  --surface-2:   #212227;
+  --hairline:    #2c2d33;
+  --hairline-2:  #3a3b42;
+  --ink:         #f6f4f2;
+  --ink-2:       #c3bfb8;
+  --ink-3:       #8e8a83;
+  --accent:      #f2a25a;
+  --accent-dim:  #8a5a2c;
+  --accent-wash: rgba(242,162,90,.10);
+  --record:      #e0523f;
+  --shadow:      0 1px 2px rgba(0,0,0,.5), 0 8px 28px rgba(0,0,0,.35);
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --ground:      #faf8f5;
+    --surface:     #ffffff;
+    --surface-2:   #f2efea;
+    --hairline:    #e2ddd4;
+    --hairline-2:  #cec8bd;
+    --ink:         #17181c;
+    --ink-2:       #4b4842;
+    --ink-3:       #77736b;
+    --accent:      #a4611d;
+    --accent-dim:  #d8a878;
+    --accent-wash: rgba(164,97,29,.08);
+    --record:      #bf3a28;
+    --shadow:      0 1px 2px rgba(30,25,18,.06), 0 8px 28px rgba(30,25,18,.07);
+    color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --ground:      #faf8f5;
+  --surface:     #ffffff;
+  --surface-2:   #f2efea;
+  --hairline:    #e2ddd4;
+  --hairline-2:  #cec8bd;
+  --ink:         #17181c;
+  --ink-2:       #4b4842;
+  --ink-3:       #77736b;
+  --accent:      #a4611d;
+  --accent-dim:  #d8a878;
+  --accent-wash: rgba(164,97,29,.08);
+  --record:      #bf3a28;
+  --shadow:      0 1px 2px rgba(30,25,18,.06), 0 8px 28px rgba(30,25,18,.07);
+  color-scheme: light;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 84px; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: "Source Serif 4", Charter, Georgia, serif;
+  font-size: 17px;
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, h4, .ui {
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  text-wrap: balance;
+}
+code, kbd, .mono, .num { font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace; }
+
+/* ── shell ─────────────────────────────────────────────────────────────── */
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 28px; }
+
+header.top {
+  position: sticky; top: 0; z-index: 40;
+  background: color-mix(in srgb, var(--ground) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--hairline);
+}
+.top-in { display: flex; align-items: center; gap: 18px; height: 60px; }
+.brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--ink); }
+.brand img { width: 22px; height: 22px; display: block; }
+.brand b { font-family: Archivo, sans-serif; font-weight: 700; font-size: 15px; letter-spacing: -.01em; }
+.top nav { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+.top nav a {
+  font-family: Archivo, sans-serif; font-size: 13.5px; font-weight: 500;
+  color: var(--ink-2); text-decoration: none; padding: 7px 11px; border-radius: 7px;
+}
+.top nav a:hover { color: var(--ink); background: var(--surface-2); }
+.top nav a.gh { color: var(--ink-3); }
+#themeBtn {
+  font-family: Archivo, sans-serif; font-size: 13.5px; font-weight: 500;
+  background: none; border: 1px solid var(--hairline-2); color: var(--ink-2);
+  padding: 6px 11px; border-radius: 7px; cursor: pointer;
+}
+#themeBtn:hover { color: var(--ink); border-color: var(--accent-dim); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+/* ── hero ──────────────────────────────────────────────────────────────── */
+.hero { padding: 76px 0 30px; }
+.eyebrow {
+  font-family: "JetBrains Mono", monospace; font-size: 11.5px; font-weight: 500;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--accent);
+  display: flex; align-items: center; gap: 10px;
+}
+.eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--hairline); }
+.hero h1 {
+  font-size: clamp(40px, 6.4vw, 68px); line-height: 1.02; font-weight: 700;
+  letter-spacing: -.03em; margin: 20px 0 0;
+}
+.hero .lede {
+  font-size: clamp(19px, 2.1vw, 22px); color: var(--ink-2); max-width: 60ch;
+  margin: 20px 0 0; line-height: 1.55;
+}
+.hero .lede em { color: var(--ink); font-style: normal; box-shadow: inset 0 -.4em 0 var(--accent-wash); }
+
+.thesis {
+  margin: 40px 0 0; padding: 22px 26px; background: var(--surface);
+  border: 1px solid var(--hairline); border-left: 3px solid var(--accent);
+  border-radius: 4px; max-width: 74ch;
+}
+.thesis p { margin: 0; font-size: 18px; }
+.thesis strong { font-weight: 600; }
+
+/* ── film-cell divider, from the timeline's own "uniform film cells" ───── */
+.filmrule {
+  height: 10px; margin: 62px 0 0;
+  background-image: repeating-linear-gradient(
+    to right, var(--hairline) 0 14px, transparent 14px 22px);
+  border-top: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline);
+  opacity: .85;
+}
+
+/* ── layout: sticky rail + column ──────────────────────────────────────── */
+.doc { display: grid; grid-template-columns: 208px minmax(0, 1fr); gap: 56px; padding: 54px 0 90px; }
+.rail { position: sticky; top: 84px; align-self: start; }
+.rail h5 {
+  font-family: "JetBrains Mono", monospace; font-size: 10.5px; letter-spacing: .15em;
+  text-transform: uppercase; color: var(--ink-3); margin: 0 0 12px; font-weight: 500;
+}
+.rail ol { list-style: none; margin: 0 0 26px; padding: 0; display: flex; flex-direction: column; gap: 1px; }
+.rail a {
+  display: block; font-family: Archivo, sans-serif; font-size: 13.5px; color: var(--ink-2);
+  text-decoration: none; padding: 5px 10px; border-left: 2px solid var(--hairline); line-height: 1.35;
+}
+.rail a:hover { color: var(--ink); border-left-color: var(--accent-dim); background: var(--surface); }
+.rail a.on { color: var(--accent); border-left-color: var(--accent); }
+
+.col { max-width: 70ch; min-width: 0; }
+section { scroll-margin-top: 84px; }
+section + section { margin-top: 62px; }
+h2 {
+  font-size: 31px; letter-spacing: -.022em; font-weight: 700; margin: 0 0 6px; line-height: 1.15;
+}
+h2 .n {
+  font-family: "JetBrains Mono", monospace; font-size: 13px; font-weight: 500;
+  color: var(--accent); letter-spacing: 0; margin-right: 12px; vertical-align: .18em;
+}
+.sub { color: var(--ink-3); margin: 0 0 26px; font-size: 16px; }
+h3 { font-size: 19.5px; font-weight: 600; letter-spacing: -.012em; margin: 38px 0 8px; }
+h4 { font-size: 15px; font-weight: 600; margin: 26px 0 6px; letter-spacing: -.005em; }
+p { margin: 0 0 15px; }
+.col ul, .col ol.body { margin: 0 0 15px; padding-left: 22px; }
+.col li { margin-bottom: 7px; }
+strong { font-weight: 600; color: var(--ink); }
+a { color: var(--accent); text-underline-offset: 2px; }
+
+code {
+  font-size: .875em; background: var(--surface-2); border: 1px solid var(--hairline);
+  padding: 1px 5px; border-radius: 4px; color: var(--ink);
+}
+pre {
+  background: var(--surface); border: 1px solid var(--hairline); border-radius: 6px;
+  padding: 16px 18px; overflow-x: auto; margin: 0 0 18px;
+}
+pre code { background: none; border: 0; padding: 0; font-size: 13px; line-height: 1.72; color: var(--ink-2); }
+pre code b { color: var(--accent); font-weight: 500; }
+pre code i { color: var(--ink-3); font-style: normal; }
+
+/* ── measured: the recurring object this subject earns ─────────────────── */
+.measured {
+  margin: 22px 0; border: 1px solid var(--hairline); border-radius: 6px;
+  background: var(--surface); overflow: hidden;
+}
+.measured > figcaption {
+  font-family: "JetBrains Mono", monospace; font-size: 10.5px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink-3);
+  padding: 9px 16px; border-bottom: 1px solid var(--hairline); background: var(--surface-2);
+  display: flex; align-items: center; gap: 8px;
+}
+.measured > figcaption::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none;
+}
+.rows { display: flex; flex-direction: column; }
+.row {
+  display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: baseline;
+  padding: 9px 16px; border-bottom: 1px solid var(--hairline);
+}
+.row:last-child { border-bottom: 0; }
+.row .k { font-size: 14.5px; color: var(--ink-2); }
+.row .v {
+  font-family: "JetBrains Mono", monospace; font-variant-numeric: tabular-nums;
+  font-size: 14px; color: var(--ink); white-space: nowrap;
+}
+.row.best { background: var(--accent-wash); }
+.row.best .k, .row.best .v { color: var(--ink); }
+.row.best .v { font-weight: 700; color: var(--accent); }
+.measured figcaption .note { margin-left: auto; letter-spacing: .04em; text-transform: none; }
+
+/* ── tables ────────────────────────────────────────────────────────────── */
+.tw { overflow-x: auto; margin: 0 0 20px; border: 1px solid var(--hairline); border-radius: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; min-width: 460px; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--hairline); vertical-align: top; }
+thead th {
+  font-family: Archivo, sans-serif; font-size: 12px; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--ink-3); background: var(--surface-2); white-space: nowrap;
+}
+tbody tr:last-child td { border-bottom: 0; }
+td.mono, td .num { font-family: "JetBrains Mono", monospace; font-variant-numeric: tabular-nums; }
+.yes { color: var(--accent); font-weight: 600; }
+.no  { color: var(--record); font-weight: 600; }
+
+kbd {
+  display: inline-block; font-size: 12px; padding: 2px 7px; border-radius: 5px;
+  background: var(--surface-2); border: 1px solid var(--hairline-2);
+  border-bottom-width: 2px; color: var(--ink); white-space: nowrap;
+}
+
+/* ── stage flow ────────────────────────────────────────────────────────── */
+.stages { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; margin: 0 0 20px; }
+.stage {
+  font-family: "JetBrains Mono", monospace; font-size: 12.5px;
+  padding: 6px 12px; border: 1px solid var(--hairline-2); border-radius: 999px; color: var(--ink-2);
+}
+.stage.hi { border-color: var(--accent); color: var(--accent); }
+.arw { color: var(--ink-3); font-size: 13px; }
+
+/* ── figure ────────────────────────────────────────────────────────────── */
+figure.shot { margin: 26px 0; }
+figure.shot img {
+  width: 100%; height: auto; display: block; border-radius: 7px;
+  border: 1px solid var(--hairline); box-shadow: var(--shadow);
+}
+figure.shot figcaption { font-size: 13.5px; color: var(--ink-3); margin-top: 10px; }
+
+.callout {
+  border-left: 2px solid var(--hairline-2); padding: 2px 0 2px 18px;
+  color: var(--ink-2); margin: 20px 0; font-size: 16px;
+}
+.callout strong { color: var(--ink); }
+
+footer.end {
+  border-top: 1px solid var(--hairline); padding: 34px 0 60px;
+  color: var(--ink-3); font-size: 14px;
+  display: flex; gap: 18px; flex-wrap: wrap; align-items: center;
+}
+footer.end a { color: var(--ink-2); }
+
+@media (max-width: 900px) {
+  .doc { grid-template-columns: 1fr; gap: 0; }
+  .rail { position: static; margin-bottom: 34px; }
+  .rail ol { flex-direction: row; flex-wrap: wrap; gap: 6px; }
+  .rail a { border-left: 0; border: 1px solid var(--hairline); border-radius: 999px; padding: 5px 12px; }
+  .top nav a:not(.gh) { display: none; }
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap top-in">
+    <a class="brand" href="#top">
+      <img src="media/logo/svg/mark-small-accent.svg" alt="">
+      <b>omarchy-studio</b>
+    </a>
+    <nav>
+      <a href="#how">How it works</a>
+      <a href="#engines">Engines</a>
+      <a href="#using">Using it</a>
+      <a class="gh" href="https://github.com/the2dl/omarchy-studio">GitHub</a>
+      <button id="themeBtn" type="button" aria-label="Switch theme">Light</button>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <div class="wrap hero">
+    <div class="eyebrow">Screen recorder · Linux · Hyprland</div>
+    <h1>Record the pixels.<br>Decide everything else later.</h1>
+    <p class="lede">A non-destructive screen recorder in the Screen&nbsp;Studio mould, built for Hyprland. The camera, the cursor, the clicks and the window's position are all captured as <em>separate, editable data</em> — so the zoom, the framing and the crop are decisions you make after the take, not before it.</p>
+
+    <div class="thesis">
+      <p><strong>One rule explains most of the design:</strong> recording captures pixels, editing captures intent, and export is the only place the two meet. Nothing you do in the editor touches what was recorded, and nothing about how you recorded limits what you can decide afterwards.</p>
+    </div>
+
+    <div class="filmrule"></div>
+  </div>
+
+  <div class="wrap doc">
+    <aside class="rail">
+      <h5>Contents</h5>
+      <ol>
+        <li><a href="#how" class="on">How it works</a></li>
+        <li><a href="#bundle">The bundle</a></li>
+        <li><a href="#stages">Four stages</a></li>
+        <li><a href="#order">Stage order</a></li>
+      </ol>
+      <h5>Technical</h5>
+      <ol>
+        <li><a href="#engines">Capture backends</a></li>
+        <li><a href="#zoom">Zoom</a></li>
+        <li><a href="#render">Render</a></li>
+        <li><a href="#audio">Audio</a></li>
+        <li><a href="#redact">Redaction</a></li>
+      </ol>
+      <h5>Using it</h5>
+      <ol>
+        <li><a href="#using">Setup bar</a></li>
+        <li><a href="#hud">The HUD</a></li>
+        <li><a href="#editor">The editor</a></li>
+        <li><a href="#keys">Shortcuts</a></li>
+      </ol>
+    </aside>
+
+    <div class="col">
+
+      <!-- ══ HOW IT WORKS ══ -->
+      <section id="how">
+        <h2><span class="n">01</span>How it works</h2>
+        <p class="sub">The model, and what it buys you.</p>
+
+        <h3 id="bundle">A recording is a directory, not a file</h3>
+        <pre><code>screenrecording-2026-09-05_13-23-43/
+├── <b>capture.json</b>     what the hardware did        <i>IMMUTABLE</i>
+├── <b>edit.json</b>        what you decided             <i>MUTABLE</i>
+├── media/
+│   ├── screen.mp4     the master, at capture resolution
+│   ├── screen.mp4.ts  first-frame timestamp sidecar
+│   ├── cam.mp4        the camera, recorded separately
+│   └── cam.tsv        camera frame timestamps
+├── events/
+│   ├── input.jsonl    clicks, with timestamps
+│   ├── cursor.bin     pointer positions, 120 Hz
+│   └── chrome.json    rectangles that are UI, not content
+├── proxy/             fast draft copies, rebuilt on demand
+└── assets/            images you added</code></pre>
+
+        <p><code>capture.json</code> is written once and holds only facts: resolution, frame rate, the monitor and its scale, the clock anchor that ties events to frames. It is never edited, because it is the record of what actually happened. If it were mutable, every later question — <em>where was the cursor at 4.2s?</em> — would have two possible answers.</p>
+
+        <p><code>edit.json</code> is everything you chose. It is small, it is JSON, and it is the only thing an edit writes. <strong>Delete it and you have the raw recording back</strong>, exactly as captured.</p>
+
+        <div class="callout"><strong>The camera is a separate stream, never burned in.</strong> That is what lets you move the bubble, resize it, cut it out of part of the take, or drop it entirely — after the fact. A recorder that composites the camera into the frame has thrown that away before you ever see it.</div>
+
+        <h3 id="stages">Four stages</h3>
+
+        <h4>1 · Setup — decide what to record</h4>
+        <p>A bar appears at the bottom of the screen, and an overlay on each display shows its name, resolution and frame rate with a <strong>Start</strong> button in the middle. The button sits on the target itself, which doubles as proof you picked the right monitor.</p>
+        <p>Pressing Start begins a countdown — and capture initialisation runs <em>during</em> it rather than after, so the two waits overlap. Every setup surface is destroyed before the countdown ends, so no frame of the UI can reach the recording.</p>
+
+        <figure class="shot">
+          <img src="media/setup.png" alt="The setup bar at the bottom of the screen, with mode, microphone, camera and system audio controls, and a Start overlay on the display itself.">
+          <figcaption>Mode, mic, camera and system audio on the bar — and Start on the display you are about to record.</figcaption>
+        </figure>
+
+        <h4>2 · Record — pixels and intent, in parallel</h4>
+        <p>Three things run at once: the screen through one of three capture backends, the camera to its own file with its own timestamps, and an input daemon sampling the pointer at 120&nbsp;Hz while logging every click.</p>
+        <p>That third one is why automatic zoom is possible at all. Clicks are recorded as <strong>data, not as an effect</strong> — so the zoom they imply can be tuned, deleted, or switched off long after the take is over.</p>
+
+        <h4>3 · Edit — non-destructively</h4>
+        <p>The editor plays a <em>proxy</em>: a fast, lower-resolution copy of the master, built in the background so scrubbing stays responsive on a 5K recording. Everything you see is your edit applied live over that proxy. Nothing is rendered until you export.</p>
+
+        <h4>4 · Export — one ffmpeg process</h4>
+        <p>The whole edit compiles to a single filtergraph. No intermediate file, no round trip, no generation loss. The graph is written to a file rather than passed as arguments, because a long project's graph exceeds the kernel's argument limit.</p>
+
+        <h3 id="order">Why the stage order is what it is</h3>
+        <div class="stages">
+          <span class="stage">cut</span><span class="arw">→</span>
+          <span class="stage">cursor</span><span class="arw">→</span>
+          <span class="stage hi">zoom</span><span class="arw">→</span>
+          <span class="stage">backdrop</span><span class="arw">→</span>
+          <span class="stage">layers</span>
+        </div>
+        <p>The order is not arbitrary; each position was measured.</p>
+        <ul>
+          <li><strong>Cut first.</strong> Everything downstream then runs over fewer frames — 2.20s against 2.83s on the same project. Cut-first with remapped layer timings produces <em>bit-identical</em> frames to cut-last with verbatim ones, so the reordering is provably free.</li>
+          <li><strong>Cursor before the zoom</strong>, so the zoom magnifies the pointer along with the pixels underneath it. Drawn after, the pointer would need the zoom's per-frame viewport inverted into its own position maths — and any disagreement between the two copies shows up as the pointer sliding across the thing it is pointing at.</li>
+          <li><strong>Zoom second</strong>, while the frame is still planar YUV. The same warp costs 8.4&nbsp;ms/frame on <code>yuv420p</code> and 14.9&nbsp;ms/frame once the backdrop has converted the stream to RGBA. Identical pixels, nearly double the price.</li>
+          <li><strong>Backdrop third</strong>, and it fixes the output length. The background is an infinite source and the real video reaches it through <code>shortest=1</code>. The other way round, the background's timebase governs the output — a 6.9s clip once came out 208 seconds long.</li>
+          <li><strong>Layers last.</strong> Their cost scales with how many exist, not how long each is visible (2.75s against 2.70s for a layer visible 1s of 20 versus throughout).</li>
+        </ul>
+      </section>
+
+      <div class="filmrule"></div>
+
+      <!-- ══ ENGINES ══ -->
+      <section id="engines">
+        <h2><span class="n">02</span>Engines</h2>
+        <p class="sub">What does the work, and why each choice was made.</p>
+
+        <h3>Capture: three backends, not one</h3>
+        <p>Wayland does not let an application record whatever it likes, and the three ways in have different powers. The differences leak into what the product can offer, so they are worth knowing.</p>
+
+        <div class="tw">
+        <table>
+          <thead><tr><th></th><th>KMS</th><th>Portal</th><th>Toplevel</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Reads</strong></td><td>DRM scanout, below the compositor</td><td>xdg-desktop-portal stream</td><td>one window's surface tree</td></tr>
+            <tr><td><strong>Frame rate</strong></td><td class="mono">60 fps</td><td class="mono">30 fps</td><td class="mono">display rate</td></tr>
+            <tr><td><strong>Sub-rectangle</strong></td><td class="yes">yes</td><td class="no">no — whole monitor</td><td>n/a</td></tr>
+            <tr><td><strong>Can hide a window</strong></td><td class="no">no</td><td class="yes">yes</td><td>n/a</td></tr>
+            <tr><td><strong>Used for</strong></td><td>monitor, area</td><td>anything needing a hidden self-view</td><td>true single-window</td></tr>
+          </tbody>
+        </table>
+        </div>
+
+        <p><strong>KMS</strong> is the default and the fastest. It reads the scanout <em>below</em> the compositor, which is exactly why it cannot honour <code>no_screen_share</code>: the compositor's decision to hide a window has already been applied to a layer this path never sees.</p>
+        <p><strong>Portal</strong> runs at half the rate but the compositor is in the loop, so windows can be excluded. This is the backend that makes a live camera self-view possible — the bubble is on screen for you and absent from the recording.</p>
+        <p><strong>Toplevel</strong> (<code>hyprland_toplevel_export_v1</code>) renders one window's surface tree alone — the Linux equivalent of ScreenCaptureKit's window capture. This is what "just this window" means when it means it literally: anything stacked on top is not in the take, because those surfaces are never composited into the frame.</p>
+
+        <div class="callout">A region capture that also wants a self-view takes the <strong>whole monitor</strong> through the portal and crops back at export — because only KMS can capture a sub-rectangle directly, and only the portal can hide the bubble. macOS never faces this; it excludes windows on the same fast path whatever the capture is.</div>
+
+        <h3 id="zoom">Zoom is derived, not authored</h3>
+        <p>Zoom moves are computed from the click track at render time rather than stored as keyframes. Clicks land on the output timeline, clicks inside a cut are discarded, and nearby clicks <strong>cluster</strong> into one move — without clustering, a burst of clicks in one dialog produces one zoom per click, each easing out before the next eases in.</p>
+        <p>Deleting one move stores the <strong>source frames of its clicks</strong>, not the move's index or its time range — both of those shift the moment any other edit lands. The click track is part of the capture and never changes, so it is the one stable name.</p>
+
+        <figure class="measured">
+          <figcaption>Gating the warp to frames that actually zoom <span class="note">510-frame export, two zooms</span></figcaption>
+          <div class="rows">
+            <div class="row"><span class="k">Warp running on every frame</span><span class="v">56.2 s</span></div>
+            <div class="row best"><span class="k">Warp gated with <code>enable=</code></span><span class="v">31.2 s</span></div>
+            <div class="row"><span class="k">Frames that were paying for an identity warp</span><span class="v">434 of 510</span></div>
+            <div class="row"><span class="k">Difference in output</span><span class="v">bit-identical</span></div>
+          </div>
+        </figure>
+
+        <h3 id="render">Render: one graph, one process</h3>
+        <p>Everything below the zoom is composited at the size the export will be, not at the master's. The background is a band-limited gradient, the shadow a Gaussian whose sigma is proportional to its radius, the corner mask analytic coverage — all resolution-independent by construction. Building them at four times the pixels and discarding three quarters buys nothing.</p>
+        <p>This is also <em>better</em> quality, not a trade: the backdrop scales the video down to make room for its own padding, so the old arrangement resampled the picture twice. Now the zoomed master reaches its final size in one lanczos step.</p>
+
+        <figure class="measured">
+          <figcaption>Export time <span class="note">17 s take · 5120×2880 master · 1440p out</span></figcaption>
+          <div class="rows">
+            <div class="row"><span class="k">Decode + one downscale + encode — the floor</span><span class="v">4.0 s</span></div>
+            <div class="row"><span class="k">Original</span><span class="v">88.0 s</span></div>
+            <div class="row"><span class="k">Compositing at the delivered size</span><span class="v">54.3 s</span></div>
+            <div class="row best"><span class="k">…plus gating the zoom and the cursor chroma</span><span class="v">18.6 s</span></div>
+          </div>
+        </figure>
+
+        <p>The encode runs on the <strong>CPU</strong>, which is the counter-intuitive part. VAAPI measured <em>slower</em> — 18.11s against 19.82s at 1080p, 49.43 against 52.80 at 4K — because every filter in the graph is CPU-only, so <code>hwupload</code> only adds a copy. VAAPI offloads the encode, which was never the bottleneck. (The native window <em>recorder</em> does use VAAPI, because there the encode is all there is.)</p>
+
+        <h3 id="audio">Audio</h3>
+        <div class="stages">
+          <span class="stage">afade</span><span class="arw">→</span>
+          <span class="stage">cut</span><span class="arw">→</span>
+          <span class="stage hi">declick</span><span class="arw">→</span>
+          <span class="stage">loudnorm</span><span class="arw">→</span>
+          <span class="stage">48 kHz</span>
+        </div>
+        <p>Every step is placed deliberately. The start-pop fade sits <em>before</em> the cut, so it belongs to the capture's start rather than the edited timeline's — cut the head away and the fade goes with it, instead of silencing the first 450&nbsp;ms of whatever now begins the video. Declick sits before <code>loudnorm</code>, because a key clack is the loudest thing in a narration track and normalising first would set the gain from the noise and leave the voice quiet.</p>
+
+        <h4>Removing keyboard clicks</h4>
+        <p>RNNoise with a vendored model, followed by <code>afftdn</code>. Chosen by measurement on a real take, scored by the <em>gap</em> between how much each candidate attenuates the clacks and how much it attenuates speech — the gap is what matters, since <code>loudnorm</code> follows and makes absolute level irrelevant.</p>
+
+        <figure class="measured">
+          <figcaption>Clack suppression vs speech damage <span class="note">higher gap is better</span></figcaption>
+          <div class="rows">
+            <div class="row"><span class="k"><code>adeclick</code> — the original choice</span><span class="v">0.4 dB</span></div>
+            <div class="row"><span class="k"><code>afftdn</code> alone</span><span class="v">6.0 dB</span></div>
+            <div class="row"><span class="k"><code>arnndn</code> alone</span><span class="v">6.2 dB</span></div>
+            <div class="row best"><span class="k"><code>arnndn</code> + <code>afftdn</code></span><span class="v">12.1 dB</span></div>
+          </div>
+        </figure>
+
+        <p>Tone breaks the tie. Measured as high-band minus low-band energy, the source sits at −13.4&nbsp;dB and this chain lands at −15.0&nbsp;dB — 1.6&nbsp;dB from the source, while taking 18&nbsp;dB off the clacks. More aggressive alternatives scored better on the gap and left a dulled, underwater voice.</p>
+
+        <div class="callout">Both denoisers buffer, and nothing in ffmpeg compensates it: <code>arnndn</code> delays 9.94&nbsp;ms and <code>afftdn</code> 25.00&nbsp;ms. Without a trim, turning the option on pushed the entire audio track <strong>~35&nbsp;ms behind the picture</strong> — a lip-sync error nobody would attribute to a denoiser. The chain trims its own latency off the front.</div>
+
+        <h3 id="redact">Redaction</h3>
+        <p>Blur and pixelate are applied at export, on a shared preset ladder so switching method never silently changes how much is recoverable. The QML preview and the ffmpeg export compute strength from the <em>same</em> function — Qt's MultiEffect and ffmpeg's <code>gblur</code> are different kernels, so the preview value is the export sigma mapped back through a measured ratio. Calibrated to match, not chosen to look right.</p>
+        <p>Redactions are never partially transparent and never faded. <strong>A translucent blur box leaks the pixels it exists to hide.</strong></p>
+      </section>
+
+      <div class="filmrule"></div>
+
+      <!-- ══ USING IT ══ -->
+      <section id="using">
+        <h2><span class="n">03</span>Using it</h2>
+        <p class="sub">Three surfaces: the setup bar, the HUD, and the editor.</p>
+
+        <h3>Before recording</h3>
+        <pre><code>bin/omarchy-capture-screenrecording   <i># opens the setup bar; run again to stop</i></code></pre>
+        <p>Worth binding to a key. There is no PrintScreen on every keyboard, and the stock Omarchy capture bindings assume there is:</p>
+        <pre><code>o.bind("SUPER + SHIFT + code:13", "Screenrecording (studio)",
+       "/path/to/omarchy-studio/bin/omarchy-capture-screenrecording")</code></pre>
+
+        <p>Two options are worth understanding before you press Start:</p>
+        <ul>
+          <li><strong>Just this window</strong> captures only that window's own surfaces — anything stacked on top is not in the take. Needs the native window recorder built; without it you get the window's <em>rectangle</em>, and whatever is over it.</li>
+          <li><strong>Follow window</strong> records the whole display and carries your selection as a crop, so a window that moves mid-recording can be followed afterwards. It puts the whole screen on disk, which is a privacy consideration: everything beside the window is in the bundle where an export could reach it.</li>
+        </ul>
+
+        <h3 id="hud">While recording — the HUD</h3>
+        <p>A floating pill with elapsed time, a live microphone level, and three buttons: <strong>Pause</strong>, <strong>Discard</strong> and <strong>Stop</strong>.</p>
+        <p>It is kept out of the recording by the compositor, and it <em>refuses to appear at all</em> rather than be recorded — if there is nowhere to put it outside the capture and the compositor cannot hide it, it closes itself and tells you the keyboard shortcut instead.</p>
+        <div class="callout">Clicking Stop does not end up in your video. The HUD's own rectangle is recorded as UI, and clicks inside it are dropped from the click track — otherwise every take would end with the zoom lunging at a button the viewer cannot see.</div>
+
+        <h3 id="editor">The editor</h3>
+        <figure class="shot">
+          <img src="media/editor.png" alt="The omarchy-studio editor: canvas with the recording on a backdrop, a layer list on the left, settings on the right, and the timeline underneath.">
+          <figcaption>Canvas, layer list, settings panel, and the timeline underneath.</figcaption>
+        </figure>
+
+        <h4>The timeline</h4>
+        <div class="tw">
+        <table>
+          <thead><tr><th>Row</th><th>Shows</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">screen</td><td>the take, as uniform film cells</td></tr>
+            <tr><td class="mono">layers</td><td>one sub-row per layer, front-most first, each spanning its time range</td></tr>
+            <tr><td class="mono">zoom</td><td>the zoom moves — the row you actually work in, so its label is accented</td></tr>
+            <tr><td class="mono">clicks</td><td>every recorded click; the ones that produced a zoom read brighter</td></tr>
+            <tr><td class="mono">audio</td><td>the audio track</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <p><strong>Cuts are a fold, not a hole.</strong> A cut span collapses to a 16-pixel seam that spans every row at once — the x-axis itself folds, so one cut is one object rather than a gap per row. Click a seam to expand it and see what is inside.</p>
+
+        <h4>Making a cut</h4>
+        <p>Press <kbd>C</kbd> to drop a mark at the playhead, move to the other end, and press <kbd>C</kbd> again to commit. <kbd>Backspace</kbd> removes a cut — but only one you have expanded, so a stray press with nothing open cannot take time out of the movie.</p>
+
+        <h4>Zoom</h4>
+        <p>Zoom is automatic, derived from your clicks, with <strong>amount</strong>, <strong>hold</strong>, <strong>ease</strong> and <strong>merge gap</strong> in the panel. To remove a single unwanted move — the click on a menu you would rather not zoom at — select it on the zoom row and press <kbd>Delete</kbd>. It stays deleted through every later edit. When any are deleted, the panel grows a <strong>restore</strong> button, because a deleted move leaves no gap on the timeline to click.</p>
+
+        <h4>Layers and the camera</h4>
+        <p>Text, images, captions, shapes and redactions, each with its own inspector plus a shared <em>when</em> section for its time range. Draw tools live on the canvas — select, text, blur, pixelate; <kbd>Esc</kbd> disarms back to select.</p>
+        <p>Because the camera is its own stream, the bubble can be moved, resized, reshaped or mirrored at any time. <kbd>S</kbd> splits the camera segment at the playhead — deleting the right-hand half is how a head that is on for the whole take becomes one that goes away partway.</p>
+
+        <h4>Export</h4>
+        <p>Pick <span class="mono">1080p</span>, <span class="mono">1440p</span>, <span class="mono">4k</span> or <span class="mono">native</span>. A preset is a <em>ceiling, never a target</em>: asking for 1440p from a 1080p capture gives you 1080p, because inventing pixels costs time and file size to make the picture no better. When the render finishes, your file manager opens at the result.</p>
+
+        <h3 id="keys">Keyboard shortcuts</h3>
+        <div class="tw">
+        <table>
+          <thead><tr><th style="width:34%">Key</th><th>Does</th></tr></thead>
+          <tbody>
+            <tr><td><kbd>Space</kbd></td><td>play / pause</td></tr>
+            <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>step one frame</td></tr>
+            <tr><td><kbd>C</kbd></td><td>mark a cut, then commit it</td></tr>
+            <tr><td><kbd>Backspace</kbd></td><td>remove the expanded cut</td></tr>
+            <tr><td><kbd>Delete</kbd></td><td>delete the selected layer, or the selected zoom</td></tr>
+            <tr><td><kbd>S</kbd></td><td>split the camera segment at the playhead</td></tr>
+            <tr><td><kbd>P</kbd></td><td>preview mode — hide every editing handle</td></tr>
+            <tr><td><kbd>L</kbd></td><td>show or hide the layer list</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>disarm the draw tool, clear a selection, or leave preview mode</td></tr>
+            <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>save</td></tr>
+            <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>undo</td></tr>
+            <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>redo</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <p>Every letter shortcut is suppressed while a text field has focus, so typing a layer's name cannot fire an edit.</p>
+
+        <h3>Worth knowing</h3>
+        <ul>
+          <li><strong>Undo is a whole-project snapshot</strong>, not a per-operation inverse, and drags coalesce into one step — so one <kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes one <em>gesture</em>, not sixty frames of a drag.</li>
+          <li><strong>Saving is atomic.</strong> A crash mid-save cannot leave an unparseable <code>edit.json</code>.</li>
+          <li><strong>A take survives being stopped by something else.</strong> If the recorder is killed from outside — the stock bar indicator, a <code>pkill</code>, a crash — the bundle is finalised anyway, either by a watcher or the next time the dispatch runs.</li>
+        </ul>
+      </section>
+
+    </div>
+  </div>
+
+  <div class="wrap">
+    <footer class="end">
+      <span>omarchy-studio</span>
+      <a href="https://github.com/the2dl/omarchy-studio">github.com/the2dl/omarchy-studio</a>
+      <span>Hyprland · Wayland · ffmpeg</span>
+    </footer>
+  </div>
+</main>
+
+<script>
+(function () {
+  // Theme toggle. The button names the theme you would switch TO, which is the one
+  // thing about a toggle people get wrong when it names the current state instead.
+  var root = document.documentElement, btn = document.getElementById("themeBtn");
+  function currentIsDark() {
+    var set = root.getAttribute("data-theme");
+    if (set) return set === "dark";
+    return !window.matchMedia("(prefers-color-scheme: light)").matches;
+  }
+  function label() { btn.textContent = currentIsDark() ? "Light" : "Dark"; }
+  btn.addEventListener("click", function () {
+    root.setAttribute("data-theme", currentIsDark() ? "light" : "dark");
+    label();
+    try { localStorage.setItem("os-theme", root.getAttribute("data-theme")); } catch (e) {}
+  });
+  try {
+    var saved = localStorage.getItem("os-theme");
+    if (saved === "light" || saved === "dark") root.setAttribute("data-theme", saved);
+  } catch (e) {}
+  label();
+  window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", label);
+
+  // Highlight the section in view.
+  var links = Array.prototype.slice.call(document.querySelectorAll(".rail a"));
+  var targets = links.map(function (a) { return document.querySelector(a.getAttribute("href")); });
+  function onScroll() {
+    var best = 0, top = 120;
+    for (var i = 0; i < targets.length; i++) {
+      if (targets[i] && targets[i].getBoundingClientRect().top <= top) best = i;
+    }
+    links.forEach(function (a, i) { a.classList.toggle("on", i === best); });
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+})();
+</script>
+</body>
+</html>

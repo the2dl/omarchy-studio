@@ -69,6 +69,15 @@ Hyprland (tested on 0.56.2, Lua config), plus:
 
 Python 3.12+. The optional caption engine (`faster-whisper`) lives in the repo venv.
 
+## Documentation
+
+Full docs, and a rendered version for GitHub Pages:
+
+    docs/how-it-works.md      the model: bundles, the four stages, why the stage order
+    docs/engines.md           capture backends, render, audio, redaction -- and the numbers
+    docs/using-the-editor.md  the setup bar, the HUD, the timeline, every shortcut
+    docs/index.html           all three as one page; what Pages serves
+
 ## Installing it on another machine
 
 The core needs no build step -- it runs out of the checkout, on the system Python.

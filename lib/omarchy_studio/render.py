@@ -791,9 +791,26 @@ def _declick_chain() -> str:
     if not RNNOISE_MODEL.exists():
         # Ship-but-verify: without the model, afftdn alone still gives ~6dB, which is
         # far better than the adeclick this replaced. Never fail an export over it.
-        return "afftdn=nr=12:nf=-40:tn=1"
+        return f"afftdn=nr=12:nf=-40:tn=1,{_latency_trim(0.025)}"
     model = str(RNNOISE_MODEL).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-    return f"arnndn=m='{model}',afftdn=nr=12:nf=-40:tn=1"
+    return f"arnndn=m='{model}',afftdn=nr=12:nf=-40:tn=1,{_latency_trim(0.035)}"
+
+
+def _latency_trim(seconds: float) -> str:
+    """Drop the denoisers' own latency, so the audio stays under its picture.
+
+    Both filters buffer, and NOTHING in ffmpeg compensates it: measured with a 1 kHz
+    burst at t=1.000s and the onset compared against the source, arnndn delays 9.94ms
+    and afftdn 25.00ms, so the pair runs 34.94ms late. Before this trim, turning
+    "Remove keyboard clicks" ON therefore pushed the ENTIRE audio track ~35ms behind
+    the picture, on every machine and every export that used the option -- a lip-sync
+    error nobody would attribute to a denoiser.
+
+    Trimming the front is the cheap fix: the samples dropped are the filters' own
+    ramp-up, and the track ends `seconds` early rather than starting `seconds` late.
+    Verified back to -0.06ms with the trim in place.
+    """
+    return f"atrim=start={seconds},asetpts=PTS-STARTPTS"
 
 
 # The draft the editor scrubs. Wide enough to read, small enough to build fast.

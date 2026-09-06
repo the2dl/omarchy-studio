@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import os
 import subprocess
 
 import pytest
@@ -236,14 +237,32 @@ def test_the_same_terms_in_a_linear_chain_do_fail(tmp_path):
 
 @needs_ffmpeg
 def test_the_graph_survives_being_passed_as_a_file(tmp_path):
-    """argv dies at ~288 KB with E2BIG and ffmpeg 9.0.1 removed
-    `-filter_complex_script`, so `-/filter_complex <path>` is the only way in."""
+    """A single argv entry dies at MAX_ARG_STRLEN with E2BIG, and ffmpeg 9.0.1
+    removed `-filter_complex_script`, so `-/filter_complex <path>` is the only way in.
+
+    That limit is 32 PAGES, not a constant: 128 KB on the 4 KB pages of a typical
+    x86-64 box, but 512 KB on the 16 KB pages Asahi uses on Apple silicon. A graph
+    hardcoded to be "big enough" was therefore only big enough on one of them -- and
+    the failure read as the graph builder being broken rather than the test making an
+    assumption about the kernel. So the size comes from the platform.
+    """
+    limit = 32 * os.sysconf("SC_PAGESIZE")
     s = settings(hold_frames=2, ease_frames=1, merge_gap_frames=0)
-    segs = zoom_segments([click(4 * i, 0.3, 0.4) for i in range(150)], s, TB, CutMap([], 700))
-    graph = f"[0:v]{zoom_filter(segs, CANVAS, TB)}[vout]"
+
+    # Grow until the graph is past THIS machine's limit, with room to spare so the
+    # test is not sitting on the boundary it is trying to cross.
+    clicks = 150
+    while True:
+        segs = zoom_segments([click(4 * i, 0.3, 0.4) for i in range(clicks)], s, TB,
+                             CutMap([], 4 * clicks + 100))
+        graph = f"[0:v]{zoom_filter(segs, CANVAS, TB)}[vout]"
+        if len(graph.encode()) > limit + 8192:
+            break
+        clicks = int(clicks * 1.5) + 10
+
     gp = tmp_path / "big.txt"
     gp.write_text(graph + "\n")
-    assert gp.stat().st_size > 288_000
+    assert gp.stat().st_size > limit
 
     # E2BIG arrives as an OSError from the exec itself, before ffmpeg exists to report
     # anything -- which is why this failure mode is so easy to mistake for a crash.

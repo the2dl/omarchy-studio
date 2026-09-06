@@ -85,18 +85,45 @@ Item {
     // failure this file's own comment exists to prevent.
     readonly property bool squareCrop: true
 
+    // Shadow geometry, in the SAME proportions layers._shadow_margin uses, against the
+    // bubble's displayed size rather than its export size -- so what you see here is
+    // what the export draws, at whatever zoom the canvas happens to be at.
+    readonly property bool shadowOn: root.cam.shadow !== false
+    readonly property real shadowMargin: Math.max(2, 0.09 * Math.min(root.width, root.height))
+    readonly property real shadowDrop: Math.max(1, 0.30 * shadowMargin)
+
     Item {
         id: clipBox
         x: 0; y: 0
         width: root.width
         height: root.height
-        layer.enabled: root.cam.shape !== "rect"
+        // A `rect` bubble needs no mask, but it still gets a shadow -- so the layer is
+        // enabled for either reason and the mask is switched separately.
+        layer.enabled: root.cam.shape !== "rect" || root.shadowOn
         layer.effect: MultiEffect {
-            maskEnabled: true
+            maskEnabled: root.cam.shape !== "rect"
             // Two separate mask items, chosen here, rather than one item whose children
             // toggle `visible`: a layered mask whose child visibility changes does not
             // reliably re-render, and the failure is silent -- the webcam disappears.
             maskSource: root.cam.shape === "circle" ? ellipseMask : squircleMask
+
+            // The export's drop shadow, matched by eye rather than by formula: the
+            // filtergraph blurs a silhouette with a Gaussian of sigma = margin/3, and
+            // MultiEffect's shadowBlur is a 0..1 fraction of blurMax, so there is no
+            // exact translation. What IS matched is the thing that matters -- the
+            // shadow scales with the bubble, so shrinking the camera shrinks its shadow
+            // in the preview exactly as it does in the export.
+            //
+            // autoPaddingEnabled, or the shadow is clipped to the bubble's own bounds
+            // and reads as a dark rim instead of a shadow.
+            shadowEnabled: root.shadowOn
+            autoPaddingEnabled: true
+            blurMax: 40
+            shadowBlur: Math.min(1, (root.shadowMargin * 1.6) / 40)
+            shadowOpacity: 0.55
+            shadowColor: "black"
+            shadowVerticalOffset: root.shadowDrop
+            shadowHorizontalOffset: 0
         }
 
         VideoOutput {

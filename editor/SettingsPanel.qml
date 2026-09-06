@@ -544,6 +544,24 @@ ScrollView {
                 }
             }
 
+            // Lifts the bubble off the picture. Applies to all three shapes -- a rect
+            // camera gets one too, which is the case worth checking when this moves.
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                C.Toggle {
+                    checked: root.cam.shadow !== false
+                    enabled: root.camEditable
+                    onToggled: function (v) { root.camOp({ shadow: v }) }
+                }
+                Text {
+                    text: "Shadow"
+                    color: root.camEditable ? Theme.text3 : Theme.text6
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fsRow
+                }
+            }
+
             C.Caption { text: "shape"; opacity: root.camEditable ? 1.0 : 0.5 }
 
             C.Segmented {

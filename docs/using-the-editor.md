@@ -130,7 +130,9 @@ leaks the pixels it exists to hide. What the preview shows is what exports.
 ### The camera
 
 The camera is its own stream, so the bubble can be moved, resized, reshaped (circle,
-rounded, rectangle) or mirrored at any time. Press **S** to split the camera segment at
+rounded, rectangle) or mirrored at any time. **Shadow** lifts it off the picture the way
+Screen Studio does — it applies to all three shapes and scales with the bubble, so
+shrinking the camera shrinks its shadow. Press **S** to split the camera segment at
 the playhead — deleting the right-hand half is how a head that is on for the whole take
 becomes one that goes away partway.
 

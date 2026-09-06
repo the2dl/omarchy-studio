@@ -287,6 +287,7 @@ def resolve_webcam(bundle: Bundle) -> dict:
             "enabled": cam.enabled,
             "shape": cam.shape,
             "mirror": cam.mirror,
+            "shadow": cam.shadow,
             # The size control's value: the width as a fraction of the canvas, which is
             # the one number that describes the camera box (the height is derived --
             # WebcamSettings.placement). The corner grip writes the same field through
@@ -692,6 +693,7 @@ def project_state(
                     "enabled": seg.enabled,
                     "shape": seg.props.get("shape", bundle.edit.webcam.shape),
                     "mirror": bool(seg.props.get("mirror", bundle.edit.webcam.mirror)),
+                    "shadow": bool(seg.props.get("shadow", bundle.edit.webcam.shadow)),
                     "corner_radius": float(
                         seg.props.get("corner_radius", bundle.edit.webcam.corner_radius)),
                     # The size control's value, same meaning as resolve_webcam's:
@@ -824,7 +826,7 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
                 canvas,
             )
             cam.x, cam.y, cam.w, cam.h = p.x, p.y, p.w, p.h
-        for key in ("enabled", "mirror"):
+        for key in ("enabled", "mirror", "shadow"):
             if key in args:
                 setattr(cam, key, bool(args[key]))
         if "shape" in args:

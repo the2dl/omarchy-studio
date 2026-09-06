@@ -290,6 +290,12 @@ class WebcamSettings:
     shape: str = "circle"  # circle | rounded | rect
     corner_radius: float = 0.12
     mirror: bool = True
+    # A drop shadow behind the bubble, the way Screen Studio lifts its camera off the
+    # plate. Defaults ON, matching BackdropSettings.shadow: a bubble sitting flat on the
+    # picture is the thing people notice and cannot name, and both shadows are the same
+    # idea applied to the two things that float. Costs one blurred mask per export --
+    # the mask is a single frame, so the blur runs once, not per frame.
+    shadow: bool = True
 
     # One vocabulary, three shapes, everywhere: the setup bar, this model, the editor
     # panel and the live self-view all say circle / rounded / rect. They did not always

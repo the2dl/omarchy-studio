@@ -518,7 +518,7 @@ def test_no_webcam_shape_stretches_the_camera():
                               ("rect", 716, 716, "1.000000"),
                               ("rect", 900, 400, "2.250000"),
                               ("rounded", 300, 300, "1.000000")):
-        chains, _ = layers_mod._tile_webcam(
+        chains, _tile, _shadow = layers_mod._tile_webcam(
             Layer(id="w", type="webcam", props={"shape": shape}), "w",
             layers_mod.Rect(0, 0, w, h), reg)
         assert f"ih*{want}" in chains[0], f"{shape} {w}x{h} does not crop to its box"

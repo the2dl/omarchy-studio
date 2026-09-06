@@ -339,6 +339,7 @@ def webcam_layer(
             "shape": settings.shape,
             "corner_radius": settings.corner_radius,
             "mirror": settings.mirror,
+            "shadow": settings.shadow,
         },
     )
 
@@ -447,6 +448,7 @@ def _compile_overlay(
     ramp = fade_filters(ramp_span, layer.fade_frames)
 
     before = len(inputs.inputs)
+    shadow = None
     if layer.type == "image":
         chains, tile = _tile_image(layer, name, rect, cutmap, tb, inputs, not ramp)
     elif layer.type == "text":
@@ -456,13 +458,28 @@ def _compile_overlay(
     elif layer.type == "shape":
         chains, tile = _tile_shape(layer, name, rect, cutmap, tb, not ramp)
     else:
-        chains, tile = _tile_webcam(layer, name, rect, inputs)
+        chains, tile, shadow = _tile_webcam(layer, name, rect, inputs)
     extra_inputs = inputs.inputs[before:]
 
     tail = ",".join(b for b in (ramp, _opacity(layer)) if b)
     if tail:
         chains.append(f"{tile}{tail}[{name}_f]")
         tile = f"[{name}_f]"
+
+    # The shadow goes down FIRST, under the tile, as its own overlay against the base.
+    # It carries the same fade and opacity, so a bubble that fades in does not arrive
+    # with its shadow already at full strength.
+    if shadow is not None:
+        shadow_label, dx, dy = shadow
+        if tail:
+            chains.append(f"{shadow_label}{tail}[{name}_shf]")
+            shadow_label = f"[{name}_shf]"
+        chains.append(
+            f"{lin}{shadow_label}"
+            f"overlay=x={int(rect.x) + dx}:y={int(rect.y) + dy}:enable='{gate}'"
+            f":eof_action=repeat:shortest=0:format=auto[{name}_sh]"
+        )
+        lin = f"[{name}_sh]"
 
     out = f"[{name}_o]"
     # eof_action=repeat + shortest=0 because the streams end at different instants:
@@ -617,7 +634,7 @@ def _tile_shape(
 
 def _tile_webcam(
     layer: Layer, name: str, rect: Rect, inputs: InputRegistry
-) -> tuple[list[str], str]:
+) -> tuple[list[str], str, tuple[str, int, int] | None]:
     cam = inputs.label("camera")
     w, h = int(rect.w), int(rect.h)
     shape = layer.props.get("shape", "circle")
@@ -644,18 +661,92 @@ def _tile_webcam(
     chains = [
         f"{cam}{pre}{mirror}scale={w}:{h}:flags=bicubic,setsar=1,format=rgba[{name}_c]"
     ]
+    shadow = bool(layer.props.get("shadow", False))
+
     if shape == "rect":
-        return chains, f"[{name}_c]"
+        if not shadow:
+            return chains, f"[{name}_c]", None
+        # No mask to reuse -- a rect bubble needs none.
+        chains, lbl, dx, dy = _shadow_plate(chains, name, w, h, None)
+        return chains, f"[{name}_c]", (lbl, dx, dy)
+
     # `rounded` is the superellipse, not a rectangle with a big radius -- see
     # _squircle_mask for why those are not the same shape. The shallow rounded rectangle
     # the webcam used to offer under this name is gone; `corner_radius` survives on the
     # model for the backdrop, which still wants a real radius.
     mask = _circle_mask(w, h) if shape == "circle" else _squircle_mask(w, h)
     chains.append(
-        f"color=c=black:s={w}x{h}:r=1:d=1,format=gray,geq=lum='{mask}'[{name}_m]"
+        f"color=c=black:s={w}x{h}:r=1:d=1,format=gray,geq=lum='{mask}'[{name}_mk]"
     )
+    if shadow:
+        # ffmpeg hands a labelled pad to exactly ONE consumer, and the shape is wanted
+        # twice: as the bubble's alpha, and as the silhouette the shadow is blurred from.
+        # Splitting is cheaper than evaluating the geq expression a second time.
+        chains.append(f"[{name}_mk]split=2[{name}_m][{name}_shm]")
+    else:
+        chains.append(f"[{name}_mk]null[{name}_m]")
     chains.append(f"[{name}_c][{name}_m]alphamerge=repeatlast=1:shortest=0[{name}_s]")
-    return chains, f"[{name}_s]"
+    if not shadow:
+        return chains, f"[{name}_s]", None
+    chains, lbl, dx, dy = _shadow_plate(chains, name, w, h, f"[{name}_shm]")
+    return chains, f"[{name}_s]", (lbl, dx, dy)
+
+
+# The bubble's drop shadow. Proportional to the bubble, because a fixed blur that reads
+# as "lifted" on a 700px circle is a smudge under a 200px one -- and the bubble's size
+# is a slider people actually move.
+SHADOW_SPREAD = 0.09      # blur margin, as a fraction of the bubble's short side
+SHADOW_DROP = 0.30        # how far the shadow sits below it, as a fraction of that margin
+SHADOW_ALPHA = 0.55       # softer than the backdrop's 0.6: this sits on picture, not plate
+
+
+def _shadow_margin(w: int, h: int) -> tuple[int, int]:
+    """Blur margin and vertical drop, both even, for a bubble of this size."""
+    m = max(4, int(round(SHADOW_SPREAD * min(w, h))))
+    m += m % 2
+    dy = max(2, int(round(SHADOW_DROP * m)))
+    dy += dy % 2
+    return m, dy
+
+
+def _shadow_plate(
+    chains: list[str], name: str, w: int, h: int, mask_label: str | None
+) -> tuple[list[str], str, int, int]:
+    """A blurred silhouette of the bubble, and where to put it relative to the bubble.
+
+    A STILL, exactly like every other tile in this file, held in place by the overlay's
+    `eof_action=repeat`. That is not an optimisation, it is the only arrangement that
+    works: the shadow has to sit UNDER the camera, and the first version put it in the
+    tile as the overlay's main input instead. A still main input drags its own 1/1
+    timebase into the output and froze the camera on frame one for the entire take --
+    the trap `_backdrop` documents. Making it infinite fixed that and then ended the
+    tile one frame early through `shortest=1`, which is the OTHER trap in the same
+    docstring. Emitting it as its own overlay against the base avoids both: the base is
+    finite, it decides the length, and a one-frame tile is what this file already knows
+    how to hold.
+
+    `mask_label` is the bubble's alpha shape, or None for a `rect` bubble, which needs
+    no mask; the silhouette then comes off a solid plate of the same size.
+    """
+    m, dy = _shadow_margin(w, h)
+    W, H = w + 2 * m, h + 2 * m + dy
+
+    if mask_label is None:
+        chains.append(f"color=c=white:s={w}x{h}:r=1:d=1,format=gray[{name}_shm]")
+        mask_label = f"[{name}_shm]"
+
+    chains.append(
+        f"{mask_label}pad={W}:{H}:{m}:{m + dy}:color=black,"
+        f"gblur=sigma={m / 3.0:.3f}:steps=3[{name}_sha]"
+    )
+    chains.append(f"color=c=black:s={W}x{H}:r=1:d=1,format=rgba[{name}_shc]")
+    chains.append(
+        f"[{name}_shc][{name}_sha]alphamerge=repeatlast=1:shortest=0,"
+        f"colorchannelmixer=aa={SHADOW_ALPHA}[{name}_shadow]"
+    )
+    # Relative to the bubble's own rect: the plate starts a margin up and to the left,
+    # and the silhouette inside it is padded down by `dy`, so the shadow falls below.
+    return chains, f"[{name}_shadow]", -m, -m
 
 
 # -- redaction ---------------------------------------------------------------

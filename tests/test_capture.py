@@ -582,13 +582,15 @@ def test_no_plugin_script_ever_updates_every_repo():
             assert "hyprpm update" not in stripped, f"{name} runs a global update: {line}"
 
 
-def test_the_autostart_hook_does_nothing_off_x86_64():
+def test_the_autostart_hook_does_nothing_where_the_plugin_cannot_load():
     """It is meant for `exec_on_start` on dotfiles shared between machines.
 
-    Hyprland's plugin function-hooking is x86_64-only -- CFunctionHook::hook() returns
-    false everywhere else -- so the plugin builds, hyprpm calls it enabled, and it dies
-    in init. Without this gate the hook would find it "not loaded" every login, decide
-    the build was stale, spend a cmake compile, and notify that it still did not load.
+    Hyprland's own hooking is x86_64-only -- CFunctionHook::hook() returns false
+    everywhere else -- but aarch64 loads through the vendored funchook, so the gate
+    must let it through. On an architecture with neither, the plugin builds, hyprpm
+    calls it enabled, and it dies in init: without the gate the hook would find it
+    "not loaded" every login, decide the build was stale, spend a cmake compile, and
+    notify that it still did not load.
     Forever, on a machine where it can never work.
     """
     src = (Path(__file__).resolve().parents[1] / "contrib"
@@ -596,6 +598,7 @@ def test_the_autostart_hook_does_nothing_off_x86_64():
     gate = src[:src.index("loaded() {")]
     assert "uname -m" in gate, "the arch gate must come before anything else runs"
     assert "x86_64" in gate
+    assert "aarch64" in gate, "aarch64 loads via the vendored funchook -- do not gate it out"
     assert "exit 0" in gate
 
 

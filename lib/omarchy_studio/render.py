@@ -360,7 +360,13 @@ def build_graph(bundle: Bundle, *, for_proxy: bool = False) -> RenderPlan:
         if edit.normalize_audio:
             # loudnorm AFTER the cut: it measures the material it is normalizing, and a
             # cut that removes a loud passage changes the right answer.
-            g.add(f"{aout}loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
+            #
+            # aresample because loudnorm works internally at 192kHz and OUTPUTS at that
+            # rate; nothing downstream put it back, so every normalised export carried
+            # 96kHz AAC off a 48kHz capture -- twice the rate, none of the information,
+            # and a file some players resample again on the way out. The capture side
+            # writes 48kHz, so that is what the export should be.
+            g.add(f"{aout}loudnorm=I=-14:TP=-1.5:LRA=11,aresample={AUDIO_RATE}[aout]")
         else:
             g.add(f"{aout}anull[aout]")
         maps += ["-map", "[aout]"]
@@ -750,6 +756,9 @@ def _backdrop(
     g.add("[bg][content_cfr]overlay=x=0:y=0:shortest=1:format=auto[composited]")
     return "[composited]"
 
+
+# What the capture side writes, and therefore what an export should come out at.
+AUDIO_RATE = 48000
 
 RNNOISE_MODEL = Path(__file__).resolve().parent / "assets" / "beguiling-drafter.rnnn"
 

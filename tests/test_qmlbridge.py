@@ -214,6 +214,16 @@ def test_zoom_track_eases_from_identity_to_the_full_amount(media_bundle):
 # --- intents -----------------------------------------------------------------
 
 
+def test_set_webcam_shadow_depth_is_clamped_and_reported(bundle):
+    qmlbridge.apply_op(bundle, "set_webcam", {"shadow_depth": 0.8})
+    assert bundle.edit.webcam.shadow_depth == 0.8
+    assert qmlbridge.project_state(bundle)["webcam"]["shadow_depth"] == 0.8
+    qmlbridge.apply_op(bundle, "set_webcam", {"shadow_depth": 4})
+    assert bundle.edit.webcam.shadow_depth == 1.0
+    with pytest.raises(qmlbridge.BridgeError):
+        qmlbridge.apply_op(bundle, "set_webcam", {"shadow_depth": "deep"})
+
+
 def test_set_webcam_from_a_dragged_rect(bundle):
     canvas = bundle.canvas
     qmlbridge.apply_op(bundle, "set_webcam", {"rect": {"x": 640, "y": 360, "width": 256, "height": 144}})

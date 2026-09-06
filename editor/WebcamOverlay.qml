@@ -19,6 +19,7 @@ Item {
 
     property var cam: ({})
     property alias videoOutput: camOut
+    property alias shadowItem: bubbleShadow
     property bool selected: false
     property bool editable: cam.editable === true && cam.enabled === true
     // Preview mode: ring, handles and grip hide and dragging goes inert; the camera
@@ -85,45 +86,91 @@ Item {
     // failure this file's own comment exists to prevent.
     readonly property bool squareCrop: true
 
-    // Shadow geometry, in the SAME proportions layers._shadow_margin uses, against the
-    // bubble's displayed size rather than its export size -- so what you see here is
-    // what the export draws, at whatever zoom the canvas happens to be at.
+    // Shadow geometry: the SAME constants and the SAME rounding as layers._shadow_margin
+    // and _shadow_plate -- SHADOW_SPREAD 0.22, SHADOW_DROP 0.38, SHADOW_ALPHA 0.60,
+    // shadow_scale = 0.5 + depth, floors of 4 and 2, rounded to even. This item lives
+    // inside the stage's fit transform, so root.width IS the export's bubble width and
+    // every number below is canvas pixels: the margin here and the margin in the
+    // filtergraph are the same integer, not the same proportion.
     readonly property bool shadowOn: root.cam.shadow !== false
-    readonly property real shadowMargin: Math.max(2, 0.09 * Math.min(root.width, root.height))
-    readonly property real shadowDrop: Math.max(1, 0.30 * shadowMargin)
+    readonly property real shadowDepth: root.cam.shadow_depth === undefined ? 0.5
+                                        : Math.min(1, Math.max(0, root.cam.shadow_depth))
+    readonly property real shadowScale: 0.5 + shadowDepth
+    readonly property int shadowMargin: {
+        var m = Math.max(4, Math.round(0.22 * shadowScale * Math.min(root.width, root.height)))
+        return m + (m % 2)
+    }
+    readonly property int shadowDrop: {
+        var d = Math.max(2, Math.round(0.38 * shadowMargin))
+        return d + (d % 2)
+    }
+    readonly property real shadowOpacity: Math.min(1, 0.60 * shadowScale)
+
+    // THE SHADOW: RectangularShadow (QtQuick.Effects, Qt 6.9+), a blurred rounded
+    // rectangle drawn from NO source item that paints OUTSIDE its own bounds. Both halves
+    // of that sentence matter, because four MultiEffect arrangements before it showed
+    // the user no shadow for any shape:
+    //   * `shadowEnabled` on the bubble's own mask effect: the padding a shadow needs
+    //     grows the effect texture while maskSource stays sized to the item, so the
+    //     mask lines up with nothing and every shape degenerates to the same rounded
+    //     rectangle -- one bug, reported as "shape no longer changes".
+    //   * `shadowEnabled` as a layer effect on a wrapper item: a layer effect's geometry
+    //     IS the item's geometry, so nothing is drawn past the bubble's edge however
+    //     `autoPaddingEnabled` is set.
+    //   * a standalone MultiEffect with `source:` on one of the invisible mask items,
+    //     which also carry `layer.enabled`: nothing. Preview.qml's backdrop shadow does
+    //     source an invisible item, so the layer is the likely difference; untested.
+    //   * an oversized item holding a black silhouette, blur-layered: nothing.
+    // The "zero pixels different" those attempts were measured at proves less than it
+    // sounds: the method toggled a running editor over the bridge and diffed
+    // screenshots, and Bridge.qml only re-fetches /state at startup and when a proxy
+    // build ends, so the window never saw the toggle. What works is one launch per
+    // state with --selftest-op and --grab, at a fixed --frame, over a flat light clip.
+    //
+    // Calibrated against the export rather than matched by eye. The export pads the
+    // silhouette by m and runs gblur sigma=m/3, and its rect plate fits a Gaussian
+    // edge of sigma 14.5 at m=44. A 200px square under THIS item at blur 20/40/60
+    // fitted sigma 7.5/15.1/22.75 (error < 0.04), so sigma = 0.375 * blur, and
+    // blur = m * 8/9 gives the export's edge. offset.y > 0 falls downward. `spread`
+    // fattens the edge (0.45 -> 0.69 at 10px, measured) and stays 0. The bubble covers
+    // its own middle, so only the edge is ever seen and only the edge had to match.
+    RectangularShadow {
+        id: bubbleShadow
+        visible: root.shadowOn
+        x: 0; y: 0
+        width: root.width
+        height: root.height
+        // circle: the box is square by construction (WebcamSettings.placement derives
+        // h from w), so a half-side radius is a true circle. rounded: SquircleShape's
+        // n=4 superellipse passes through 2^(-1/4) of the half-side on the diagonal,
+        // and a rounded square whose corner does the same has radius 0.27 of the side;
+        // under a blur of sigma 0.073 * side the two are indistinguishable. rect: none.
+        radius: root.cam.shape === "circle" ? Math.min(root.width, root.height) / 2
+              : root.cam.shape === "rect" ? 0
+              : 0.27 * Math.min(root.width, root.height)
+        blur: root.shadowMargin * 8 / 9
+        spread: 0
+        offset.x: 0
+        offset.y: root.shadowDrop
+        color: Qt.rgba(0, 0, 0, root.shadowOpacity)
+    }
 
     Item {
         id: clipBox
         x: 0; y: 0
         width: root.width
         height: root.height
-        // A `rect` bubble needs no mask, but it still gets a shadow -- so the layer is
-        // enabled for either reason and the mask is switched separately.
-        layer.enabled: root.cam.shape !== "rect" || root.shadowOn
+        layer.enabled: root.cam.shape !== "rect"
         layer.effect: MultiEffect {
-            maskEnabled: root.cam.shape !== "rect"
+            maskEnabled: true
+            // NO padding here. Padding grows the effect's texture while maskSource
+            // stays sized to these bounds, and the mask then lines up with nothing.
+            autoPaddingEnabled: false
             // Two separate mask items, chosen here, rather than one item whose children
             // toggle `visible`: a layered mask whose child visibility changes does not
             // reliably re-render, and the failure is silent -- the webcam disappears.
             maskSource: root.cam.shape === "circle" ? ellipseMask : squircleMask
 
-            // The export's drop shadow, matched by eye rather than by formula: the
-            // filtergraph blurs a silhouette with a Gaussian of sigma = margin/3, and
-            // MultiEffect's shadowBlur is a 0..1 fraction of blurMax, so there is no
-            // exact translation. What IS matched is the thing that matters -- the
-            // shadow scales with the bubble, so shrinking the camera shrinks its shadow
-            // in the preview exactly as it does in the export.
-            //
-            // autoPaddingEnabled, or the shadow is clipped to the bubble's own bounds
-            // and reads as a dark rim instead of a shadow.
-            shadowEnabled: root.shadowOn
-            autoPaddingEnabled: true
-            blurMax: 40
-            shadowBlur: Math.min(1, (root.shadowMargin * 1.6) / 40)
-            shadowOpacity: 0.55
-            shadowColor: "black"
-            shadowVerticalOffset: root.shadowDrop
-            shadowHorizontalOffset: 0
         }
 
         VideoOutput {

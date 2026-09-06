@@ -12,14 +12,16 @@ avoids them, and is what this file already does for every other static tile.
 from __future__ import annotations
 
 
-def _cam(shape="circle", shadow=True, w=200, h=200):
+def _cam(shape="circle", shadow=True, w=200, h=200, depth=None):
     """The webcam tile's chains, its tile label, and its shadow plate (or None)."""
     from omarchy_studio.geometry import Rect
     from omarchy_studio.layers import InputRegistry, _tile_webcam
     from omarchy_studio.project import Layer
 
-    layer = Layer(id="webcam", type="webcam", x=0.0, y=0.0, w=0.5, h=0.5,
-                  props={"shape": shape, "mirror": True, "shadow": shadow})
+    props = {"shape": shape, "mirror": True, "shadow": shadow}
+    if depth is not None:
+        props["shadow_depth"] = depth
+    layer = Layer(id="webcam", type="webcam", x=0.0, y=0.0, w=0.5, h=0.5, props=props)
     reg = InputRegistry()
     reg.bind("camera", "[cam]")
     chains, tile, sh = _tile_webcam(layer, "webcam", Rect(0, 0, w, h), reg)
@@ -111,3 +113,53 @@ def test_the_shadow_is_drawn_under_the_bubble_not_over_it():
                            Timebase(fps_num=30, fps_den=1), reg, label_in="[base]")
     g = frag.filter_chain
     assert g.index("_sh]") < g.index("_o]"), "the shadow must be composited first"
+
+
+# --- depth ---------------------------------------------------------------------
+
+
+def test_the_default_depth_is_the_tuned_look():
+    """shadow_scale is exactly 1 at rest, so a project saved before the slider existed
+    -- no `shadow_depth` in its props -- renders precisely as it did."""
+    from omarchy_studio.layers import SHADOW_DEPTH, _shadow_margin, shadow_scale
+
+    assert shadow_scale(SHADOW_DEPTH) == 1.0
+    assert _shadow_margin(240, 240, SHADOW_DEPTH) == _shadow_margin(240, 240)
+    assert "aa=0.600" in _cam(shadow=True)[0]
+    assert _cam(shadow=True)[0] == _cam(shadow=True, depth=SHADOW_DEPTH)[0]
+
+
+def test_depth_widens_and_darkens_the_shadow_together():
+    """One factor for both quantities. The preview applies the same one, which is what
+    keeps the slider's middle in the same place on both sides."""
+    from omarchy_studio.layers import _shadow_margin
+
+    shallow, shallow_dy = _shadow_margin(240, 240, 0.0)
+    rest, rest_dy = _shadow_margin(240, 240, 0.5)
+    deep, deep_dy = _shadow_margin(240, 240, 1.0)
+    assert shallow < rest < deep
+    assert shallow_dy < rest_dy < deep_dy
+    assert "aa=0.300" in _cam(shadow=True, depth=0.0)[0]
+    assert "aa=0.900" in _cam(shadow=True, depth=1.0)[0]
+
+
+def test_depth_is_clamped_everywhere_it_enters():
+    """A hand-edited 7.0 renders the deepest shadow, not an opaque plate or an error."""
+    from omarchy_studio.layers import shadow_scale
+    from omarchy_studio.project import WebcamSettings
+
+    assert shadow_scale(-3) == shadow_scale(0.0)
+    assert shadow_scale(9) == shadow_scale(1.0)
+    assert WebcamSettings(shadow_depth=7.0).shadow_depth == 1.0
+    assert WebcamSettings(shadow_depth=-1).shadow_depth == 0.0
+    assert "aa=0.900" in _cam(shadow=True, depth=7.0)[0]
+
+
+def test_the_webcam_layer_carries_the_depth():
+    """It has to reach the segment's props, because that is what the renderer reads."""
+    from omarchy_studio.geometry import Canvas
+    from omarchy_studio.layers import webcam_layer
+    from omarchy_studio.project import WebcamSettings
+
+    layer = webcam_layer(WebcamSettings(shadow_depth=0.8), Canvas(1920, 1080))
+    assert layer.props["shadow_depth"] == 0.8

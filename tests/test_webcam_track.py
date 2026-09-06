@@ -162,6 +162,30 @@ def test_the_panel_edits_the_selected_segment_not_the_default(tmp_path):
 
 
 @needs_ffmpeg
+def test_the_shadow_controls_edit_the_selected_segment_too(tmp_path):
+    """`shadow` was missing from the per-segment key list, so with a segment selected --
+    which clicking the bubble does -- the toggle changed the preview's global value and
+    nothing the export reads. Both shadow fields now go where mirror goes, and the
+    state reports the segment's own values back."""
+    root = tmp_path / "shadowseg"
+    synthetic.make_bundle(root, seconds=2.0, width=640, height=360)
+    b = Bundle(root)
+    qmlbridge.apply_op(b, "split_webcam", {"at_ms": 30 * 1000.0 / b.timebase.fps})
+
+    qmlbridge.apply_op(b, "set_webcam", {"id": "webcam1", "shadow": False, "shadow_depth": 0.9})
+    seg = next(l for l in b.edit.layers if l.id == "webcam1")
+    assert seg.props["shadow"] is False
+    assert seg.props["shadow_depth"] == 0.9
+    assert b.edit.webcam.shadow is True, "the whole-take default must not move"
+
+    got = {s["id"]: s for s in qmlbridge.project_state(b)["webcam_track"]["segments"]}
+    assert got["webcam1"]["shadow"] is False
+    assert got["webcam1"]["shadow_depth"] == 0.9
+    other = next(s for i, s in got.items() if i != "webcam1")
+    assert other["shadow"] is True and other["shadow_depth"] == 0.5
+
+
+@needs_ffmpeg
 def test_an_overlapping_add_is_reported_rather_than_silently_dropped(tmp_path):
     root = tmp_path / "overlap"
     synthetic.make_bundle(root, seconds=2.0, width=640, height=360)

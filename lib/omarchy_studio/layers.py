@@ -340,6 +340,7 @@ def webcam_layer(
             "corner_radius": settings.corner_radius,
             "mirror": settings.mirror,
             "shadow": settings.shadow,
+            "shadow_depth": settings.shadow_depth,
         },
     )
 
@@ -662,12 +663,14 @@ def _tile_webcam(
         f"{cam}{pre}{mirror}scale={w}:{h}:flags=bicubic,setsar=1,format=rgba[{name}_c]"
     ]
     shadow = bool(layer.props.get("shadow", False))
+    # A segment saved before the slider existed carries no depth and renders as it did.
+    depth = float(layer.props.get("shadow_depth", SHADOW_DEPTH))
 
     if shape == "rect":
         if not shadow:
             return chains, f"[{name}_c]", None
         # No mask to reuse -- a rect bubble needs none.
-        chains, lbl, dx, dy = _shadow_plate(chains, name, w, h, None)
+        chains, lbl, dx, dy = _shadow_plate(chains, name, w, h, None, depth)
         return chains, f"[{name}_c]", (lbl, dx, dy)
 
     # `rounded` is the superellipse, not a rectangle with a big radius -- see
@@ -688,21 +691,40 @@ def _tile_webcam(
     chains.append(f"[{name}_c][{name}_m]alphamerge=repeatlast=1:shortest=0[{name}_s]")
     if not shadow:
         return chains, f"[{name}_s]", None
-    chains, lbl, dx, dy = _shadow_plate(chains, name, w, h, f"[{name}_shm]")
+    chains, lbl, dx, dy = _shadow_plate(chains, name, w, h, f"[{name}_shm]", depth)
     return chains, f"[{name}_s]", (lbl, dx, dy)
 
 
 # The bubble's drop shadow. Proportional to the bubble, because a fixed blur that reads
 # as "lifted" on a 700px circle is a smudge under a 200px one -- and the bubble's size
 # is a slider people actually move.
-SHADOW_SPREAD = 0.09      # blur margin, as a fraction of the bubble's short side
-SHADOW_DROP = 0.30        # how far the shadow sits below it, as a fraction of that margin
-SHADOW_ALPHA = 0.55       # softer than the backdrop's 0.6: this sits on picture, not plate
+# Sized against Screen Studio's camera shadow, which is large and soft rather than a
+# tight rim: at 0.09 the blur was ~22px under a 250px bubble and simply did not read as
+# a shadow. These are fractions of the bubble's SHORT side, so they hold at any size.
+SHADOW_SPREAD = 0.22      # blur margin, as a fraction of the bubble's short side
+SHADOW_DROP = 0.38        # how far the shadow sits below it, as a fraction of that margin
+SHADOW_ALPHA = 0.60       # it has to survive landing on picture rather than on a plate
+# The depth those three describe, and WebcamSettings.shadow_depth's default. Named here
+# because this is the file that has to agree with itself about what "at rest" means.
+SHADOW_DEPTH = 0.5
 
 
-def _shadow_margin(w: int, h: int) -> tuple[int, int]:
+def shadow_scale(depth: float) -> float:
+    """What the depth slider multiplies the blur margin AND the opacity by.
+
+    One factor for both, linear, and exactly 1.0 at the default -- so the tuned
+    constants are the look at rest, 0 is half of it (the tight rim SHADOW_SPREAD used
+    to be) and 1 is one and a half times it. WebcamOverlay.qml applies the same
+    function to the same two numbers; a second curve on either side would put the
+    slider's middle in two different places.
+    """
+    depth = min(max(float(depth), 0.0), 1.0)
+    return 0.5 + depth
+
+
+def _shadow_margin(w: int, h: int, depth: float = SHADOW_DEPTH) -> tuple[int, int]:
     """Blur margin and vertical drop, both even, for a bubble of this size."""
-    m = max(4, int(round(SHADOW_SPREAD * min(w, h))))
+    m = max(4, int(round(SHADOW_SPREAD * shadow_scale(depth) * min(w, h))))
     m += m % 2
     dy = max(2, int(round(SHADOW_DROP * m)))
     dy += dy % 2
@@ -710,7 +732,8 @@ def _shadow_margin(w: int, h: int) -> tuple[int, int]:
 
 
 def _shadow_plate(
-    chains: list[str], name: str, w: int, h: int, mask_label: str | None
+    chains: list[str], name: str, w: int, h: int, mask_label: str | None,
+    depth: float = SHADOW_DEPTH,
 ) -> tuple[list[str], str, int, int]:
     """A blurred silhouette of the bubble, and where to put it relative to the bubble.
 
@@ -727,8 +750,12 @@ def _shadow_plate(
 
     `mask_label` is the bubble's alpha shape, or None for a `rect` bubble, which needs
     no mask; the silhouette then comes off a solid plate of the same size.
+
+    `depth` scales the margin and the alpha through shadow_scale, and nothing else:
+    the drop is a fraction of the margin, so it follows.
     """
-    m, dy = _shadow_margin(w, h)
+    m, dy = _shadow_margin(w, h, depth)
+    alpha = min(1.0, SHADOW_ALPHA * shadow_scale(depth))
     W, H = w + 2 * m, h + 2 * m + dy
 
     if mask_label is None:
@@ -742,7 +769,7 @@ def _shadow_plate(
     chains.append(f"color=c=black:s={W}x{H}:r=1:d=1,format=rgba[{name}_shc]")
     chains.append(
         f"[{name}_shc][{name}_sha]alphamerge=repeatlast=1:shortest=0,"
-        f"colorchannelmixer=aa={SHADOW_ALPHA}[{name}_shadow]"
+        f"colorchannelmixer=aa={alpha:.3f}[{name}_shadow]"
     )
     # Relative to the bubble's own rect: the plate starts a margin up and to the left,
     # and the silhouette inside it is padded down by `dy`, so the shadow falls below.

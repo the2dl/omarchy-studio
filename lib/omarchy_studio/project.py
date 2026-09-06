@@ -296,6 +296,14 @@ class WebcamSettings:
     # idea applied to the two things that float. Costs one blurred mask per export --
     # the mask is a single frame, so the blur runs once, not per frame.
     shadow: bool = True
+    # How far off the picture the bubble sits, 0..1. One number scales the shadow's
+    # blur margin and its opacity together (layers.shadow_scale) because they move
+    # together in the real thing: a higher object throws a wider and, on a diffuse
+    # ground, a denser shadow. 0.5 is exactly the look layers.py's constants were tuned
+    # to against Screen Studio; 0 is a tight rim, 1 a bubble held well clear of the
+    # frame. Not "off" at 0 -- `shadow` is the switch, and a slider that is also a
+    # switch reads as broken at one end.
+    shadow_depth: float = 0.5
 
     # One vocabulary, three shapes, everywhere: the setup bar, this model, the editor
     # panel and the live self-view all say circle / rounded / rect. They did not always
@@ -310,6 +318,8 @@ class WebcamSettings:
         self.shape = self.LEGACY_SHAPES.get(self.shape, self.shape)
         if self.shape not in ("circle", "rounded", "rect"):
             self.shape = "circle"
+        # Clamped, not validated: this is read from a file as often as from the slider.
+        self.shadow_depth = min(max(float(self.shadow_depth), 0.0), 1.0)
 
     def placement(self, canvas: Canvas) -> Placement:
         """The camera box, square in PIXELS for a circle.

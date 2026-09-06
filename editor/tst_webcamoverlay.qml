@@ -56,6 +56,51 @@ Item {
             compare(overlay.videoOutput.height, overlay.height)
         }
 
+        // The shadow's numbers are the export's numbers: these constants are what
+        // layers._shadow_margin(716, 716, depth) returns, including the floor and the
+        // rounding to even. Offscreen draws none of it, so the geometry is the check.
+        function test_the_shadow_geometry_is_the_exports_data() {
+            return [{ tag: "shallow", depth: 0.0, margin: 80, drop: 30, alpha: 0.3 },
+                    { tag: "rest", depth: 0.5, margin: 158, drop: 60, alpha: 0.6 },
+                    { tag: "deep", depth: 1.0, margin: 236, drop: 90, alpha: 0.9 }]
+        }
+
+        function test_the_shadow_geometry_is_the_exports(row) {
+            var c = harness.camFor("circle")
+            c.shadow = true
+            c.shadow_depth = row.depth
+            overlay.cam = c
+            compare(overlay.shadowMargin, row.margin, "margin at depth " + row.depth)
+            compare(overlay.shadowDrop, row.drop, "drop at depth " + row.depth)
+            fuzzyCompare(overlay.shadowOpacity, row.alpha, 0.0001)
+            compare(overlay.shadowItem.offset.y, row.drop)
+            fuzzyCompare(overlay.shadowItem.blur, row.margin * 8 / 9, 0.001)
+        }
+
+        function test_a_project_without_a_depth_is_at_rest() {
+            overlay.cam = harness.camFor("circle")     // no shadow_depth key at all
+            compare(overlay.shadowMargin, 158)
+            verify(overlay.shadowItem.visible, "the shadow defaults on, like the model")
+        }
+
+        function test_the_shadow_follows_the_shape_data() {
+            return [{ tag: "circle", shape: "circle", radius: 358 },
+                    { tag: "rect", shape: "rect", radius: 0 },
+                    { tag: "rounded", shape: "rounded", radius: 0.27 * 716 }]
+        }
+
+        function test_the_shadow_follows_the_shape(row) {
+            overlay.cam = harness.camFor(row.shape)
+            fuzzyCompare(overlay.shadowItem.radius, row.radius, 0.01)
+        }
+
+        function test_the_toggle_hides_the_shadow() {
+            var c = harness.camFor("circle")
+            c.shadow = false
+            overlay.cam = c
+            verify(!overlay.shadowItem.visible)
+        }
+
         function test_the_mirror_is_the_only_transform_left() {
             // The export flips before the scale; a leftover squash transform here would
             // silently reintroduce the stretch this file exists to prevent.

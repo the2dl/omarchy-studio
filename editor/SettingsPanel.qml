@@ -35,6 +35,8 @@ ScrollView {
         m.shape = camSeg.shape
         m.mirror = camSeg.mirror
         m.corner_radius = camSeg.corner_radius
+        m.shadow = camSeg.shadow
+        m.shadow_depth = camSeg.shadow_depth
         m.size = camSeg.size
         m.enabled = camSeg.enabled
         return m
@@ -560,6 +562,21 @@ ScrollView {
                     font.family: Theme.fontFamily
                     font.pixelSize: Theme.fsRow
                 }
+            }
+
+            // How far off the picture the bubble sits: one number that widens and
+            // darkens the shadow together, through the same layers.shadow_scale the
+            // export uses. Disabled with the toggle rather than hidden -- a control
+            // that vanishes is a control nobody finds.
+            LabelledSlider {
+                Layout.fillWidth: true
+                label: "shadow depth"
+                from: 0.0
+                to: 1.0
+                modelValue: root.cam.shadow_depth === undefined ? 0.5 : root.cam.shadow_depth
+                display: Math.round(liveValue * 100) + "%"
+                enabled: root.camEditable && root.cam.shadow !== false
+                onCommitted: function (v) { root.camOp({ shadow_depth: v }) }
             }
 
             C.Caption { text: "shape"; opacity: root.camEditable ? 1.0 : 0.5 }

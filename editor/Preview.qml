@@ -726,6 +726,12 @@ Item {
                     m.shape = root.camNow.shape
                     m.mirror = root.camNow.mirror
                     m.corner_radius = root.camNow.corner_radius
+                    // The segment's shadow, not the whole-take one. Left out, the
+                    // preview drew the global toggle while the export read the
+                    // segment's props, and the two disagreed the moment a track
+                    // became explicit -- which clicking the bubble does.
+                    m.shadow = root.camNow.shadow
+                    m.shadow_depth = root.camNow.shadow_depth
                     return m
                 }
                 // Undo the stage's fit so the handles are a constant size on screen.

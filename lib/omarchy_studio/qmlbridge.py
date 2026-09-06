@@ -56,6 +56,15 @@ FONT_FILE = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"
 # camera you can still see a face in; the ceiling is the point past which the camera is
 # the recording and the screen is the decoration.
 MIN_WEBCAM_WIDTH = 0.04
+
+
+def _shadow_depth_arg(v: Any) -> float:
+    """The slider's value, clamped to the model's range rather than rejected: a value
+    off the end is an intent to go as far as it goes, not an error in the whole op."""
+    try:
+        return min(max(float(v), 0.0), 1.0)
+    except (TypeError, ValueError):
+        raise BridgeError(f"bad shadow_depth {v!r}") from None
 MAX_WEBCAM_WIDTH = 0.60
 
 # A zoom track longer than this is a runaway click log, not a project; the preview would
@@ -288,6 +297,7 @@ def resolve_webcam(bundle: Bundle) -> dict:
             "shape": cam.shape,
             "mirror": cam.mirror,
             "shadow": cam.shadow,
+            "shadow_depth": cam.shadow_depth,
             # The size control's value: the width as a fraction of the canvas, which is
             # the one number that describes the camera box (the height is derived --
             # WebcamSettings.placement). The corner grip writes the same field through
@@ -694,6 +704,8 @@ def project_state(
                     "shape": seg.props.get("shape", bundle.edit.webcam.shape),
                     "mirror": bool(seg.props.get("mirror", bundle.edit.webcam.mirror)),
                     "shadow": bool(seg.props.get("shadow", bundle.edit.webcam.shadow)),
+                    "shadow_depth": float(
+                        seg.props.get("shadow_depth", bundle.edit.webcam.shadow_depth)),
                     "corner_radius": float(
                         seg.props.get("corner_radius", bundle.edit.webcam.corner_radius)),
                     # The size control's value, same meaning as resolve_webcam's:
@@ -800,6 +812,15 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         for key in ("shape", "corner_radius", "mirror"):
             if key in args:
                 layer.props[key] = args[key]
+        # The shadow too. It was missing from this list, so with a segment selected --
+        # which clicking the bubble does -- the Shadow toggle wrote to nothing: the
+        # segment kept the whole-take value it was materialized with, the renderer
+        # read the segment, and the preview drew the global. A control that changes
+        # the preview and not the export is the one bug this editor exists to not have.
+        if "shadow" in args:
+            layer.props["shadow"] = bool(args["shadow"])
+        if "shadow_depth" in args:
+            layer.props["shadow_depth"] = _shadow_depth_arg(args["shadow_depth"])
         if "fade_ms" in args:
             layer.fade_frames = max(0, tb.to_frame(float(args["fade_ms"]) / 1000.0))
 
@@ -829,6 +850,8 @@ def apply_op(bundle: Bundle, op: str, args: dict) -> None:
         for key in ("enabled", "mirror", "shadow"):
             if key in args:
                 setattr(cam, key, bool(args[key]))
+        if "shadow_depth" in args:
+            cam.shadow_depth = _shadow_depth_arg(args["shadow_depth"])
         if "shape" in args:
             shape = WebcamSettings.LEGACY_SHAPES.get(args["shape"], args["shape"])
             if shape not in ("circle", "rounded", "rect"):

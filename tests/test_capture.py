@@ -634,8 +634,10 @@ def test_a_new_recording_opens_with_a_backdrop(tmp_path):
     C.begin(root, logical_geometry=C.parse_geometry("2560x1440+0+0"))
     bd = Bundle(root).edit.backdrop
     assert bd.enabled is True
-    assert bd.color == C.NEW_RECORDING_BACKDROP["color"]
-    assert bd.gradient == C.NEW_RECORDING_BACKDROP["gradient"]
+    assert bd.background == C.NEW_RECORDING_BACKDROP["background"]
+    # and it names something the renderer can actually draw
+    from omarchy_studio import backgrounds
+    assert backgrounds.find(bd.background) is not None
 
 
 def test_a_bare_edit_still_has_no_backdrop():

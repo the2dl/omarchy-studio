@@ -143,7 +143,7 @@ becomes one that goes away partway.
 A colour or gradient behind the video, with rounded corners and a drop shadow. The
 padding, corner radius and background are all adjustable.
 
-**A new recording opens with one on** — a flat blue-grey plate. It is what makes a raw
+**A new recording opens with one on** — `Basalt`, a dark blue-grey. It is what makes a raw
 capture read as a finished video. Turn it off per recording if you want the bare
 capture.
 

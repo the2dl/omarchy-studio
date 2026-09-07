@@ -430,25 +430,29 @@ def begin(
 # should look composed the moment the editor opens, which is what every tool in this
 # class does and the single thing that makes a raw capture read as a finished video.
 #
-# `slate`'s colour, chosen by the person who has to look at these all day. A light plate
-# measured better for shadow contrast -- plate luma 78 against a shadow band of 63, where
-# this one is 26 against 22 -- and it was the first default here for exactly that reason.
-# It was also wrong: a near-white surround under a dark terminal is a look nobody wants
-# on every recording, and the measurement was answering a narrower question than "what
-# should this look like".
+# `basalt`, picked by the person who has to look at these all day. Two earlier choices
+# were wrong in opposite directions: `fog` because it maximised shadow contrast (plate
+# luma 78 against a shadow band of 63, where this one is 26 against 15) -- but "which
+# plate makes the shadow most visible" is a narrower question than "what should every
+# recording look like", and a near-white surround under a dark terminal is a look nobody
+# wants by default. Then `slate`, from a description that did not match what the grid
+# actually shows.
 #
-# So the shadows are faint on this plate, and that is the accepted trade. The backdrop is
-# carrying the composition -- inset, rounded corners, separation from the frame edge --
-# rather than carrying the shadow. Anyone who wants the shadow to read can pick a lighter
-# background; `fog` and `sandstone` are two tiles away.
+# THE CATALOGUE ID, not a colour pair, and that is safe precisely because this is SEEDED
+# rather than defaulted. `BackdropSettings.background` has to keep CUSTOM as its
+# dataclass default -- every edit.json written before the library existed carries only
+# color/gradient, and a catalogue id there would silently outrank them. Written
+# explicitly into a new bundle's edit.json it outranks nothing, and it gets basalt's own
+# vertical gradient exactly; carrying the two colours as a custom pair would have
+# rendered them corner-to-corner instead.
 #
-# The COLOUR, not the catalogue id: `background` has to stay CUSTOM, because every
-# edit.json written before the library existed carries only color/gradient, and so does
-# everything the headless editor writes today. A catalogue id here would outrank both.
+# The shadows are faint on a plate this dark, and that is the accepted trade: the
+# backdrop carries the COMPOSITION -- inset, rounded corners, separation from the frame
+# edge -- rather than carrying the shadow. `fog` and `sandstone` are two tiles away for
+# anyone who wants the shadow to read.
 NEW_RECORDING_BACKDROP = {
     "enabled": True,
-    "color": "#2b303a",
-    "gradient": None,
+    "background": "basalt",
 }
 
 

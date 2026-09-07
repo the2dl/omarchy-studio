@@ -430,25 +430,25 @@ def begin(
 # should look composed the moment the editor opens, which is what every tool in this
 # class does and the single thing that makes a raw capture read as a finished video.
 #
-# It is also the only way either drop shadow is visible at all. A shadow needs
-# something to fall on; with no plate the picture and the camera sit straight on the
-# footage, and on a dark terminal -- luma 11 of 255, measured on a real take -- nothing
-# can show, at any strength.
+# `slate`'s colour, chosen by the person who has to look at these all day. A light plate
+# measured better for shadow contrast -- plate luma 78 against a shadow band of 63, where
+# this one is 26 against 22 -- and it was the first default here for exactly that reason.
+# It was also wrong: a near-white surround under a dark terminal is a look nobody wants
+# on every recording, and the measurement was answering a narrower question than "what
+# should this look like".
 #
-# `fog`'s colours rather than its catalogue id: `background` has to stay CUSTOM,
-# because every edit.json written before the library existed carries only
-# color/gradient, and so does everything the headless editor writes today. A catalogue
-# id here would silently outrank both.
+# So the shadows are faint on this plate, and that is the accepted trade. The backdrop is
+# carrying the composition -- inset, rounded corners, separation from the frame edge --
+# rather than carrying the shadow. Anyone who wants the shadow to read can pick a lighter
+# background; `fog` and `sandstone` are two tiles away.
 #
-# Light rather than dark, which is the counter-intuitive part for a tool whose users
-# record dark terminals. Measured on a real take at 1080p: a dark plate leaves the
-# inset dissolving into its own background (plate luma 26, the shadow band 15) while
-# this one makes it pop (78 against 63). Neutral rather than warm so it imposes no
-# colour temperature on anyone's footage; `sandstone` is the warm one, one click away.
+# The COLOUR, not the catalogue id: `background` has to stay CUSTOM, because every
+# edit.json written before the library existed carries only color/gradient, and so does
+# everything the headless editor writes today. A catalogue id here would outrank both.
 NEW_RECORDING_BACKDROP = {
     "enabled": True,
-    "color": "#dcd8d1",
-    "gradient": "#b4b0a9",
+    "color": "#2b303a",
+    "gradient": None,
 }
 
 

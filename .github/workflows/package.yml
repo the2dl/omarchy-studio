@@ -86,7 +86,16 @@ jobs:
           # they are here so check() actually runs instead of skipping. 22 test files
           # gate on ffmpeg and the QML suites gate on qmltestrunner, so without them a
           # green check has verified almost nothing while reading exactly the same.
-          pacman -Syu --noconfirm --needed \
+          # --disable-sandbox: pacman 7 confines its download phase with Landlock and a
+          # separate `alpm` user, and neither is grantable inside an Actions job
+          # container -- the ARM leg died on "the Landlock ruleset could not be applied".
+          # This does NOT weaken the trust chain: signature verification is a separate
+          # mechanism and stays on, so packages are still rejected unless signed by a key
+          # the image's keyring trusts. What is given up is defence-in-depth around the
+          # downloader, in a container that is destroyed at the end of the job. The
+          # alternative -- handing the container extra kernel privileges so the sandbox
+          # can be built -- would be strictly worse.
+          pacman -Syu --noconfirm --needed --disable-sandbox \
             git base-devel pkgconf \
             wayland wayland-protocols mesa \
             python python-pytest \
@@ -98,8 +107,14 @@ jobs:
           # this is an `any` package coming from a different distribution's mirrors on
           # the ARM leg -- so asking for it above would let a missing font break the
           # build it cannot actually affect.
-          pacman -S --noconfirm --needed ttf-jetbrains-mono-nerd \
+          pacman -S --noconfirm --needed --disable-sandbox ttf-jetbrains-mono-nerd \
             || echo "::warning::JetBrains Mono Nerd Font unavailable; drawtext tests will skip"
+
+          # Say which way it went, so a jump in the skip count has a reason on the page
+          # rather than sending someone back into the logs to work it out.
+          test -f /usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf \
+            && echo "drawtext tests: font present" \
+            || echo "::warning::drawtext tests will skip: font not installed"
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -167,6 +182,15 @@ jobs:
           set -eux
           cd /tmp/build
           ls -lh ./*.pkg.tar.zst
+
+          # Exactly the package, never the -debug one makepkg also emits. The previous
+          # glob ("omarchy-studio-"*"-$ARCH...") matched both, and bsdtar reads a second
+          # filename as a MEMBER to list inside the first archive -- so it reported
+          # "Not found in archive" and the step concluded the recorder was missing from
+          # a package that in fact contained it. A verification step that fails on a good
+          # build is worse than none: it teaches you to ignore it.
+          pkg=$(ls "omarchy-studio-"[0-9]*"-${ARCH}.pkg.tar.zst")
+          test -f "$pkg"
           # Prove the native recorder is actually in there. It is optional by design and
           # build() only warns when it fails, so a silently recorder-less package would
           # otherwise ship looking identical.
@@ -174,7 +198,7 @@ jobs:
           # As builder, not root: this parses an archive the previous step's code just
           # produced, and libarchive is the wrong thing to point at hostile input from
           # the privileged side of the only boundary this job has.
-          runuser -u builder -- bsdtar -tf "omarchy-studio-"*"-${ARCH}.pkg.tar.zst" \
+          runuser -u builder -- bsdtar -tf "$pkg" \
             | grep -q 'contrib/omarchy-capture-window/omarchy-capture-window' \
             || { echo "::error::the native window recorder is missing from the package"; exit 1; }
 

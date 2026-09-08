@@ -32,6 +32,7 @@ depends=(
 # linux-dmabuf-v1.xml, which build.sh takes from the system rather than vendoring so
 # it tracks the installed protocols instead of going stale.
 makedepends=('gcc' 'pkgconf' 'wayland' 'wayland-protocols' 'mesa' 'git')
+checkdepends=('python-pytest')
 
 optdepends=(
   'python-faster-whisper: local speech-to-text for automatic captions'
@@ -56,10 +57,15 @@ build() {
 
 check() {
   cd "$pkgname"
-  # The suite reaches for a file manager on a successful export; the guard in
-  # tests/conftest.py honours this, but set it here too so a build server never
-  # spawns one.
-  OMARCHY_STUDIO_NO_REVEAL=1 python -m pytest -q || warning "test suite did not pass cleanly"
+  # The suite reaches for a file manager on a successful export. tests/conftest.py
+  # already guards that, but set it here too so a build server can never spawn one
+  # even if the fixture is refactored away.
+  #
+  # This runs against the SYSTEM interpreter, not the developer venv -- which is the
+  # point: it is the interpreter the package will actually run on, so a test that only
+  # passes with the venv's optional packages present is telling you something real
+  # about the dependency list.
+  OMARCHY_STUDIO_NO_REVEAL=1 python -m pytest -q
 }
 
 package() {

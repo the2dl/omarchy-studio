@@ -79,7 +79,21 @@ it as one page. The same content lives in the repo:
     docs/using-the-editor.md  the setup bar, the HUD, the timeline, every shortcut
     docs/index.html           all three as one page; what Pages serves
 
-## Installing it on another machine
+## Installing it
+
+### As a package
+
+    cd packaging && makepkg -si
+
+Builds the native single-window recorder, installs the tree under
+`/usr/lib/omarchy-studio`, puts six commands on `PATH`, and registers a desktop entry
+and icons. `pacman -R omarchy-studio` takes all of it back out.
+
+The AUR is not a route this project has: new-account registration has been closed
+since the June 2026 malware waves. The package is built to be carried by a repo
+instead -- `[omarchy]` is already in every Omarchy user's `pacman.conf`.
+
+### From a checkout
 
 The core needs no build step -- it runs out of the checkout, on the system Python.
 A venv is only for the optional caption engine; every entry point falls back to
@@ -246,6 +260,10 @@ the wrong object resolves to `undefined`, an anchor inside a positioner is undef
 behaviour, and neither raises anything at runtime. `qmllint` and the `tst_*.qml`
 cases catch exactly that class, and each one in the tree exists because something
 shipped broken.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
 
 ## Status
 

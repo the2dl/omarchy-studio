@@ -306,7 +306,12 @@ def test_force_replaces_the_transcript(bundle):
 
 def test_no_engine_fails_before_any_audio_is_extracted(bundle, monkeypatch):
     """Ordering matters: extracting audio from a long recording is a minute of work to
-    throw away when the answer was knowable up front."""
+    throw away when the answer was knowable up front.
+
+    Stated without a runner, because supplying one IS supplying an engine -- see
+    test_an_explicit_runner_needs_no_installed_engine. This is the no-runner path, which
+    is the one that has to go looking for an install and so is the one that can fail.
+    """
     monkeypatch.setattr(transcribe, "have_faster_whisper", lambda: False)
     monkeypatch.setattr(transcribe, "whisper_cpp_binary", lambda: None)
     monkeypatch.setattr(
@@ -314,7 +319,22 @@ def test_no_engine_fails_before_any_audio_is_extracted(bundle, monkeypatch):
         lambda *a, **kw: pytest.fail("audio was extracted with no engine available"),
     )
     with pytest.raises(TranscribeError):
-        transcribe.transcribe_bundle(bundle, runner=fake_runner())
+        transcribe.transcribe_bundle(bundle)
+
+
+def test_an_explicit_runner_needs_no_installed_engine(bundle, monkeypatch):
+    """The runner is the seam that lets a caller transcribe without a local install --
+    and every other test in this file leans on it. It used to demand an engine anyway,
+    so the whole file passed only on a machine that happened to have faster-whisper in
+    its venv, and a packaged build with the optional dependency absent failed six tests
+    that were deliberately written to need nothing."""
+    monkeypatch.setattr(transcribe, "have_faster_whisper", lambda: False)
+    monkeypatch.setattr(transcribe, "whisper_cpp_binary", lambda: None)
+
+    t = transcribe.transcribe_bundle(bundle, model="tiny", runner=fake_runner())
+
+    assert [s.text for s in t.segments] == ["hello there", "second segment"]
+    assert t.engine in transcribe.ENGINE_ORDER
 
 
 # --- whisper.cpp output parsing ---------------------------------------------

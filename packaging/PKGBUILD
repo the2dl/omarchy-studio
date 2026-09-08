@@ -6,24 +6,27 @@ pkgrel=1
 pkgdesc="Non-destructive screen recorder and editor for Hyprland: automatic zoom, camera, backdrops, redaction"
 arch=('x86_64' 'aarch64')
 url="https://github.com/the2dl/omarchy-studio"
-license=('MIT')
+license=('Apache-2.0')
 
 # Runtime. Everything here is reached by name at runtime, so a missing one is a
 # failure in the middle of a recording rather than at install time.
+#   omarchy         omarchy-shell (bar indicator refresh) and omarchy-notification-send
+#   mpv             the live camera self-view, and playback from the library
 #   ffmpeg          the render pipeline, and the encoder for the window recorder
 #   gpu-screen-recorder  the KMS and portal capture backends
 #   hyprland        hyprctl, for monitors, window geometry and the click binds
 #   qt6-declarative qml6 -- the editor, setup bar, HUD and teleprompter are all QML
 #   qt6-multimedia  video playback in the editor
 #   jq              the bash entry points parse hyprctl's JSON with it
-#   libpulse        pactl, for enumerating microphones
+#   libpulse        pactl to enumerate microphones, parec for the HUD's live level
 #   v4l-utils       v4l2-ctl, for enumerating cameras
 #   slurp           the area picker
 #   libnotify       notify-send, the only completion signal a menu-launched export has
 #   xdg-utils       xdg-open, to reveal the finished file
 depends=(
   'bash' 'python'
-  'ffmpeg' 'gpu-screen-recorder' 'hyprland'
+  'omarchy' 'hyprland'
+  'ffmpeg' 'gpu-screen-recorder' 'mpv'
   'qt6-declarative' 'qt6-multimedia'
   'jq' 'libpulse' 'v4l-utils' 'slurp' 'libnotify' 'xdg-utils'
 )
@@ -128,6 +131,5 @@ package() {
   install -Dm644 bin/omarchy-studio-menu-entries.jsonc \
     -t "$pkgdir/usr/share/doc/$pkgname"
 
-  # TODO: the repo has no LICENSE file yet. Add one, then uncomment:
-  # install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

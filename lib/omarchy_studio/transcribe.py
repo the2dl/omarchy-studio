@@ -502,8 +502,18 @@ def transcribe_bundle(
         say(f"transcript.json already exists ({len(existing.segments)} segments)")
         return existing
 
-    chosen = require_engine(engine)
-    run = runner if runner is not None else _RUNNERS[chosen]
+    # An explicit runner IS the engine: it is the documented seam, and the whole point
+    # of it is to transcribe without a local install. Calling require_engine() first
+    # asked for one anyway, so `transcribe_bundle(bundle, runner=...)` raised "no local
+    # speech-to-text engine found" on a machine that had deliberately supplied its own
+    # -- the seam existed and could not be reached. Resolve an engine only when we are
+    # actually about to go looking for one.
+    if runner is not None:
+        chosen = engine if engine in ENGINE_ORDER else ENGINE_ORDER[0]
+        run = runner
+    else:
+        chosen = require_engine(engine)
+        run = _RUNNERS[chosen]
 
     stream, media, offset = audio_source(bundle)
     say(f"engine {chosen}, model {model}, audio from {stream}")

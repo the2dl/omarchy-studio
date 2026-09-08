@@ -1,0 +1,215 @@
+# Build the pacman package on both architectures we claim to support.
+#
+# aarch64 is the reason this exists. The ARM work is real -- the screenshare plugin
+# vendors funchook so Hyprland plugin hooking works there at all -- but it was only ever
+# exercised by being physically sat at the Apple silicon machine. A push that breaks the
+# ARM build was previously discoverable only by going and finding out.
+#
+# Both jobs run on NATIVE runners, not QEMU: arm64 hosted runners are free for public
+# repositories, and this repository is public. A cross build under emulation would take
+# roughly an order of magnitude longer and would not exercise the same compiler.
+#
+# SECURITY POSTURE, since a build pipeline is a supply chain:
+#
+#   * The trigger is `pull_request`, never `pull_request_target`. A fork's pull request
+#     builds that fork's code -- which for a package build means running arbitrary code
+#     by design -- so it must run with no secrets and a read-only token. Using
+#     pull_request_target here would hand write scope to unreviewed code.
+#   * No `${{ }}` interpolation appears inside any `run:` block except values that come
+#     from this file. Anything attacker-influenced (a branch name, a tag, a PR title)
+#     reaches the shell only as a quoted environment variable, so it cannot end the
+#     current command and start another.
+#   * Permissions are declared per job and default to none. Only the release job gets
+#     `contents: write`, and only on a tag.
+#   * Third-party actions are pinned to a full commit SHA. A tag is a mutable pointer:
+#     whoever can move `v4` can run code in every workflow that trusts it.
+#   * `persist-credentials: false`, because the build job never pushes. Otherwise
+#     checkout leaves the token in .git/config, inside the very tree whose build scripts
+#     we then execute.
+#   * The build user has no sudoers grant. (base-devel ships the sudo binary; builder
+#     has a locked password and no rule, so it is unusable.) Every dependency is
+#     installed as root beforehand and makepkg runs with --nodeps, so the step that
+#     executes repository code needs no privilege at all -- and every step AFTER it
+#     drops back to that user, so nothing root-owned ever parses its output.
+name: package
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# Default to nothing; each job opts in to exactly what it needs.
+permissions: {}
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    permissions:
+      contents: read
+    strategy:
+      # Never let one architecture's failure hide the other's result: which of the two
+      # broke is the single most useful thing this workflow reports.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            image: archlinux:base-devel@sha256:84cd9ef000b3cff245ec028e87965b84724f4bf1cc63fc2741ba927b88515ed6
+          # Arch proper publishes no ARM image; Arch Linux ARM is a separate distribution
+          # with the same package names. menci/archlinuxarm is the one that is actually
+          # maintained -- it rebuilds daily and publishes a real arm64 manifest.
+          #
+          # Both images are pinned BY DIGEST, and the reason is not the one you would
+          # expect. `pacman -Syu` replaces the package set in the first minute, so a pin
+          # freezes almost nothing about what gets built -- but the image also carries
+          # the pacman KEYRING, which is the thing that makes the mirrors' signatures
+          # mean anything at all. On a tag, whatever that keyring trusts becomes a
+          # published release. Pinning makes "what base built v0.1.0" an explicit,
+          # reviewable change instead of whatever the registry served that minute.
+          #
+          # Cost: these go stale, and nothing here bumps them. Re-pin when you want the
+          # newer base -- `docker buildx imagetools inspect <image>:base-devel` prints
+          # the current digest.
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: menci/archlinuxarm:base-devel@sha256:68b3b9434a41b92d80b66a384034d73d5598771ed175bead99ae7c380905c964
+
+    steps:
+      - name: Install toolchain and test dependencies
+        run: |
+          set -euxo pipefail
+          # Required. ffmpeg, the Qt6 QML tooling and pytest are not needed to BUILD --
+          # they are here so check() actually runs instead of skipping. 22 test files
+          # gate on ffmpeg and the QML suites gate on qmltestrunner, so without them a
+          # green check has verified almost nothing while reading exactly the same.
+          pacman -Syu --noconfirm --needed \
+            git base-devel pkgconf \
+            wayland wayland-protocols mesa \
+            python python-pytest \
+            ffmpeg qt6-declarative qt6-multimedia
+
+          # Best effort, in its own call. The drawtext tests gate on one exact font file
+          # and skip without it, so its absence costs a little coverage and nothing else.
+          # pacman fails the WHOLE transaction on an unknown package name, though, and
+          # this is an `any` package coming from a different distribution's mirrors on
+          # the ARM leg -- so asking for it above would let a missing font break the
+          # build it cannot actually affect.
+          pacman -S --noconfirm --needed ttf-jetbrains-mono-nerd \
+            || echo "::warning::JetBrains Mono Nerd Font unavailable; drawtext tests will skip"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # makepkg resolves the source below to a commit, which a depth-1 clone may not
+          # contain once this is a merge commit or a tag build.
+          fetch-depth: 0
+          # This job executes the tree's own build scripts. Do not leave a credential in
+          # it for them to find.
+          persist-credentials: false
+
+      - name: Build the package
+        env:
+          # Via the environment, not `${{ }}` in the script: GITHUB_SHA is trustworthy
+          # but the habit is what keeps the one that is not out of the shell.
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euxo pipefail
+          # The container is root and makepkg refuses to run as root. runuser drops to an
+          # unprivileged user directly -- no sudo, no sudoers entry, nothing that would
+          # let the code being built climb back out.
+          useradd -m builder
+
+          # The workflow-command files are how a step talks to the runner: anything
+          # written to $GITHUB_ENV becomes an environment variable in the NEXT step. A
+          # build that could append to them could set BASH_ENV and have the runner
+          # execute it -- as root, outside the container's build user. They are created
+          # on the host and should not be builder-writable, but "should not" is resting
+          # on a uid coincidence, so say it explicitly.
+          chmod go-w /github/file_commands /github/file_commands/* 2>/dev/null || true
+
+          install -d -o builder /tmp/build
+          install -o builder packaging/PKGBUILD /tmp/build/PKGBUILD
+
+          # Both users have to agree the checkout is safe to read: root cloned it,
+          # builder reads it.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          runuser -u builder -- git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # Build THIS commit, not the release tag the PKGBUILD names. Otherwise every
+          # run would rebuild the last release and a pull request would test nothing it
+          # changed. Releases still build the tag, because the tag is this commit.
+          runuser -u builder -- \
+            sed -i "s|^source=.*|source=(\"git+file://${GITHUB_WORKSPACE}#commit=${COMMIT}\")|" \
+            /tmp/build/PKGBUILD
+
+          # Verify the rewrite landed. `^source=.*` is a single-line substitution: if
+          # source= ever becomes a multi-line array, this would quietly leave the tail
+          # behind and build the last release tag instead of this commit -- a green run
+          # that tested nothing it was asked to.
+          grep -q '^source=("git+file://' /tmp/build/PKGBUILD
+
+          # Everything from here runs as builder. --nodeps because the RUNTIME
+          # dependencies are deliberately not installable here: omarchy lives in a
+          # third-party repo that serves x86_64 only, and none of hyprland, mpv or
+          # gpu-screen-recorder is needed to compile or to test. The build and check
+          # dependencies were installed explicitly above, so this skips only what it
+          # should.
+          cd /tmp/build
+          runuser -u builder -- makepkg --nodeps --noconfirm
+
+      - name: Show what was built
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eux
+          cd /tmp/build
+          ls -lh ./*.pkg.tar.zst
+          # Prove the native recorder is actually in there. It is optional by design and
+          # build() only warns when it fails, so a silently recorder-less package would
+          # otherwise ship looking identical.
+          #
+          # As builder, not root: this parses an archive the previous step's code just
+          # produced, and libarchive is the wrong thing to point at hostile input from
+          # the privileged side of the only boundary this job has.
+          runuser -u builder -- bsdtar -tf "omarchy-studio-"*"-${ARCH}.pkg.tar.zst" \
+            | grep -q 'contrib/omarchy-capture-window/omarchy-capture-window' \
+            || { echo "::error::the native window recorder is missing from the package"; exit 1; }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: omarchy-studio-${{ matrix.arch }}
+          path: /tmp/build/*.pkg.tar.zst
+          if-no-files-found: error
+
+  release:
+    name: attach to release
+    needs: build
+    # Tags only, and only on this repository. A fork's tag would upload to the fork's
+    # own release rather than ours regardless -- its token is its own -- but the comment
+    # claimed a check that was not written, so write it.
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'the2dl/omarchy-studio'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eux
+          ls -lh dist/
+          # Create on the first run, add to it on a re-run. Quoted env vars throughout:
+          # a tag name is attacker-controlled on a fork.
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/*.pkg.tar.zst --repo "$REPO" --clobber

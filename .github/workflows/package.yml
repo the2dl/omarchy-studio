@@ -244,4 +244,8 @@ jobs:
           if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes
           fi
-          gh release upload "$TAG" dist/*.pkg.tar.zst --repo "$REPO" --clobber
+          # dist/*, not dist/*.pkg.tar.zst: Arch compresses with zstd and Arch Linux ARM
+          # with xz, so naming one extension would have published the x86_64 package and
+          # silently dropped the aarch64 one -- on a release, where nobody is watching a
+          # log. The artifacts contain nothing but packages.
+          gh release upload "$TAG" dist/* --repo "$REPO" --clobber

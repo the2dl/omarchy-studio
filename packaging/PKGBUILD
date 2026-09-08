@@ -95,20 +95,31 @@ package() {
   find "$root" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
   rm -rf "$root/.venv"
 
-  # Public entry points only. The rest -- the camera shim, the input daemon wrapper,
-  # the setup bar, the HUD, the IPC helper -- are invoked by absolute path from inside
-  # the tree and have no business on anyone's PATH.
+  # Public entry points only, as "PATH name:file in the tree". The rest -- the camera
+  # shim, the input daemon wrapper, the setup bar, the HUD, the IPC helper -- are
+  # invoked by absolute path from inside the tree and have no business on anyone's PATH.
+  #
+  # bin/omarchy-capture-screenrecording is deliberately NOT installed under its own
+  # name: stock Omarchy already ships /usr/bin/omarchy-capture-screenrecording, and
+  # pacman would refuse the install rather than let two packages own one path. Taking
+  # it by force would break stock screen recording and be silently reverted by the next
+  # omarchy update anyway. It goes on PATH as omarchy-studio-record instead, which is
+  # the name it should have had -- this is the studio's recorder, not a replacement for
+  # omarchy's. Nothing internal is affected: every caller reaches it through
+  # $STUDIO_ROOT/bin or repo_root/"bin", never through PATH.
   install -d "$pkgdir/usr/bin"
-  local cmd
-  for cmd in \
-    omarchy-studio \
-    omarchy-recordings \
-    omarchy-capture-screenrecording \
-    omarchy-capture-screenrecording-edit \
-    omarchy-studio-transcribe \
-    omarchy-teleprompter
+  local pair name target
+  for pair in \
+    omarchy-studio:omarchy-studio \
+    omarchy-recordings:omarchy-recordings \
+    omarchy-studio-record:omarchy-capture-screenrecording \
+    omarchy-capture-screenrecording-edit:omarchy-capture-screenrecording-edit \
+    omarchy-studio-transcribe:omarchy-studio-transcribe \
+    omarchy-teleprompter:omarchy-teleprompter
   do
-    ln -s "/usr/lib/$pkgname/bin/$cmd" "$pkgdir/usr/bin/$cmd"
+    name="${pair%%:*}"
+    target="${pair##*:}"
+    ln -s "/usr/lib/$pkgname/bin/$target" "$pkgdir/usr/bin/$name"
   done
 
   # Desktop entry and icons. omarchy-recordings is the launcher target because it is

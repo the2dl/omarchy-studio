@@ -372,7 +372,12 @@ def test_bridge_done_records_a_valid_config(bridge):
                   {"target": "monitor:DP-1", "mic": True, "desktop_audio": False,
                    "camera": "off", "camera_device": None})
     assert reply == {"ok": True}
-    assert session.done.is_set()
+    # wait(), not is_set(): the handler sends the response BEFORE setting the event
+    # (bin/omarchy-capture-setup), so a 200 does not yet mean the session is finished --
+    # it means the reply got out first, which is the point of that ordering. Asserting
+    # is_set() straight off the reply is a race that a fast machine wins and the 4-vCPU
+    # ARM CI runner loses.
+    assert session.done.wait(5)
     assert session.result["target"] == "monitor:DP-1"
     # The session's own countdown rides into the contract line: the consumer
     # learns how long until every setup surface is gone.
@@ -394,7 +399,7 @@ def test_bridge_done_rejects_a_bad_config_without_finishing(bridge):
 def test_bridge_cancel_finishes_with_no_result(bridge):
     session, port = bridge
     assert _call(port, "/cancel", session.token, {}) == {"ok": True}
-    assert session.done.is_set()
+    assert session.done.wait(5)   # see test_bridge_done_records_a_valid_config
     assert session.result is None
 
 

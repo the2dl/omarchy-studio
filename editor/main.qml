@@ -554,6 +554,16 @@ ApplicationWindow {
 
     property bool selftestOpDone: false
     property bool selftestGrabDone: false
+    property int selftestGrabWaits: 0
+    property int selftestPaintTicks: 0
+
+    // Re-enters runSelftest() while it is waiting for the video to catch up.
+    Timer {
+        id: selftestSettle
+        interval: 50
+        repeat: false
+        onTriggered: app.runSelftest()
+    }
 
     // Each step re-enters once its asynchronous half has finished, so the report is
     // written after the op has round-tripped rather than while it is still in flight.
@@ -567,15 +577,36 @@ ApplicationWindow {
         }
         var grab = Bridge.arg("--grab", "")
         if (grab !== "" && !selftestGrabDone) {
-            selftestGrabDone = true
             // Grabs are taken in preview mode: the parity harness compares the grab
             // against an ffmpeg render, and preview mode is by definition the frame
             // with no editing chrome -- the same frame the user checks by pressing P.
-            // This replaces the old selftestMs gate on the redaction marker, so the
-            // test measures a state a user can actually see.
             app.previewMode = true
+
+            // WAIT FOR THE SEEK TO LAND. This used to fire straight off the --selftest
+            // timer, which is a fixed deadline and not a readiness signal: under load the
+            // seek had not completed, the VideoOutput was still presenting the previous
+            // frame, and the grab captured it while every reported property already said
+            // the new one. That is what made the zoom parity case fail about one run in
+            // three -- looking exactly like a renderer disagreement, which is the one
+            // thing that test exists to detect.
+            if (!preview.videoSettled && selftestGrabWaits < 100) {   // <= 5s
+                selftestGrabWaits += 1
+                selftestSettle.restart()
+                return
+            }
+            // Landing the position and having painted it are not the same instant, and
+            // leaving preview mode above also costs a relayout. Two ticks covers both.
+            if (selftestPaintTicks < 2) {
+                selftestPaintTicks += 1
+                selftestSettle.restart()
+                return
+            }
+
+            selftestGrabDone = true
             preview.grabStage(grab, function () {
-                console.log("SELFTEST grabbed -> " + grab)
+                console.log("SELFTEST grabbed -> " + grab
+                            + " (settled=" + preview.videoSettled
+                            + " waits=" + app.selftestGrabWaits + ")")
                 app.runSelftest()
             })
             return

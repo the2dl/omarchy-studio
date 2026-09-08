@@ -44,6 +44,16 @@ Item {
     // (517-651ms with half the seeks delivering nothing); decoding frame 0 forward is
     // the case that works, and the player unloads the moment the proxy is ready.
     readonly property bool proxyPending: !hasScreen
+
+    // True once the screen player has actually landed on the frame the playhead is
+    // asking for. grabToImage captures whatever the VideoOutput last PRESENTED, so a
+    // grab taken while a seek is still in flight returns the PREVIOUS frame -- silently,
+    // and with every property (frame, zoomScale) already reporting the new one. A pixel
+    // comparison then blames the renderer for what is really a timing bug.
+    readonly property bool videoSettled: !hasScreen
+        || ((screenPlayer.mediaStatus === MediaPlayer.LoadedMedia
+             || screenPlayer.mediaStatus === MediaPlayer.BufferedMedia)
+            && Math.abs(screenPlayer.position - scrubFrame * msPerFrame) <= msPerFrame)
         && (Bridge.proxyStatus.state === "building" || Bridge.proxyStatus.state === "error")
     readonly property string masterUrl:
         screenMedia && screenMedia.master ? "file://" + screenMedia.master : ""

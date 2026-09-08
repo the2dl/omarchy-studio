@@ -216,6 +216,76 @@ jobs:
           path: /tmp/out/*
           if-no-files-found: error
 
+  parity:
+    # The preview-vs-export checks, which the package build cannot run.
+    #
+    # tests/test_parity.py renders frames through QML and compares them pixel-wise
+    # against the ffmpeg export -- the only thing that catches the editor and the
+    # renderer disagreeing, which is the defect a user actually sees. It gates on
+    # WAYLAND_DISPLAY/DISPLAY because a VideoOutput grabs EMPTY under every headless Qt
+    # platform, so in the build job it quietly skips: every green run of this workflow
+    # was green partly because these never ran.
+    #
+    # Weston's headless backend is a real Wayland compositor with no GPU and no DRM
+    # device, which is exactly the missing piece. Rendering falls to llvmpipe and
+    # decoding to ffmpeg in software -- slow, and correct, which is the trade this job
+    # wants.
+    name: parity
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel@sha256:84cd9ef000b3cff245ec028e87965b84724f4bf1cc63fc2741ba927b88515ed6
+    permissions:
+      contents: read
+    steps:
+      - name: Install a compositor and the video stack
+        run: |
+          set -euxo pipefail
+          pacman -Syu --noconfirm --needed --disable-sandbox \
+            git python python-pytest ffmpeg mesa \
+            qt6-declarative qt6-multimedia qt6-multimedia-ffmpeg qt6-wayland \
+            weston ttf-jetbrains-mono-nerd
+          # qt6-multimedia-ffmpeg by name: qt6-multimedia depends on the VIRTUAL
+          # qt6-multimedia-backend, and letting pacman pick can land the gstreamer
+          # provider, whose behaviour here is not what upstream develops against.
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Run the parity suite under weston
+        env:
+          QT_QPA_PLATFORM: wayland
+        run: |
+          set -euxo pipefail
+          # Weston refuses to run as root, and the tests launch the real editor, so give
+          # both an ordinary user with its own runtime dir.
+          useradd -m runner
+          install -d -m 0700 -o runner /run/user/1001
+          chown -R runner "$GITHUB_WORKSPACE"
+
+          runuser -u runner -- env XDG_RUNTIME_DIR=/run/user/1001 \
+            weston --backend=headless --socket=wayland-ci --idle-time=0 \
+            >/tmp/weston.log 2>&1 &
+
+          # Wait for the socket rather than sleeping: weston takes well under a second
+          # here, but "well under a second" is what the bug this job exists to catch was
+          # also built on.
+          for _ in $(seq 1 100); do
+            [ -S /run/user/1001/wayland-ci ] && break
+            sleep 0.1
+          done
+          test -S /run/user/1001/wayland-ci || { echo "::error::weston did not start"; cat /tmp/weston.log; exit 1; }
+
+          runuser -u runner -- env \
+            XDG_RUNTIME_DIR=/run/user/1001 \
+            WAYLAND_DISPLAY=wayland-ci \
+            QT_QPA_PLATFORM=wayland \
+            OMARCHY_STUDIO_NO_REVEAL=1 \
+            python -m pytest -q tests/test_parity.py
+
+      - name: Weston log
+        if: always()
+        run: cat /tmp/weston.log || true
+
   release:
     name: attach to release
     needs: build

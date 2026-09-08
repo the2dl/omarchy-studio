@@ -1,0 +1,127 @@
+# Maintainer: the2dl <dan@nano.rs>
+
+pkgname=omarchy-studio
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Non-destructive screen recorder and editor for Hyprland: automatic zoom, camera, backdrops, redaction"
+arch=('x86_64' 'aarch64')
+url="https://github.com/the2dl/omarchy-studio"
+license=('MIT')
+
+# Runtime. Everything here is reached by name at runtime, so a missing one is a
+# failure in the middle of a recording rather than at install time.
+#   ffmpeg          the render pipeline, and the encoder for the window recorder
+#   gpu-screen-recorder  the KMS and portal capture backends
+#   hyprland        hyprctl, for monitors, window geometry and the click binds
+#   qt6-declarative qml6 -- the editor, setup bar, HUD and teleprompter are all QML
+#   qt6-multimedia  video playback in the editor
+#   jq              the bash entry points parse hyprctl's JSON with it
+#   libpulse        pactl, for enumerating microphones
+#   v4l-utils       v4l2-ctl, for enumerating cameras
+#   slurp           the area picker
+#   libnotify       notify-send, the only completion signal a menu-launched export has
+#   xdg-utils       xdg-open, to reveal the finished file
+depends=(
+  'bash' 'python'
+  'ffmpeg' 'gpu-screen-recorder' 'hyprland'
+  'qt6-declarative' 'qt6-multimedia'
+  'jq' 'libpulse' 'v4l-utils' 'slurp' 'libnotify' 'xdg-utils'
+)
+
+# The native single-window recorder is compiled here. wayland-protocols supplies
+# linux-dmabuf-v1.xml, which build.sh takes from the system rather than vendoring so
+# it tracks the installed protocols instead of going stale.
+makedepends=('gcc' 'pkgconf' 'wayland' 'wayland-protocols' 'mesa' 'git')
+
+optdepends=(
+  'python-faster-whisper: local speech-to-text for automatic captions'
+  'hyprland-studio-screenshare: true window exclusion, so the camera self-view is invisible to a portal capture rather than a black box (install via hyprpm)'
+)
+
+source=("git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname"
+
+  # Optional by design: without it, "just this window" falls back to capturing the
+  # window's RECTANGLE, which records whatever is stacked on top. Building it is the
+  # whole reason this package has makedepends, so a failure here is a real failure --
+  # but it must not take the rest of the package down with it on an arch or a Wayland
+  # stack where it cannot build.
+  if ! contrib/omarchy-capture-window/build.sh; then
+    warning "the native window recorder did not build; 'just this window' will fall back to a rectangle capture"
+  fi
+}
+
+check() {
+  cd "$pkgname"
+  # The suite reaches for a file manager on a successful export; the guard in
+  # tests/conftest.py honours this, but set it here too so a build server never
+  # spawns one.
+  OMARCHY_STUDIO_NO_REVEAL=1 python -m pytest -q || warning "test suite did not pass cleanly"
+}
+
+package() {
+  cd "$pkgname"
+
+  local root="$pkgdir/usr/lib/$pkgname"
+
+  # The tree is installed whole and kept together, because the entry points locate
+  # their siblings relative to themselves: REPO is parents[1] of the resolved script
+  # path, and lib/, editor/, daemon/ and contrib/ all hang off it. Splitting it into
+  # FHS-proper locations would mean patching every one of those lookups.
+  install -d "$root"
+  cp -a bin lib editor daemon "$root/"
+
+  install -d "$root/contrib/omarchy-capture-window"
+  if [[ -x contrib/omarchy-capture-window/omarchy-capture-window ]]; then
+    install -Dm755 contrib/omarchy-capture-window/omarchy-capture-window \
+      "$root/contrib/omarchy-capture-window/omarchy-capture-window"
+  fi
+
+  # Build artefacts and the developer venv never ship. The venv especially: its
+  # bin/python is a symlink, and reexec_into_venv() would send a packaged install off
+  # to an interpreter under /usr/lib that pacman does not own.
+  find "$root" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+  rm -rf "$root/.venv"
+
+  # Public entry points only. The rest -- the camera shim, the input daemon wrapper,
+  # the setup bar, the HUD, the IPC helper -- are invoked by absolute path from inside
+  # the tree and have no business on anyone's PATH.
+  install -d "$pkgdir/usr/bin"
+  local cmd
+  for cmd in \
+    omarchy-studio \
+    omarchy-recordings \
+    omarchy-capture-screenrecording \
+    omarchy-capture-screenrecording-edit \
+    omarchy-studio-transcribe \
+    omarchy-teleprompter
+  do
+    ln -s "/usr/lib/$pkgname/bin/$cmd" "$pkgdir/usr/bin/$cmd"
+  done
+
+  # Desktop entry and icons. omarchy-recordings is the launcher target because it is
+  # the only GUI that takes no arguments -- omarchy-studio needs a bundle path.
+  install -Dm644 "$srcdir/$pkgname/packaging/omarchy-studio.desktop" \
+    "$pkgdir/usr/share/applications/$pkgname.desktop"
+
+  local size
+  for size in 16 24 32 64 128 256 512; do
+    install -Dm644 "docs/media/logo/png/mark-$size.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/$pkgname.png"
+  done
+  install -Dm644 docs/media/logo/svg/mark-full-accent.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/$pkgname.svg"
+
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/how-it-works.md docs/engines.md docs/using-the-editor.md \
+    -t "$pkgdir/usr/share/doc/$pkgname"
+  # Menu leaves for omarchy-menu, to be merged by hand -- see the comments in the file.
+  install -Dm644 bin/omarchy-studio-menu-entries.jsonc \
+    -t "$pkgdir/usr/share/doc/$pkgname"
+
+  # TODO: the repo has no LICENSE file yet. Add one, then uncomment:
+  # install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

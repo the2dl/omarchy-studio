@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Omarchy Studio
+GenericName=Screen Recorder
+Comment=Record your screen, then zoom, cut and polish it without touching the capture
+Exec=omarchy-recordings
+Icon=omarchy-studio
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=screen;record;recording;capture;screencast;video;editor;zoom;
+StartupNotify=true

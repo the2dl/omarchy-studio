@@ -280,7 +280,21 @@ jobs:
             WAYLAND_DISPLAY=wayland-ci \
             QT_QPA_PLATFORM=wayland \
             OMARCHY_STUDIO_NO_REVEAL=1 \
-            python -m pytest -q tests/test_parity.py
+            python -m pytest -q tests/test_parity.py \
+              --deselect tests/test_parity.py::test_the_preview_renders_the_export_redaction_strength
+
+          # That one is deselected because its xfail is CALIBRATED TO A GPU, and this job
+          # renders with llvmpipe. It is xfail(strict=True) recording a real, open bug --
+          # MultiEffect's blur is 1.5x to 4.1x weaker than gblur and saturates across the
+          # whole preset ladder -- measured as sigma 14.0 on a hardware renderer. Under
+          # software rendering the `strong` preset comes out reachable, the test XPASSes,
+          # and strict xfail turns that into a failure.
+          #
+          # Which is itself the finding: the preview's blur strength depends on the
+          # renderer, so the recalibration that xfail is waiting for cannot be a single
+          # constant measured on one machine. Deselected here rather than made
+          # non-strict, because non-strict would also throw away the signal this test
+          # exists to give -- telling you the day the calibration is actually fixed.
 
       - name: Weston log
         if: always()

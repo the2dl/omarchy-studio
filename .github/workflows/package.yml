@@ -175,21 +175,29 @@ jobs:
           cd /tmp/build
           runuser -u builder -- makepkg --nodeps --noconfirm
 
+          # Ask makepkg where it put things instead of guessing. Both PKGDEST (where)
+          # and PKGEXT (which compressor) are makepkg.conf settings, and the two
+          # distributions do not agree: Arch Linux ARM produced no -debug package at all,
+          # so a glob written against what Arch does found nothing here and the step
+          # failed on a build that had just passed 925 tests. --packagelist prints the
+          # full resolved paths and is the only answer that cannot drift.
+          install -d -o builder /tmp/out
+          runuser -u builder -- makepkg --packagelist >/tmp/pkglist
+          cat /tmp/pkglist
+          runuser -u builder -- sh -c 'while IFS= read -r p; do cp "$p" /tmp/out/; done < /tmp/pkglist'
+
       - name: Show what was built
-        env:
-          ARCH: ${{ matrix.arch }}
         run: |
           set -eux
-          cd /tmp/build
-          ls -lh ./*.pkg.tar.zst
+          ls -lh /tmp/out/
 
-          # Exactly the package, never the -debug one makepkg also emits. The previous
-          # glob ("omarchy-studio-"*"-$ARCH...") matched both, and bsdtar reads a second
-          # filename as a MEMBER to list inside the first archive -- so it reported
-          # "Not found in archive" and the step concluded the recorder was missing from
-          # a package that in fact contained it. A verification step that fails on a good
-          # build is worse than none: it teaches you to ignore it.
-          pkg=$(ls "omarchy-studio-"[0-9]*"-${ARCH}.pkg.tar.zst")
+          # Exactly the package, never the -debug one makepkg may also emit. Selecting it
+          # by name mattered: bsdtar reads a second filename as a MEMBER to list inside
+          # the first archive, so a glob matching both reported "Not found in archive"
+          # and the step concluded the recorder was missing from a package that in fact
+          # contained it. A verification step that fails on a good build is worse than
+          # none, because it teaches you to ignore it.
+          pkg=/tmp/out/$(basename "$(grep -v -- '-debug-' /tmp/pkglist | head -1)")
           test -f "$pkg"
           # Prove the native recorder is actually in there. It is optional by design and
           # build() only warns when it fails, so a silently recorder-less package would
@@ -205,7 +213,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: omarchy-studio-${{ matrix.arch }}
-          path: /tmp/build/*.pkg.tar.zst
+          path: /tmp/out/*
           if-no-files-found: error
 
   release:
